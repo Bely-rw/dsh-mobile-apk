@@ -56,8 +56,56 @@ jobs:
           git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 2de902729e01eb3619aa50bdfa164c5231948848
           git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 2de902729e01eb3619aa50bdfa164c5231948848
           test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "2de902729e01eb3619aa50bdfa164c5231948848"
-          cmp dsh-host-web-compat/package.json .deploy-tmp/component-sources/host-web-compat/package.json
           cmp dsh-host-web-compat/lib/index.js .deploy-tmp/component-sources/host-web-compat/lib/index.js
+          mkdir -p .deploy-tmp/source-build
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const pinnedRoot = '.deploy-tmp/component-sources/host-web-compat'
+          const mirrorRoot = 'dsh-host-web-compat'
+          const cordisKey = '@deepseek-ai/cordis'
+          const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+          const pinned = JSON.parse(fs.readFileSync(`${pinnedRoot}/package.json`, 'utf8'))
+          const mirror = JSON.parse(fs.readFileSync(`${mirrorRoot}/package.json`, 'utf8'))
+          const overlay = JSON.parse(fs.readFileSync('scripts/snapshot-config/engine-overlay.json', 'utf8'))
+          const overlayCordis = (overlay.packages ?? {})[cordisKey]
+          if (!overlayCordis) throw new Error(`the engine overlay does not pin ${cordisKey}`)
+          // The in-repo mirror tracks the engine overlay's Cordis pin rather than
+          // the component repository's, because the plugin is mounted into the
+          // APK engine tree. Compare the manifest modulo exactly that one
+          // dependency and bind the replacement value to the overlay pin, so a
+          // mirror that drifted upstream for any other reason still fails.
+          const expected = { ...pinned, dependencies: { ...(pinned.dependencies ?? {}), [cordisKey]: overlayCordis } }
+          if (JSON.stringify(expected) !== JSON.stringify(mirror)) {
+            const differences = []
+            const collect = (left, right, prefix) => {
+              const keys = new Set([...Object.keys(left ?? {}), ...Object.keys(right ?? {})])
+              for (const key of keys) {
+                const path = prefix ? `${prefix}.${key}` : key
+                const a = left?.[key]
+                const b = right?.[key]
+                if (a && b && typeof a === 'object' && typeof b === 'object') collect(a, b, path)
+                else if (JSON.stringify(a) !== JSON.stringify(b)) differences.push(path)
+              }
+            }
+            collect(expected, mirror, '')
+            throw new Error(`${mirrorRoot}/package.json differs from the pinned component commit outside the declared ${cordisKey} pin: ${differences.join(', ') || 'key order'}`)
+          }
+          const report = {
+            repository: 'https://github.com/kelai141/dsh-host-web-compat',
+            pinnedCommit: '2de902729e01eb3619aa50bdfa164c5231948848',
+            pinnedLibSha256: sha256(`${pinnedRoot}/lib/index.js`),
+            mirrorLibSha256: sha256(`${mirrorRoot}/lib/index.js`),
+            libByteIdentical: true,
+            manifestDelta: {
+              [cordisKey]: { pinnedCommitPin: pinned.dependencies?.[cordisKey], mirrorPin: mirror.dependencies?.[cordisKey], engineOverlayPin: overlayCordis },
+            },
+            manifestDeltaReason: 'The mirror is mounted into the APK engine tree, so its Cordis dependency follows the engine overlay pin instead of the component repository pin. Every other manifest field must equal the pinned commit.',
+            reason: 'lib/index.js is the shipped plugin payload and is verified byte-for-byte against the pinned component commit.',
+          }
+          fs.writeFileSync('.deploy-tmp/source-build/host-web-compat-pin.json', JSON.stringify(report, null, 2) + '\n')
+          console.log(`host-web-compat matches pinned ${report.pinnedCommit.slice(0, 7)} (Cordis pin ${mirror.dependencies[cordisKey]} follows the engine overlay)`)
+          NODE
           git clone --filter=blob:none --no-checkout --depth=1 https://github.com/DshMarketPlace/dsh-plugins-store.git .deploy-tmp/component-sources/marketplace
           git -C .deploy-tmp/component-sources/marketplace fetch --depth=1 origin 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
           git -C .deploy-tmp/component-sources/marketplace checkout --detach 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
@@ -534,6 +582,7 @@ jobs:
             .deploy-tmp/source-build/plugin-lock-sha256.txt
             .deploy-tmp/source-build/project-source-commit.txt
             .deploy-tmp/source-build/component-source-provenance.json
+            .deploy-tmp/source-build/host-web-compat-pin.json
             .deploy-tmp/source-build/marketplace-source-provenance.json
             .deploy-tmp/source-build/source-build-policy.json
             .deploy-tmp/source-build/effective-engine-overlay.json
