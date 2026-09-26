@@ -130,7 +130,47 @@ jobs:
             "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
             "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
             "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json"
+          root_manifest="package.json"
+          root_manifest_backup="$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-root-package.json.original"
+          cp "$root_manifest" "$root_manifest_backup"
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const path = 'package.json'
+          const reportPath = `${process.env.GITHUB_WORKSPACE}/.deploy-tmp/source-build/harness-build-script-exclusion.json`
+          const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex')
+          const original = fs.readFileSync(path, 'utf8')
+          // 0.1.7-rc.2 appends the Electron desktop bundle to build:lib:host. This
+          // source audit builds an Android APK: @deepseek-ai/dsh-desktop is private,
+          // absent from the engine overlay, and outside the apps/cli production
+          // deploy closure, while the recursive bundle pass below already bundles
+          // every workspace package. Removing the clause restores the 0.1.5-rc.1
+          // build shape (measured at 5.9 min for this step against 15-45 min with
+          // it). The clause is dropped for the build only and the root manifest is
+          // restored before anything is packed, so every packed manifest stays
+          // exactly as the pinned release ships it.
+          const clause = ' && pnpm --filter @deepseek-ai/dsh-desktop run bundle'
+          const occurrences = original.split(clause).length - 1
+          if (occurrences !== 1) {
+            throw new Error(`expected exactly one desktop bundle clause in the pinned root manifest, found ${occurrences}`)
+          }
+          const temporary = original.replace(clause, '')
+          fs.writeFileSync(path, temporary)
+          const report = {
+            file: 'package.json',
+            field: 'scripts.build:lib:host',
+            originalValue: JSON.parse(original).scripts['build:lib:host'],
+            temporaryValue: JSON.parse(temporary).scripts['build:lib:host'],
+            originalManifestSha256: sha256(original),
+            temporaryManifestSha256: sha256(temporary),
+            restoredAfterBuild: true,
+            reason: 'The pinned Harness release builds the Electron desktop app from build:lib:host. The source audit produces an Android APK, where @deepseek-ai/dsh-desktop is private, absent from the engine overlay and outside the apps/cli production deploy closure; the recursive bundle pass already covers every workspace package.',
+          }
+          fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
+          console.log(`harness desktop bundle excluded for the source build: ${report.originalValue.length} -> ${report.temporaryValue.length} chars`)
+          NODE
           corepack pnpm run build
+          cp "$root_manifest_backup" "$root_manifest"
           corepack pnpm --recursive --if-present run bundle
           corepack pnpm run build:web
           workspace_config="$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness/pnpm-workspace.yaml"
@@ -588,6 +628,8 @@ jobs:
             .deploy-tmp/source-build/source-build-policy.json
             .deploy-tmp/source-build/effective-engine-overlay.json
             .deploy-tmp/source-build/harness-vendor-overrides.json
+            .deploy-tmp/source-build/harness-build-script-exclusion.json
+            .deploy-tmp/source-build/harness-root-package.json.original
             .deploy-tmp/source-build/android-build-inputs-sha256.txt
             .deploy-tmp/source-build/gradle-artifacts-sha256.txt
             .deploy-tmp/source-build/signing-certificate-sha256.txt
