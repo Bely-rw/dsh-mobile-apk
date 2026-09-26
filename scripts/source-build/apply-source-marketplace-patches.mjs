@@ -15,7 +15,12 @@ if (args.length < 1) {
 
 const sourcePath = resolve('scripts/patches/apply-patches.mjs')
 const source = readFileSync(sourcePath, 'utf8')
-const newline = source.includes('\r\n') ? '\r\n' : '\n'
+// Anchors are matched against LF-normalised text: a Windows checkout can carry
+// CRLF, or a mix of both endings after a partial conversion, which would fail
+// the anchor assertion for a reason unrelated to the shared runner's content.
+// The generated runner is a temporary file, so its endings are irrelevant, and
+// the hashes below still cover the shared runner's real bytes.
+const normalized = source.replaceAll('\r\n', '\n')
 const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 const adapterSource = readFileSync(fileURLToPath(import.meta.url))
 const oldBlock = [
@@ -23,24 +28,24 @@ const oldBlock = [
   "        s = s.replace('join(`\\n`)}}', 'join(`\\n`)});return n()}}')",
   '        changed++',
   '      }',
-].join(newline)
+].join('\n')
 const sourceBlock = [
   "      if (!s.includes(')});return n()}}')) {",
   "        if (s.includes('join(`\\n`)}}')) {",
   "          s = s.replace('join(`\\n`)}}', 'join(`\\n`)});return n()}}')",
   '          changed++',
   "        } else if (s.includes('join(`\\n`)})}}')) {",
-  "          // Source-built esbuild output also closes the optional requireApproval call.",
+  '          // Source-built esbuild output also closes the optional requireApproval call.',
   "          s = s.replace('join(`\\n`)})}}', 'join(`\\n`)});return n()}}')",
   '          changed++',
   '        }',
   '      }',
-].join(newline)
+].join('\n')
 const hereLine = 'const HERE = dirname(fileURLToPath(import.meta.url))'
-if (source.split(oldBlock).length !== 2 || source.split(hereLine).length !== 2) {
+if (normalized.split(oldBlock).length !== 2 || normalized.split(hereLine).length !== 2) {
   throw new Error('shared patch runner changed; review the source-build marketplace adapter before updating it')
 }
-const adapted = source
+const adapted = normalized
   .replace(hereLine, "const HERE = join(process.cwd(), 'scripts', 'patches')")
   .replace(oldBlock, sourceBlock)
 

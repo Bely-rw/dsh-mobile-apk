@@ -584,8 +584,10 @@ jobs:
             .deploy-tmp/source-build/component-source-provenance.json
             .deploy-tmp/source-build/host-web-compat-pin.json
             .deploy-tmp/source-build/marketplace-source-provenance.json
+            .deploy-tmp/source-build/marketplace-patch-adapter.json
             .deploy-tmp/source-build/source-build-policy.json
             .deploy-tmp/source-build/effective-engine-overlay.json
+            .deploy-tmp/source-build/harness-vendor-overrides.json
             .deploy-tmp/source-build/android-build-inputs-sha256.txt
             .deploy-tmp/source-build/gradle-artifacts-sha256.txt
             .deploy-tmp/source-build/signing-certificate-sha256.txt
