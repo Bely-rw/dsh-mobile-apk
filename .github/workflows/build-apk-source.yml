@@ -1,0 +1,556 @@
+name: build-apk-source
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    env:
+      DSH_APK_DIR: ${{ github.workspace }}
+    steps:
+      - name: Checkout project source without Git LFS runtime archives
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Prepare build tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install archive and signature tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xz-utils gnupg unzip
+
+      - name: Checkout pinned DeepSeek Harness source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .deploy-tmp
+          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 477b4f420553e8a52c2fbccc464d7561b239c443
+          git -C .deploy-tmp/deepseek-harness checkout --detach 477b4f420553e8a52c2fbccc464d7561b239c443
+          git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
+          git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 7bedce822f2c6b076df167dff46eecf81bbd5de4
+          test "$(git -C .deploy-tmp/deepseek-harness rev-parse HEAD)" = "477b4f420553e8a52c2fbccc464d7561b239c443"
+
+      - name: Checkout pinned component sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .deploy-tmp/component-sources
+          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
+          git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 2de902729e01eb3619aa50bdfa164c5231948848
+          git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 2de902729e01eb3619aa50bdfa164c5231948848
+          test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "2de902729e01eb3619aa50bdfa164c5231948848"
+          cmp dsh-host-web-compat/package.json .deploy-tmp/component-sources/host-web-compat/package.json
+          cmp dsh-host-web-compat/lib/index.js .deploy-tmp/component-sources/host-web-compat/lib/index.js
+          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/DshMarketPlace/dsh-plugins-store.git .deploy-tmp/component-sources/marketplace
+          git -C .deploy-tmp/component-sources/marketplace fetch --depth=1 origin 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
+          git -C .deploy-tmp/component-sources/marketplace checkout --detach 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
+          test "$(git -C .deploy-tmp/component-sources/marketplace rev-parse HEAD)" = "8354d9a0a1ad49ad12075d8ec0c2bf44f4349856"
+          test "$(node -p "require('./.deploy-tmp/component-sources/marketplace/package.json').version")" = "0.1.5"
+          rm -rf vendor/dshmarketplace-plugin
+          mkdir -p vendor/dshmarketplace-plugin
+          git -C .deploy-tmp/component-sources/marketplace archive HEAD | tar -x -C vendor/dshmarketplace-plugin
+
+      - name: Build and pack DeepSeek Harness from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.deploy-tmp/source-build"
+          cd .deploy-tmp/deepseek-harness
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm --version > "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
+          printf 'deployment pnpm: ' >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
+          corepack pnpm@12.2.0 --pm-on-fail=ignore --version >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
+          python3 "$GITHUB_WORKSPACE/scripts/source-build/prepare-harness-vendor-overrides.py" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
+            "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json"
+          corepack pnpm run build
+          corepack pnpm --recursive --if-present run bundle
+          corepack pnpm run build:web
+          workspace_config="$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness/pnpm-workspace.yaml"
+          workspace_backup="$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-workspace.original.yaml"
+          package_backup_dir="$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure"
+          package_backup="$package_backup_dir/apps-cli-package.json.original"
+          lock_backup="$package_backup_dir/pnpm-lock.yaml.original"
+          cp "$workspace_config" "$workspace_backup"
+          mkdir -p "$package_backup_dir"
+          cp apps/cli/package.json "$package_backup"
+          cp pnpm-lock.yaml "$lock_backup"
+          restore_deploy_inputs() {
+            cp "$workspace_backup" "$workspace_config"
+            cp "$package_backup" apps/cli/package.json
+            cp "$lock_backup" pnpm-lock.yaml
+          }
+          trap restore_deploy_inputs EXIT
+          python3 "$GITHUB_WORKSPACE/scripts/source-build/prepare-pnpm-deploy-policy.py" \
+            "$workspace_config" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-build-policy.json"
+          cp "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-build-policy.json" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/source-build-policy.json"
+          node "$GITHUB_WORKSPACE/scripts/source-build/prepare-pnpm-deploy-runtime-closure.mjs" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
+            "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
+            "$package_backup_dir" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.json"
+          corepack pnpm install --lockfile-only --no-frozen-lockfile
+          corepack pnpm install --frozen-lockfile --ignore-scripts
+          corepack pnpm@12.2.0 --pm-on-fail=ignore --filter @deepseek-ai/dsh deploy --prod "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
+          cp pnpm-lock.yaml "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml"
+          restore_deploy_inputs
+          trap - EXIT
+          cd "$GITHUB_WORKSPACE"
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const { createRequire } = require('node:module')
+          const path = require('node:path')
+          const yaml = createRequire(path.resolve('.deploy-tmp/deepseek-harness/apps/cli/package.json'))('js-yaml')
+          const lockPath = '.deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml'
+          const lock = yaml.load(fs.readFileSync(lockPath, 'utf8'))
+          const reportPath = '.deploy-tmp/source-build/pnpm-deploy-runtime-closure.json'
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
+          const digest = (value) => crypto.createHash('sha256').update(value).digest('hex')
+          const exact = (name, version) => {
+            const key = Object.keys(lock.packages ?? {}).find((entry) => entry === `${name}@${version}` || entry.startsWith(`${name}@${version}(`))
+            if (!key) throw new Error(`temporary runtime lock is missing ${name}@${version}`)
+            return { lockKey: key, resolution: lock.packages[key].resolution }
+          }
+          report.resolvedLockfileSha256 = digest(fs.readFileSync(lockPath))
+          report.androidRuntimeDependencies.resolvedPackages = {
+            koffi: exact('koffi', '3.2.1'),
+            koffiAndroidArm64: exact('@koromix/koffi-android-arm64', '3.2.1'),
+            sharpWasm32: exact('@img/sharp-wasm32', '0.35.3'),
+          }
+          fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
+          const policyPath = '.deploy-tmp/source-build/source-build-policy.json'
+          const policy = JSON.parse(fs.readFileSync(policyPath, 'utf8'))
+          policy.androidRuntimePackages = {
+            audit: '.deploy-tmp/source-build/android-native-runtime-packages.json',
+            trustedPublisherInputs: [
+              { name: '@koromix/koffi-android-arm64', version: '3.2.1', upstream: 'https://github.com/Koromix/koffi', role: 'Android ARM64 Node-API binding for Koffi' },
+              { name: '@img/sharp-wasm32', version: '0.35.3', upstream: 'https://github.com/lovell/sharp', role: 'WebAssembly fallback for Sharp on Android' },
+            ],
+            lockfileSha256: report.resolvedLockfileSha256,
+            lockfileIntegrityEntries: report.androidRuntimeDependencies.resolvedPackages,
+            note: 'These runtime binaries are publisher-provided official packages, not local source builds. Their package identity, resolution integrity, runtime payload hashes, ABI or module path are recorded by the source-build audits.'
+          }
+          fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
+          NODE
+          python3 scripts/source-build/prune-harness-preview.py \
+            .deploy-tmp/deepseek-harness \
+            .deploy-tmp/engine-deploy \
+            .deploy-tmp/source-build/harness-web-preview-exclusion.json
+          cp scripts/snapshot-config/engine-overlay.json .deploy-tmp/source-build/engine-overlay.original.json
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = 'scripts/snapshot-config/engine-overlay.json'
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'))
+          const baseHash = require('node:crypto').createHash('sha256').update(fs.readFileSync(path)).digest('hex')
+          const sourceOnlyVendorTop = { 'partial-json': '0.1.7' }
+          for (const [name, version] of Object.entries(sourceOnlyVendorTop)) {
+            const existing = manifest.vendorTop?.[name]
+            if (existing && existing !== version) throw new Error(`source-only runtime pin conflicts for ${name}: ${existing} vs ${version}`)
+            manifest.vendorTop = { ...(manifest.vendorTop ?? {}), [name]: version }
+          }
+          fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n')
+          const policyPath = '.deploy-tmp/source-build/source-build-policy.json'
+          const policy = JSON.parse(fs.readFileSync(policyPath, 'utf8'))
+          policy.sourceOnlyVendorTop = {
+            baseOverlaySha256: baseHash,
+            packages: sourceOnlyVendorTop,
+            reason: 'A clean Termux bootstrap does not inherit the partial-json transitive copy present in the legacy LFS runtime base; keep its exact Harness runtime version in the source-built engine overlay.'
+          }
+          policy.harnessVendorSourceOverrides = '.deploy-tmp/source-build/harness-vendor-overrides.json'
+          policy.harnessVendorSourceOverridesSha256 = require('node:crypto').createHash('sha256').update(fs.readFileSync('.deploy-tmp/source-build/harness-vendor-overrides.json')).digest('hex')
+          fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
+          NODE
+          node scripts/source-build/export-dsh-engine.mjs \
+            .deploy-tmp/deepseek-harness .deploy-tmp/engine-overlay
+          node scripts/source-build/inject-dsh-engine-packages.mjs \
+            .deploy-tmp/engine-deploy .deploy-tmp/engine-overlay \
+            scripts/snapshot-config/engine-overlay.json \
+            .deploy-tmp/source-build/first-party-deploy-injection.json
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = 'scripts/snapshot-config/engine-overlay.json'
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'))
+          const injection = JSON.parse(fs.readFileSync('.deploy-tmp/source-build/first-party-deploy-injection.json', 'utf8'))
+          const runtimeClosure = JSON.parse(fs.readFileSync('.deploy-tmp/source-build/pnpm-deploy-runtime-closure.json', 'utf8'))
+          const sourcePackages = Object.entries(manifest.packages ?? {})
+            .filter(([name]) => name.startsWith('@deepseek-ai/'))
+            .map(([name, version]) => ({ name, version }))
+          if (sourcePackages.length !== injection.packageCount) throw new Error(`injected ${injection.packageCount} first-party packages, overlay lists ${sourcePackages.length}`)
+          for (const { name } of sourcePackages) delete manifest.packages[name]
+          fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n')
+          const sourceBuildPolicyPath = '.deploy-tmp/source-build/source-build-policy.json'
+          const sourceBuildPolicy = JSON.parse(fs.readFileSync(sourceBuildPolicyPath, 'utf8'))
+          fs.writeFileSync('.deploy-tmp/source-build/source-build-policy.json', JSON.stringify({
+            ...sourceBuildPolicy,
+            omittedFirstPartyPackageOverlays: sourcePackages,
+            firstPartySourceInjection: injection,
+            pnpmDeployRuntimeClosure: runtimeClosure,
+            firstPartyOverlayReason: 'The source-built package tarballs are injected into the physical targets of the pnpm deploy package links before bootstrap packaging. This supplies built lib files while preserving each package symlink and its sibling virtual-store dependency links; the snapshot builder skips re-extracting these packages.',
+            exportedFirstPartyTarballs: 'Built from the pinned source, hashed in source-build-manifest.json, and injected into the pnpm deploy tree before that tree is copied into the APK runtime.',
+          }, null, 2) + '\n')
+          fs.writeFileSync('.deploy-tmp/source-build/effective-engine-overlay.json', JSON.stringify(manifest, null, 2) + '\n')
+          NODE
+
+      - name: Authenticate official Termux bootstrap and extract signing keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .deploy-tmp/source-build
+          curl --fail --location --retry 3 \
+            'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
+            --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          python3 scripts/source-build/prepare-termux-bootstrap.py \
+            --extract-bootstrap-only \
+            .deploy-tmp/source-build/bootstrap-aarch64.zip \
+            .deploy-tmp/source-build/bootstrap-extracted/usr
+
+      - name: Build project plugins and marketplace from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage dsh-shell-termux plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay dsh-client-ui-responsive vendor/dshmarketplace-plugin; do
+            echo "== source build $d =="
+            if [ -f "$d/package-lock.json" ]; then
+              (cd "$d" && npm ci --no-audit --no-fund)
+            else
+              (cd "$d" && npm install --no-audit --no-fund)
+            fi
+            (cd "$d" && npm run build)
+          done
+
+      - name: Apply project patches to the source-built marketplace
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/source-build/apply-source-marketplace-patches.mjs vendor --apply
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const cp = require('node:child_process')
+          const sourceRoot = '.deploy-tmp/component-sources/marketplace'
+          const packageRoot = 'vendor/dshmarketplace-plugin'
+          const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+          const listFiles = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+            const full = path.join(dir, entry.name)
+            return entry.isDirectory() ? listFiles(full) : [full]
+          }).sort()
+          const commit = cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          const sourcePackage = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package.json'), 'utf8'))
+          const patchRegistry = JSON.parse(fs.readFileSync('scripts/patches/registry.json', 'utf8'))
+          const marketplacePatches = patchRegistry.patches
+            .filter((patch) => patch.target.startsWith('dshmarketplace-plugin/'))
+            .map(({ id, target }) => ({ id, target }))
+          const expectedPatches = ['market-A', 'market-B', 'market-C', 'market-D-server', 'market-route-auth-U2', 'market-D-client']
+          for (const id of expectedPatches) {
+            if (!marketplacePatches.some((patch) => patch.id === id)) throw new Error(`missing registered marketplace patch: ${id}`)
+          }
+          const sourceFiles = listFiles(path.join(sourceRoot, 'src')).map((file) => ({
+            path: path.relative(sourceRoot, file).replaceAll(path.sep, '/'),
+            sha256: sha256(file),
+          }))
+          const provenance = {
+            repository: 'https://github.com/DshMarketPlace/dsh-plugins-store',
+            sourceCommit: commit,
+            sourceTree: cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim(),
+            packageVersion: sourcePackage.version,
+            buildCommand: 'npm run build',
+            sourceFiles,
+            projectCommit: process.env.GITHUB_SHA,
+            patchRegistrySha256: sha256('scripts/patches/registry.json'),
+            patchImplementationSha256: sha256('scripts/patches/apply-patches.mjs'),
+            patchMode: 'ensure (--apply)',
+            registeredMarketplacePatches: marketplacePatches,
+            generatedAndPatchedOutputs: {
+              'lib/index.js': sha256(path.join(packageRoot, 'lib/index.js')),
+              'lib/client.js': sha256(path.join(packageRoot, 'lib/client.js')),
+            },
+          }
+          fs.writeFileSync('.deploy-tmp/source-build/marketplace-source-provenance.json', JSON.stringify(provenance, null, 2) + '\n')
+          NODE
+
+      - name: Add Node.js to the clean Termux base
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .deploy-tmp/source-build
+          cp scripts/snapshot-config/preinstall.json .deploy-tmp/source-build/preinstall.original.json
+          test -s .deploy-tmp/source-build/engine-overlay.original.json
+          node -e 'const fs=require("fs"); const p="scripts/snapshot-config/preinstall.json"; const x=JSON.parse(fs.readFileSync(p,"utf8")); if (!x.targets.includes("nodejs-lts")) x.targets.push("nodejs-lts"); x.requiredTargets=["nodejs-lts"]; fs.writeFileSync(p,JSON.stringify(x,null,2)+"\n")'
+          node <<'NODE'
+          const fs = require('fs')
+          const path = 'scripts/snapshot-config/engine-overlay.json'
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'))
+          const omitted = manifest.keepUnpublished ?? []
+          manifest.keepUnpublished = []
+          fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n')
+          const policyPath = '.deploy-tmp/source-build/source-build-policy.json'
+          const policy = JSON.parse(fs.readFileSync(policyPath, 'utf8'))
+          policy.omittedLegacyKeepUnpublished = omitted
+          policy.omittedLegacyKeepUnpublishedReason = 'These packages are absent from the pinned Harness source commit and are unmounted legacy residue inherited only from the old LFS runtime base.'
+          fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
+          fs.writeFileSync('.deploy-tmp/source-build/effective-engine-overlay.json', JSON.stringify(manifest, null, 2) + '\n')
+          NODE
+
+      - name: Verify signed Termux repository and stage pinned packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/source-build/prepare-termux-signed-repo.py \
+            .deploy-tmp/source-build/bootstrap-extracted/usr \
+            .deploy-tmp/source-build/termux-webroot \
+            scripts/snapshot-config/preinstall.json
+
+      - name: Cross-compile node-pty Android binding from pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_archive=.deploy-tmp/source-build/android-ndk-r30-linux.zip
+          curl --fail --location --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+            --output "$ndk_archive"
+          printf '%s  %s\n' '5107f898313790e449e87eee2183d9a20602dee9' "$ndk_archive" | sha1sum --check -
+          printf '%s\n' '5107f898313790e449e87eee2183d9a20602dee9' \
+            > .deploy-tmp/source-build/ndk-archive-sha1.txt
+          unzip -q "$ndk_archive" -d .deploy-tmp/source-build/ndk
+          node_deb=$(python3 - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path('.deploy-tmp/source-build/termux-packages-provenance.json').read_text())
+          packages = [item for item in report['packages'] if item['package'] == 'nodejs-lts']
+          if len(packages) != 1:
+              raise SystemExit('signed Termux repository must contain exactly one nodejs-lts package')
+          print(pathlib.Path('.deploy-tmp/source-build/termux-webroot') / packages[0]['filename'])
+          PY
+          )
+          mkdir -p .deploy-tmp/source-build/node-deb-extracted
+          dpkg-deb --extract "$node_deb" .deploy-tmp/source-build/node-deb-extracted
+          node_header=$(find .deploy-tmp/source-build/node-deb-extracted -path '*/include/node/node_api.h' -print -quit)
+          test -n "$node_header"
+          node_headers=$(dirname "$node_header")
+          node scripts/source-build/build-node-pty-android.mjs \
+            .deploy-tmp/engine-deploy \
+            "$node_headers" \
+            .deploy-tmp/source-build/ndk/android-ndk-r30 \
+            .deploy-tmp/source-build/node-pty-android-build.json
+          node scripts/source-build/check-android-native-runtime-packages.mjs \
+            .deploy-tmp/engine-deploy \
+            .deploy-tmp/source-build/android-native-runtime-packages.json
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = '.deploy-tmp/source-build/source-build-policy.json'
+          const policy = JSON.parse(fs.readFileSync(path, 'utf8'))
+          policy.nodePtyAndroidSourceBuild = {
+            report: '.deploy-tmp/source-build/node-pty-android-build.json',
+            source: 'node-pty@1.2.0-beta.15 pinned npm package with the Harness lockfile integrity and patch',
+            headers: 'nodejs-lts headers from the SHA256-authenticated Termux package in the signed repository',
+            toolchain: 'Google Android NDK r30, Linux archive SHA1 5107f898313790e449e87eee2183d9a20602dee9',
+          }
+          fs.writeFileSync(path, JSON.stringify(policy, null, 2) + '\n')
+          NODE
+
+      - name: Assemble clean Termux base with the source-built Android binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .deploy-tmp/arm64-base
+          python3 scripts/source-build/prepare-termux-bootstrap.py \
+            .deploy-tmp/source-build/bootstrap-aarch64.zip \
+            .deploy-tmp/deepseek-harness \
+            .deploy-tmp/engine-deploy \
+            .deploy-tmp/arm64-base/base-usr.tar.xz
+
+      - name: Build runtime snapshot from verified inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          original=".deploy-tmp/source-build/preinstall.original.json"
+          test -f "$original"
+          restore_config() { cp "$original" scripts/snapshot-config/preinstall.json; }
+          server_pid=""
+          cleanup() {
+            restore_config
+            if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+          node -e 'const fs=require("fs"); const p="scripts/snapshot-config/preinstall.json"; const x=JSON.parse(fs.readFileSync(p,"utf8")); x.mirrors=["http://127.0.0.1:8787"]; fs.writeFileSync(p,JSON.stringify(x,null,2)+"\n")'
+          python3 -m http.server 8787 --bind 127.0.0.1 \
+            --directory .deploy-tmp/source-build/termux-webroot \
+            > .deploy-tmp/source-build/termux-http.log 2>&1 &
+          server_pid=$!
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:8787/dists/stable/main/binary-aarch64/Packages.gz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --silent --fail http://127.0.0.1:8787/dists/stable/main/binary-aarch64/Packages.gz >/dev/null
+          if node scripts/build-snapshot-013.mjs arm64; then
+            :
+          else
+            node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const esbuild = require('./plugins/dsh-android-bridge/node_modules/esbuild')
+          const root = '.deploy-tmp/snapshot-013/arm64/stage/root'
+          let failures = 0
+          function walk(dir, rel = '') {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const childRel = rel ? `${rel}/${entry.name}` : entry.name
+              const full = path.join(dir, entry.name)
+              if (entry.isDirectory()) walk(full, childRel)
+              else if (entry.isFile() && (/(^|\/)dsh-web-frontend\/dist\/.*\.js$/.test(childRel) || /(^|\/)lib\/client\.js$/.test(childRel))) {
+                try { esbuild.transformSync(fs.readFileSync(full, 'utf8'), { loader: 'js', logLevel: 'silent', target: 'chrome87' }) }
+                catch (error) {
+                  failures++
+                  console.error(`CHROME87 transform failed: ${childRel}`)
+                  for (const item of error.errors ?? []) console.error(item.text)
+                }
+              }
+            }
+          }
+          if (fs.existsSync(root)) walk(root)
+          if (!failures) console.error('CHROME87 diagnostic found no failing file in the retained stage tree')
+          NODE
+            exit 1
+          fi
+          node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
+            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
+            .deploy-tmp/engine-overlay/source-build-manifest.json \
+            .deploy-tmp/source-build/pnpm-package-materialization.json
+          snapshot_archive="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.tar.xz"
+          snapshot_repacked="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.source-built.tar.xz"
+          (
+            cd .deploy-tmp/snapshot-013/arm64/stage/root
+            tar -c --mtime=@1704067200 usr home/.dsh home/.gitconfig 2>/dev/null \
+              | xz -T8 -6 > "$snapshot_repacked"
+          )
+          mv "$snapshot_repacked" "$snapshot_archive"
+          sha256sum "$snapshot_archive" | cut -d' ' -f1 > .deploy-tmp/snapshot-013/arm64/snapshot.sha256
+          node scripts/source-build/check-dsh-runtime-dependencies.mjs \
+            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
+            .deploy-tmp/source-build/post-snapshot-runtime-dependency-check.json
+          node scripts/source-build/check-android-native-runtime-packages.mjs \
+            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
+            .deploy-tmp/source-build/post-snapshot-native-runtime-check.json
+          node scripts/source-build/check-dsh-source-snapshot.mjs "$snapshot_archive"
+
+      - name: Generate ephemeral signing certificate from the installed JDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f keystore/debug.keystore
+          keytool -genkeypair -noprompt \
+            -keystore keystore/debug.keystore -storetype PKCS12 \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname 'CN=DSH Source Build,OU=Ephemeral,O=dsh-mobile-apk,C=US'
+          keytool -list -v -keystore keystore/debug.keystore \
+            -storepass android -alias androiddebugkey \
+            | grep -E '^[[:space:]]*SHA256:' > .deploy-tmp/source-build/signing-certificate-sha256.txt
+
+      - name: Build ARM64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          overlay_gate_backup=.deploy-tmp/source-build/check-engine-overlay.original.mjs
+          cp scripts/check-engine-overlay.mjs "$overlay_gate_backup"
+          restore_overlay() {
+            cp .deploy-tmp/source-build/engine-overlay.original.json scripts/snapshot-config/engine-overlay.json
+            cp "$overlay_gate_backup" scripts/check-engine-overlay.mjs
+          }
+          trap restore_overlay EXIT
+          node <<'NODE'
+          const fs = require('node:fs')
+          const crypto = require('node:crypto')
+          const policyPath = '.deploy-tmp/source-build/source-build-policy.json'
+          const policy = JSON.parse(fs.readFileSync(policyPath, 'utf8'))
+          const digest = (path) => crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex')
+          policy.sourceBuiltEngineOverlayGate = {
+            originalGate: 'scripts/check-engine-overlay.mjs',
+            originalGateSha256: digest('.deploy-tmp/source-build/check-engine-overlay.original.mjs'),
+            temporaryAdapter: 'scripts/source-build/check-dsh-source-snapshot-gate.mjs',
+            temporaryAdapterSha256: digest('scripts/source-build/check-dsh-source-snapshot-gate.mjs'),
+            checker: 'scripts/source-build/check-dsh-source-snapshot.mjs',
+            checkerSha256: digest('scripts/source-build/check-dsh-source-snapshot.mjs'),
+            reason: 'The standard gate models the older flattened npm overlay; this source audit uses the pinned 0.1.7-rc.2 pnpm deploy tree. The replacement validates the final snapshot against the pinned source package manifest, pnpm dependency links, and registered engine patch markers.'
+          }
+          fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
+          NODE
+          cp scripts/source-build/check-dsh-source-snapshot-gate.mjs scripts/check-engine-overlay.mjs
+          node scripts/build-apk.mjs --abi arm64 --suffix -source
+          find out -type f -name '*.apk' -print -exec sha256sum {} \; > .deploy-tmp/source-build/apk-sha256.txt
+          test -s .deploy-tmp/source-build/apk-sha256.txt
+          find .deploy-tmp/engine-overlay -maxdepth 1 -type f -name '*.tgz' -print0 \
+            | sort -z | xargs -0 -r sha256sum \
+            > .deploy-tmp/source-build/engine-overlay-sha256.txt
+          find .deploy-tmp/snapshot-013/arm64/.debs -maxdepth 1 -type f -name '*.tgz' -print0 \
+            | sort -z | xargs -0 -r sha256sum \
+            > .deploy-tmp/source-build/runtime-tarballs-sha256.txt
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay dsh-shell-termux dsh-client-ui-responsive vendor/dshmarketplace-plugin; do
+            sha256sum "$d/package.json" "$d/package-lock.json" 2>/dev/null || true
+          done > .deploy-tmp/source-build/plugin-lock-sha256.txt
+          printf '%s\n' "$GITHUB_SHA" > .deploy-tmp/source-build/project-source-commit.txt
+          node -e 'const fs=require("fs"); const cp=require("child_process"); const dirs={"dsh-host-web-compat":".deploy-tmp/component-sources/host-web-compat","dshmarketplace-plugin":".deploy-tmp/component-sources/marketplace"}; const out={projectCommit:process.env.GITHUB_SHA,deepseekHarnessCommit:cp.execFileSync("git",["-C",".deploy-tmp/deepseek-harness","rev-parse","HEAD"],{encoding:"utf8"}).trim(),components:{}}; for(const [name,dir] of Object.entries(dirs)) out.components[name]={commit:cp.execFileSync("git",["-C",dir,"rev-parse","HEAD"],{encoding:"utf8"}).trim()}; out.components["dsh-undo-savepoint"]={source:"checked-in JavaScript source",fileSha256:require("crypto").createHash("sha256").update(fs.readFileSync("vendor/dsh-undo-savepoint/lib/index.js")).digest("hex")}; fs.writeFileSync(".deploy-tmp/source-build/component-source-provenance.json",JSON.stringify(out,null,2)+"\n")'
+          sha256sum app/build.gradle.kts build.gradle.kts settings.gradle.kts \
+            > .deploy-tmp/source-build/android-build-inputs-sha256.txt
+          gradle_artifacts="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2/files-2.1"
+          find "$gradle_artifacts" -type f \( -name '*.jar' -o -name '*.aar' \) -print0 \
+            | sort -z | xargs -0 -r sha256sum \
+            > .deploy-tmp/source-build/gradle-artifacts-sha256.txt
+          cat .deploy-tmp/source-build/apk-sha256.txt
+
+      - name: Upload APK and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-mobile-apk-arm64-source-${{ github.sha }}
+          path: |
+            out/v*/*.apk
+            .deploy-tmp/arm64-base/base-usr.tar.xz.provenance.json
+            .deploy-tmp/source-build/termux-packages-provenance.json
+            .deploy-tmp/engine-overlay/source-build-manifest.json
+            .deploy-tmp/source-build/apk-sha256.txt
+            .deploy-tmp/source-build/engine-overlay-sha256.txt
+            .deploy-tmp/source-build/runtime-tarballs-sha256.txt
+            .deploy-tmp/source-build/plugin-lock-sha256.txt
+            .deploy-tmp/source-build/project-source-commit.txt
+            .deploy-tmp/source-build/component-source-provenance.json
+            .deploy-tmp/source-build/marketplace-source-provenance.json
+            .deploy-tmp/source-build/source-build-policy.json
+            .deploy-tmp/source-build/effective-engine-overlay.json
+            .deploy-tmp/source-build/android-build-inputs-sha256.txt
+            .deploy-tmp/source-build/gradle-artifacts-sha256.txt
+            .deploy-tmp/source-build/signing-certificate-sha256.txt
+            .deploy-tmp/source-build/package-manager-versions.txt
+            .deploy-tmp/source-build/pnpm-deploy-build-policy.json
+            .deploy-tmp/source-build/pnpm-deploy-runtime-closure.json
+            .deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml
+            .deploy-tmp/source-build/android-native-runtime-packages.json
+            .deploy-tmp/source-build/node-pty-android-build.json
+            .deploy-tmp/source-build/ndk-archive-sha1.txt
+            .deploy-tmp/source-build/post-snapshot-native-runtime-check.json
+            .deploy-tmp/source-build/harness-web-preview-exclusion.json
+            .deploy-tmp/source-build/post-snapshot-runtime-dependency-check.json
+            .deploy-tmp/source-build/source-engine-snapshot-check.json
+            .deploy-tmp/source-build/pnpm-package-materialization.json
+          if-no-files-found: error
+          retention-days: 30
