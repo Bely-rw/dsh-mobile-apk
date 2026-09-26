@@ -125,7 +125,23 @@ jobs:
           corepack pnpm install --frozen-lockfile
           corepack pnpm --version > "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
           printf 'deployment pnpm: ' >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
-          corepack pnpm@12.2.0 --pm-on-fail=ignore --version >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
+          # corepack's fetcher has no download deadline: a stalled connection leaves the
+          # step silent forever rather than failing (measured 2026-09-26: the pnpm 12.2.0
+          # fetch logged nothing for 43 minutes until the run was cancelled, while the
+          # frozen install ahead of it had finished in 18 s). Bound each attempt with
+          # `timeout` and retry, then warm the cache once here so the deploy call below
+          # reuses the same binary instead of downloading again.
+          deployment_pnpm=""
+          for attempt in 1 2 3 4 5; do
+            if deployment_pnpm="$(timeout 240 corepack pnpm@12.2.0 --pm-on-fail=ignore --version)"; then
+              break
+            fi
+            deployment_pnpm=""
+            echo "corepack pnpm@12.2.0 attempt ${attempt} did not complete within 240s; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          test -n "$deployment_pnpm"
+          printf '%s\n' "$deployment_pnpm" >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
           python3 "$GITHUB_WORKSPACE/scripts/source-build/prepare-harness-vendor-overrides.py" \
             "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
             "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
