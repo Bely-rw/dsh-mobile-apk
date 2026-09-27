@@ -39,6 +39,7 @@ jobs:
           node --test scripts/source-build/preset-carriers.test.mjs
           node --test scripts/source-build/restore-overlay-pins.test.mjs
           node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
+          node --test scripts/source-build/normalize-snapshot.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |

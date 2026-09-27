@@ -22,6 +22,7 @@ import { XZ_THREADS } from '../lib/shell.mjs'
 import { checkDshRuntimeDependencies } from './check-dsh-runtime-dependencies.mjs'
 import { checkAndroidNativeRuntimePackages } from './check-android-native-runtime-packages.mjs'
 import { checkPresetCarriers } from './preset-carriers.mjs'
+import { normalizeSnapshot } from './normalize-snapshot.mjs'
 import { collectPhysicalFiles, matchesPatchTarget } from './reconcile-engine-patch-copies.mjs'
 
 const snapshotArg = process.argv[2]
@@ -76,13 +77,14 @@ for (const item of sourceManifest.packages) {
 const tempRoot = mkdtempSync(join(tmpdir(), 'dsh-source-snapshot-'))
 try {
   const decoder = spawn('xz', ['-d', `-T${XZ_THREADS}`, '-c', snapshot], { stdio: ['ignore', 'pipe', 'inherit'] })
+  // **全量解包**（原先只解引擎前缀 + canvas 一个包）：语义归一化要走遍整棵树，
+  // 而外部复核方拿到 APK 后也正是「解包整个 snapshot.tar.xz」——两侧必须看同一份输入，
+  // 否则归一化摘要不可比。解压那一步本来就要跑完整条 xz 流，多出的只是 tar 写盘。
   const extractor = spawn('tar', [
     '-xf', '-',
     '-C', tempRoot,
     '--no-same-owner',
     '--no-same-permissions',
-    packagePrefix,
-    'home/.dsh/profiles/web/node_modules/@napi-rs/canvas-android-arm64',
   ], { stdio: ['pipe', 'inherit', 'inherit'] })
   decoder.stdout.pipe(extractor.stdin)
   extractor.stdin.on('error', () => {}) // tar can close early after an extraction failure.
@@ -91,6 +93,18 @@ try {
     child.on('close', (code) => code === 0 ? accept() : reject(new Error(`${name} exited ${code}`)))
   })
   await Promise.all([successful(decoder, 'xz'), successful(extractor, 'tar')])
+  // ── 语义归一化摘要（坑 202）───────────────────────────────────────────────
+  // 本链的产物**不是逐字节可复现**的：同一套构建输入、相隔 90 分钟的两次构建，APK sha256
+  // 不同（实测 7aff2320… vs 99f64ede…）。差异全部落在**表示层**——JSON/YAML 的映射键序、
+  // pnpm 的若干时间戳字段，语义上不可观测。该摘要把它们剔除后给出稳定值，供外部复核方
+  // 重跑本链后比对，使「语义等价」成为机械判据而非人眼判断。规则清单与逐条理由见
+  // normalize-snapshot.mjs；**真**差异（如 dpkg/available 的包数变化）刻意不归一化。
+  // 放在这里（解包后、逐包校验前）：它只依赖解包结果，与其后各项检查相互独立；
+  // 前移还能让「规则撞上不认识的形态」这类 fail-loud 在**几秒内**暴露，
+  // 而不是等逐包 tarball 校验跑完。
+  const normalization = normalizeSnapshot(tempRoot)
+  delete normalization.manifest // 四万余行，留在内存里可比对，不进 report
+
   const engineRoot = join(tempRoot, packagePrefix)
   const physicalEngineRoot = realpathSync(engineRoot)
   const packageChecks = []
@@ -206,11 +220,13 @@ try {
     canvasAndroidArm64: { version: canvasManifest.version, size: canvasBytes.length, sha256: sha256(canvasBytes) },
     patchChecks,
     presetCarriers: carrierChecks,
+    snapshotNormalization: normalization,
   }
   mkdirSync(sourceBuildRoot, { recursive: true })
   writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
   const carriers = carrierChecks.map((carrier) => `${carrier.label} ${carrier.fileCount}`).join(', ')
   console.log(`source snapshot check passed: ${packageChecks.length} pinned packages, ${dependencyCheck.dependencyCount} dependency links, ${patchChecks.length} engine patch markers, preset carriers: ${carriers}`)
+  console.log(`semantic normalization digest: ${normalization.normalizedManifestSha256}（${normalization.fileCount} 条目；规则 ${normalization.rules.map((r) => r.id + '=' + r.applied).join(' ')}）`)
 } finally {
   rmSync(tempRoot, { recursive: true, force: true })
 }

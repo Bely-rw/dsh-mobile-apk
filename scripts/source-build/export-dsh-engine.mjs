@@ -6,6 +6,9 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
+// 规范化实现与检查器**共用同一份**（见 normalize-snapshot.mjs 顶部）：构建期写进去的
+// 规范形态与校验期算出来的必须是同一件事，否则摘要对不上。两处各写一份迟早漂移。
+import { canonicalizePackedManifest } from './normalize-snapshot.mjs'
 
 const repo = resolve(process.argv[2] ?? '')
 const cache = resolve(process.argv[3] ?? '')
@@ -77,6 +80,7 @@ for (const [name, version] of [...wanted].sort(([a], [b]) => a.localeCompare(b))
   const outName = `${name.replace('@', '').replace('/', '-')}-${version}.tgz`
   const outPath = join(cache, outName)
   renameSync(join(tmp, candidates[0]), outPath)
+  canonicalizePackedManifest(outPath, name)
   const digest = createHash('sha256').update(readFileSync(outPath)).digest('hex')
   packed.push({
     name,

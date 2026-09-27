@@ -39,6 +39,7 @@ jobs:
           node --test scripts/source-build/preset-carriers.test.mjs
           node --test scripts/source-build/restore-overlay-pins.test.mjs
           node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
+          node --test scripts/source-build/normalize-snapshot.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       # 补丁镜像面（自我一致性，不引用协调仓）：本仓是公开的自包含构建宿主，**不得**依赖
       # 私有协调仓——此前用 `GH_PAT` 跨仓检出私有 dsh-mobile，PAT 失效即在检出步骤硬失败，

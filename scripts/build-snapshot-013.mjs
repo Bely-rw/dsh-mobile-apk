@@ -454,9 +454,12 @@ writeFileSync(INDEX_BODY, gunzipSync(gz.buf))
 const indexText = readFileSync(INDEX_BODY, 'utf8')
 
 const pkgs = new Map()
+// 包名 → 索引里的**原始块**（逐字保留，供 dpkg/available 使用）
+const rawBlocks = new Map()
 for (const block of indexText.split('\n\n')) {
   const name = block.match(/^Package: (.+)$/m)?.[1]
   if (!name) continue
+  rawBlocks.set(name, block)
   const get = (k) => block.match(new RegExp(`^${k}: (.+)$`, 'm'))?.[1]?.trim() ?? ''
   pkgs.set(name, {
     version: get('Version'),
@@ -583,8 +586,16 @@ mkdirSync(join(dpkgDir, 'info'), { recursive: true })
 mkdirSync(join(dpkgDir, 'parts'), { recursive: true })
 writeFileSync(join(dpkgDir, 'status'), dpkgStatus.join('\n'))
 writeFileSync(join(dpkgDir, 'status-old'), dpkgStatus.join('\n'))
-writeFileSync(join(dpkgDir, 'available'), indexText.split('\n\n').filter((b) => b.startsWith('Package:')).join('\n\n') + '\n')
-log('dpkg status: ' + dpkgStatus.length + ' 包')
+// dpkg/available：由**整份活上游索引**改为「本链实际安装的那些包」（坑 202）。
+// 旧实现把 3000+ 条全倒进去，于是上游动一个与本链毫无关系的包（实测相隔 90 分钟两次构建，
+// 上游掉了 codon / ecl 两个包）快照哈希就变一次——而产物**不是逐字节可复现**这件事，
+// 会让「重跑比哈希」这个最廉价的完整性判据永远失效：恒亮的警报灯等于没有警报灯。
+// 本链真正需要的是「装了什么」，那由 needed 定义，与无关包的 churn 无关。
+// 按名排序：索引自身的块顺序不保证稳定，不排序等于把不确定性从「包集合」挪到「块顺序」；
+// status 也是 [...needed].sort()，两者口径一致。块逐字取自索引，不改写内容。
+const availableBlocks = [...needed].sort().map((n) => rawBlocks.get(n)).filter(Boolean)
+writeFileSync(join(dpkgDir, 'available'), availableBlocks.join('\n\n') + '\n')
+log('dpkg status: ' + dpkgStatus.length + ' 包，available: ' + availableBlocks.length + ' 包')
 
 // ── 6. shebang 与 ELF RUNPATH 重写（com.termux → com.dsharnessmobile.shell）──
 log('重写 shebang/RUNPATH…')
