@@ -5,21 +5,25 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, posix, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
 const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 
-export function reconcileImporter(importer, manifest, path) {
+export function reconcileImporter(importer, manifest, path, overrides = {}) {
   if (!importer || typeof importer !== 'object') throw new Error(`missing lock importer: ${path}`)
   const declared = new Map()
   for (const section of SECTIONS) {
     for (const [name, specifier] of Object.entries(manifest[section] ?? {})) {
-      if (declared.has(name) && declared.get(name) !== specifier) {
+      const override = overrides[name]
+      const effective = typeof override === 'string' && override.startsWith('link:')
+        ? `link:${posix.relative(path, override.slice('link:'.length))}`
+        : specifier
+      if (declared.has(name) && declared.get(name) !== effective) {
         throw new Error(`${path}: conflicting manifest specifier for ${name}`)
       }
-      declared.set(name, specifier)
+      declared.set(name, effective)
     }
   }
 
@@ -68,13 +72,15 @@ function main() {
   const yaml = requireFromHarness('js-yaml')
   const original = readFileSync(lockPath)
   const lock = yaml.load(original.toString('utf8'))
+  const workspace = yaml.load(readFileSync(join(sourceRoot, 'pnpm-workspace.yaml'), 'utf8'))
   const edits = []
   for (const item of overrideReport.overrides) {
     const manifest = JSON.parse(readFileSync(join(sourceRoot, item.path, 'package.json'), 'utf8'))
     if (manifest.name !== item.package || manifest.version !== item.version) {
       throw new Error(`${item.path}: staged manifest differs from the verified source override`)
     }
-    edits.push(...reconcileImporter(lock.importers?.[item.path], manifest, item.path).map((edit) => ({ path: item.path, ...edit })))
+    edits.push(...reconcileImporter(lock.importers?.[item.path], manifest, item.path, workspace.overrides ?? {})
+      .map((edit) => ({ path: item.path, ...edit })))
   }
   if (!edits.length) throw new Error('expected pinned vendor manifest specifier differences, found none')
 
@@ -87,7 +93,7 @@ function main() {
     originalLockfileSha256: sha256(original),
     adjustedLockfileSha256: sha256(adjusted),
     importerEdits: edits,
-    reason: 'Pinned Cordis manifests predate the Harness lock importers. Only importer specifiers and obsolete importer entries change; all locked package resolutions remain fixed.',
+    reason: 'Pinned Cordis manifests predate the Harness lock importers. Importer specifiers follow the workspace link overrides; only those specifiers and obsolete importer entries change, with all locked package resolutions fixed.',
   }
   writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
   console.log(`reconciled ${edits.length} pinned vendor lock importer entries without resolving packages`)

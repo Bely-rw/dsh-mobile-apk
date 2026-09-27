@@ -42,3 +42,12 @@ test('rejects malformed lock entries before changing them', () => {
   assert.throws(() => reconcileImporter(importer, manifest, 'vendor/group'), /invalid locked resolution/)
   assert.equal(importer.dependencies.cordis.specifier, 'workspace:~')
 })
+
+test('keeps the effective local link from a workspace override', () => {
+  const importer = { dependencies: { '@deepseek-ai/cosmokit': { specifier: 'link:../cosmokit', version: 'link:../cosmokit' } } }
+  const manifest = { dependencies: { '@deepseek-ai/cosmokit': 'workspace:^' } }
+  const overrides = { '@deepseek-ai/cosmokit': 'link:vendor/cosmokit' }
+  const edits = reconcileImporter(importer, manifest, 'vendor/include', overrides)
+  assert.deepEqual(edits, [])
+  assert.equal(importer.dependencies['@deepseek-ai/cosmokit'].specifier, 'link:../cosmokit')
+})
