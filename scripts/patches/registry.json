@@ -1,7 +1,6 @@
 {
   "$comment": "vendor 固化插件补丁登记表（apply-patches.mjs 消费；id 必须与 IMPLS 一一对应，启动时交叉校验）。marker 语义见 README。",
   "patches": [
-
     {
       "id": "market-B",
       "target": "dshmarketplace-plugin/lib/index.js",
@@ -9,7 +8,6 @@
       "provenance": "0.13.1；apk issue #83/#89（linker64 回退污染 process.execPath → bad ELF magic: 23212f75）",
       "marker": "execPath:(process.env.TERMUX__PREFIX"
     },
-
     {
       "id": "market-D-server",
       "target": "dshmarketplace-plugin/lib/index.js",
@@ -86,6 +84,13 @@
       "summary": "快照徽章折叠成小绿点（数量与含义挪进 title/aria-label，点击行为不变；20x20 圆形后置覆盖胶囊样式）",
       "provenance": "2026-09-10 用户定例；360dp 竖屏头部被模式徽章/打开方式/…/右栏键占满，文字徽章挤标题且更窄处错位",
       "marker": "dsh-mobile dot-only badge"
+    },
+    {
+      "id": "undo-safe-align-S1",
+      "target": "dsh-undo-savepoint/lib/core.mjs",
+      "summary": "safe 生成逻辑对齐壳侧 SafeMode.kt：只摘第三方 insert 子条目，保留我方装配的插件（@deepseek-ai/*、@dsh-android/* 及两个具名插件）与全部顶层 disable 行",
+      "provenance": "2026-09-26 追版 0.4.9；用户口径「undo 要确保保留我们自己的插件」。上游 safeModeSet 原把 cordis.patch.yml 整份覆写成只含一条 insert 的最小文件，实测会摘掉 12 个 @dsh-android/* 引用与 7 条 disabled: true（含安全关键的 client-hmr，会重开 /plugins/events 无鉴权 SSE）",
+      "marker": "dsh-mobile safe keeps shipped plugins (S1)"
     },
     {
       "id": "undo-api-auth-U1",
@@ -202,7 +207,6 @@
       "provenance": "2026-09-26 设备实测（16416）：侧边栏新建终端 → subprocess-local: terminal inspection is unsupported on platform android；Android 即 Linux 内核，/proc 与 syscall 表（x64/arm64）一致",
       "marker": "dsh-mobile android is linux (D1)"
     },
-
     {
       "id": "pi-toolcall-G2",
       "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js",
@@ -210,6 +214,22 @@
       "summary": "流式 tool_call 空名止血：出口丢弃空名调用（连同其 tool result）+ arguments 保证非空；累加器把缺 index/id 的续块合并进唯一在途调用",
       "provenance": "0.13.5 W2；apk issue #124（中转网关续块无 index/id → 新建空名块 → 回放被网关 400 invalid tool_call）",
       "marker": "dsh-mobile tool_call guard (G2)"
+    },
+    {
+      "id": "fs-local-digest-guard-B",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js",
+      "scope": "engine",
+      "summary": "文件写工具的版本守卫被『只改元数据、不改内容』误触发（0.14.2 缺陷 B）。现象：模型读文件后，只要第三方对共享存储里的同一文件做一次 touch/chmod/同字节改名，edit 就恒判 FS_STALE_VERSION ⇒ 模型陷入「读→编辑失败→读」死循环。真因：版本 token = dev:ino:size:mtimeNs:ctimeNs，内容一字未改但 mtime/ctime 变了即版本不等，守卫把元数据噪声误判成内容变更。修法：版本不一致时**先比内容摘要**——摘要相同则放行（确认是元数据噪声），不同则照旧抛 FS_STALE_VERSION（CAS 语义不变），无摘要记录亦照旧抛（引擎重启后安全回落）。摘要表有界（最近 256 条，LRU 淘汰）。摘要对**原始字节**计算，避开 readForEdit 的 LF 归一化与 readWholeText 的口径差。不改 ctimeNs：反向实验证明删它会在「同尺寸 + mtime 还原」下放过真实改动（假阴性）。",
+      "provenance": "2026-09-26 用户报障（模型陷入读→编辑失败→读死循环）+ Lead 专项侦察实测：应用挂载命名空间内 touch/chmod 两例 STALE=true（内容未变），真实改内容例 STALE=true（必须为真）；已排除 FUSE 抖动/挂载别名/延迟落定/媒体扫描/read 自改 ctime/realpath 分叉。本机以真实部署产物 dsh-fs-local 0.1.7-rc.1 复现：TOUCH 与同字节 temp+rename 两例 REJECTED，CHMOD 一例因 NTFS 语义 ALLOWED（Linux 上 rw 路径不会顺带碰 ctime）。",
+      "marker": "dsh-mobile digest CAS fallback (B)"
+    },
+    {
+      "id": "ptc-argv-L1",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js",
+      "scope": "engine",
+      "summary": "PTC 子进程的 V8 堆参数从 argv 位置 1 移出改走 env.NODE_OPTIONS；并对解析出的可执行文件加绝对值/系统动态链接器两条守卫（fails loud，不静默回退、不猜替代路径）。",
+      "provenance": "0.14.2 fx-1 只把 profile 的 ptc-runtime.nodeExecutable 钉成绝对路径，未改 argv 构造，故 worker spawn bug 在 rc.2 产物上仍在（dsh-ptc-runtime-node/lib/index.js:947 逐字节：`...packaged ? [] : [heapFlag],`）。危害：packaged===false 时 heapFlag 落在 argv[1]，而 executable 若被解析成安卓系统链接器（direct exec 被拒时壳侧改用 /system/bin/linker64，process.execPath 随之被污染），linker64 把第一个非参数当程序路径，heapFlag 排在它前面 ⇒ linker64 自己报 error: expected absolute path: \"--max-old-space-size=512\" 退出，Node 从未被加载。附带如实记录一处**既有行为**（别误当新增副作用）：上游 subprocess-local 的 childEnv() 是 {...scrubbedParentEnv(), ...spec.env}（spawn.ts:44-54 posix 分支），targetEnvironment() 再 filter 掉值为 undefined 的项（runner-launch.ts:300-314），而现有代码那份 env 先把非启动项全部 tombstone 成 undefined（index.js:956）⇒ 今天 NODE_OPTIONS 本就被删掉（这正是 heapFlag 当初只能塞进 argv 的原因之一）。本补丁把「NODE_OPTIONS 完全消失」改成「NODE_OPTIONS 恰为我们的 heap flag」。如实登记的后果：引擎自己若设了 NODE_OPTIONS 会被我们覆盖，但既有行为里子进程本就看不到它，故不构成回归。",
+      "marker": "dsh-mobile ptc argv heap via NODE_OPTIONS (L1)"
     }
   ],
   "retired": [

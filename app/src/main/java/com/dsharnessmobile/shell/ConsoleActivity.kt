@@ -146,7 +146,31 @@ class ConsoleActivity : ComponentActivity() {
   inner class ConsoleBridge {
     @JavascriptInterface
     fun submit(command: String) {
-      session.writeCommand(command)
+      // 缺陷 D（fx-2）：离线安全模式口令。命中 `dsh safe[ on|off|status]` 时**不落 bash**——
+      // 它要动的是壳侧 profile 装配清单（bash 侧既无权限语义也无事务纪律），
+      // 且引擎已死时控制台仍可用，正是这条口令存在的理由。
+      val action = parseSafeCommand(command)
+      if (action == null) {
+        session.writeCommand(command)
+        return
+      }
+      val engine = EngineManager(this@ConsoleActivity)
+      val result = when (action) {
+        SafeAction.ON -> SafeMode.enter(
+          patch = SafeMode.patchFile(engine),
+          homePatch = SafeMode.homePatchFile(engine),
+          autoDir = SafeMode.autoDir(engine),
+          id = SafeMode.newId(),
+        )
+        SafeAction.OFF -> SafeMode.exit(
+          patch = SafeMode.patchFile(engine),
+          homePatch = SafeMode.homePatchFile(engine),
+          autoDir = SafeMode.autoDir(engine),
+        )
+        SafeAction.STATUS -> SafeMode.status(SafeMode.autoDir(engine))
+      }
+      // 回执走既有输出通道（与 bash 输出同一条路径），用户看到的就是他敲的那条命令的结果。
+      sessionListener.onOutput(result.message + "\n" + safeCommandUsage() + "\n")
     }
 
     @JavascriptInterface

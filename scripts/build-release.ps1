@@ -182,12 +182,16 @@ foreach ($abi in @(@{n='arm64-v8a'; f=$armSnap}, @{n='x86_64'; f=$x86Snap})) {
   Copy-Item $apk.FullName (Join-Path $apkDir ("dsh-mobile-apk-v" + $Version + "-" + $abi.n + ".apk")) -Force
 }
 
-# 4) Snapshot security gate（ST-06 / F-ENV-08 口径：机密门禁只有一份被调用的实现 = .mjs 跨平台版；
-# 旧 .ps1 走 cmd /c tar，$LASTEXITCODE 反映 cmd 尾命令而非脚本 exit 码，只能靠输出标记判定）
-node (Join-Path $root "scripts\check-snapshot-secrets.mjs") $armSnap
-if ($LASTEXITCODE -ne 0) { throw "arm64 快照安全门禁未通过，发布中止" }
-node (Join-Path $root "scripts\check-snapshot-secrets.mjs") $x86Snap
-if ($LASTEXITCODE -ne 0) { throw "x86_64 快照安全门禁未通过，发布中止" }
+# 4) Snapshot security gate —— G.0 ④ 冗余消除（0.14.2-fx-2）：**本段不再单独跑**。
+#
+# 真因（实测）：上面 2f) 的 `node $gateAgg --run --require --snapshot-dir $snapDir` 已经对**同一个** $snapDir
+# 里的两个 tar 逐 ABI 跑了 check-snapshot-secrets（聚合入口的 secrets 分支对 abis 循环，且带 --require 严格档）。
+# 而本段原先的两条直接调用读的是 $armSnap / $x86Snap —— 它们正是第 118 行 `Copy-Item $abi.f $snapDir` 的**源**，
+# 即**逐字节同一份文件**。故本段是纯重复执行：单次 72.7s，一次发版白付约 145s，且**严格度更低**
+# （不带 --require，缺件时可能以非严格口径结案）——重复 + 更弱，属净损失。
+# 收敛后 secrets 在发布链上的执行遍数：注入前聚合 2 遍（每 ABI 一次，输入是注入前 tar）+ 注入后聚合 2 遍
+# （每 ABI 一次，输入是发布物 tar）；两个输入面**内容不同**、都必须验，故保留。本段删除的只是它们的副本。
+# 不可裁面声明：机密门禁本身仍在发布关键路径上（聚合入口 --run --require），只是不再跑第三遍。
 
 # 5) sha256 manifest + notes template
 $manifest = @()

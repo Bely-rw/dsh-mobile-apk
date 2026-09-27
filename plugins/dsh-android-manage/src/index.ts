@@ -25,7 +25,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { type JsonValue } from '@deepseek-ai/dsh-util-values'
 import { join } from 'node:path'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { parseUiTreeXml, pruneNodes, resolveRef, findActionableAncestor, checkUiTreeParse, type UiNode, actionableAncestorV2, scopePoolV2 } from './ui-tree.js'
 import { cacheFromV2, decodeV2, isV2Payload, type V2Decoded } from './protocol-v2.js'
 import { detailRecord, pageRows, writeDetailStore } from './detail-store.js'
@@ -2416,6 +2416,126 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
   return [screenList, screenshot, uiTree, deviceInfo, actInput, uiDump, uiClick, uiScroll, uiInput, webDump, envPrepare, appLaunch, uiGlobal, uiDetail]
 }
 
+// ── 启动就绪审计（0.14.2-fx-2, 2026-09-28, task-80）───────────────────────────
+//
+// 防的是「boot 报成功、但 UI 关键服务缺位」这一类**静默**失效，不是某一个条目。
+//
+// 现象（用户报障）：session/selectModel 返回
+//   gateway/service-unavailable: active Service "sessionController" is unavailable
+// 真因（task-80 实测）：session-controller 不在上游 requiredStartupEntryIds 的 7 个 id 内
+// （packages/boot/app-boot/src/index.ts:746-754），它 pending 时 auditStartupEntries 只
+// warn 不 throw（:930-938）⇒ boot 照常成功、webserver 照常服务、UI 照常可点，但服务缺席。
+// 实测（task-80 B2c/B2d）：让它的 inject 依赖 agentDefaultModel 的供给条目 pending，
+// 即可逐字重出上述报错。
+//
+// 时机：用既有的 ctx.get('appReady')，**不猜时长**。启动器在 boot() 返回之后才 commit()
+// （dsh/lib/profile-boot.js:283），即全部条目已尝试激活之后；且 onReady 对已 ready 的情况
+// 立即回调（createAppReady），不会漏订阅。appReady 由 provideCmdline 经
+// ctx.provide('appReady', host.ready) 注册，先于条目挂载（app-boot/src/index.ts:1002 的
+// prepare 早于 :1004 的 mountRootInclude）⇒ 本插件 apply 时一定拿得到。
+//
+// 为什么是**有界重查**而不是单次采样：pending 是**等待态不是终止态**（上游 inactiveEntries
+// 把 FIBER_PENDING 单独归类并带 missing 服务名）。一次采样会把「刚启动、依赖还没注入完」
+// 误报成故障——这正是「单次采样当判据」那一类错误。因此 3 次 / 250ms 内任一次全就绪即视为
+// 正常，只有**全部重查后仍缺位**才告警。
+//
+// 默认静默：正常装配必须 0 条 WARN。不阻塞 boot：审计异步、内部异常只记 trace 不上抛
+// （apply 抛错会变成 plugin tree failed to load 硬崩，见 task-80 B2b 实测）。
+// HMR 安全：监听经 ctx.effect 注册并返回 disposer，插件 dispose 后不再有任何待触发回调。
+
+/** 必须就绪的服务：缺位即告警（其余 dsh-api-* 只记 trace）。 */
+const BOOT_AUDIT_REQUIRED = ['sessionController', 'agentDefaultModel', 'typertGateway', 'settings'] as const
+/** 重查次数与间隔。见上方「为什么不是一次采样」。 */
+const BOOT_AUDIT_ATTEMPTS = 3
+const BOOT_AUDIT_INTERVAL_MS = 250
+/** 专用取证文件（$DSH_HOME 下）；engine.log 另有一份 warn 行。 */
+const BOOT_AUDIT_LOG = 'boot-ready-audit.log'
+
+/** 睡眠 ms（审计自用，避免引入依赖）。 */
+function bootAuditSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 定位「谁本该提供这个服务、现在卡在哪」。
+ * 与上游 inactiveEntries（app-boot/src/index.ts:824-856）同口径：PENDING 的理由就是
+ * fiber.inject 里在 context 上取不到的服务名（上游 :842-849）。
+ * @param ctx - 宿主 context，用于读 loader。
+ * @param missing - 本轮仍缺席的服务名。
+ * @returns 每个缺席服务对应的供给条目描述。
+ */
+function bootAuditLocate(ctx: Context, missing: readonly string[]): string[] {
+  const lines: string[] = []
+  type AuditEntry = { options?: { id?: unknown, name?: unknown }, fiber?: { state?: number, inject?: Record<string, unknown> } }
+  let entries: AuditEntry[] = []
+  try {
+    // loader.entries() 返回的是**可迭代对象不是数组**（实测 isArray=false）——
+    // 必须展开，否则直接用 .find 会静默拿不到东西。
+    const loader = ctx.get('loader') as { entries?: () => Iterable<AuditEntry> } | undefined
+    entries = [...(loader?.entries?.() ?? [])]
+  } catch { /* loader 不可读时降级为「只报服务名」，不因此中断审计 */ }
+  for (const service of missing) {
+    for (const entry of entries) {
+      const state = entry.fiber?.state
+      // PENDING=0 / LOADING=1（cordis fiber.ts:147-154）
+      if (state !== 0 && state !== 1) continue
+      const inject = entry.fiber?.inject
+      if (inject === undefined || !(service in inject)) continue
+      lines.push(String(entry.options?.id) + ' (' + String(entry.options?.name) + ')'
+        + ' pending (waiting for service: ' + service + ')')
+    }
+  }
+  return lines
+}
+
+/**
+ * 有界重查，全部失败才告警，并把缺失服务与供给条目写到 warn + 专用文件。
+ * @param ctx - 宿主 context。
+ */
+async function bootReadyAudit(ctx: Context): Promise<void> {
+  try {
+    let missing: string[] = []
+    for (let attempt = 1; attempt <= BOOT_AUDIT_ATTEMPTS; attempt++) {
+      missing = BOOT_AUDIT_REQUIRED.filter((service) => ctx.get(service) === undefined)
+      if (missing.length === 0) return   // 任一次全就绪即视为正常（默认静默）
+      if (attempt < BOOT_AUDIT_ATTEMPTS) await bootAuditSleep(BOOT_AUDIT_INTERVAL_MS)
+    }
+    const located = bootAuditLocate(ctx, missing)
+    const tail = located.length > 0 ? ' | ' + located.join(' | ') : ''
+    const line = 'boot-ready-audit: ' + String(missing.length) + ' UI-critical service(s) still absent after '
+      + String(BOOT_AUDIT_ATTEMPTS) + ' checks: ' + missing.join(', ') + tail
+    // 面 1：console.warn ⇒ stderr ⇒ 并入 engine.log（EngineManager.kt:1226-1227
+    // redirectErrorStream(true) + redirectOutput(log)），壳侧诊断包收 engine.log 脱敏副本
+    // （EngineManager.kt:882）⇒ 只走 warn 就能被收集。
+    console.warn(line)
+    // 面 2：专用可 grep 文件，便于直接取证。
+    try {
+      const homePath = ctx.get('dshHomePath') as ((...segments: string[]) => string) | undefined
+      if (homePath !== undefined) {
+        appendFileSync(homePath(BOOT_AUDIT_LOG), new Date().toISOString() + ' ' + line + '\n')
+      }
+    } catch { /* 取证文件写不进去不影响告警本身，也不上抛 */ }
+  } catch { /* 审计自身异常只吞在内部：绝不让它变成 apply 抛错（那会硬崩 boot） */ }
+}
+
+/**
+ * 注册启动就绪审计。经 ctx.effect 注册，dispose 后不再有回调。
+ * @param ctx - 宿主 context。
+ */
+function registerBootReadyAudit(ctx: Context): void {
+  const ready = ctx.get('appReady') as { onReady?: (listener: () => void) => () => void } | undefined
+  const onReady = ready?.onReady
+  // 非启动器宿主（单测等）：跳过，不抛错。
+  if (onReady === undefined) return
+  // 绑定到 ready 上：方法内部可能用 this（上游实现是对象字面量，绑定无害且更稳）。
+  const subscribe = onReady.bind(ready)
+  ctx.effect(() => {
+    let disposed = false
+    const cancel = subscribe(() => { if (!disposed) void bootReadyAudit(ctx) })
+    return () => { disposed = true; cancel() }
+  }, 'dsh-android-manage: boot readiness audit')
+}
+
 export function apply(ctx: Context, _config: Record<string, unknown> = {}) {
   const priv = (ctx as unknown as { androidPrivilege?: PrivilegeFace }).androidPrivilege
   if (!priv) {
@@ -2426,4 +2546,7 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}) {
     audit: () => {},
   }
   for (const t of tools(ctx, face)) ctx.tools.register(t)
+
+  // 启动就绪审计（异步、不阻塞 boot、异常不上抛）。
+  registerBootReadyAudit(ctx)
 }
