@@ -468,9 +468,18 @@ jobs:
           const marketplacePatches = patchRegistry.patches
             .filter((patch) => patch.target.startsWith('dshmarketplace-plugin/'))
             .map(({ id, target }) => ({ id, target }))
-          const expectedPatches = ['market-A', 'market-B', 'market-C', 'market-D-server', 'market-route-auth-U2', 'market-D-client']
+          // 期望集：注册表里必须仍在场的市场补丁。上游退役（market-A / market-C，0.1.7）时必须同步本清单，
+          // 否则来源构建在「补丁步骤」判红——那正是本清单存在的意义：补丁集变化必须被人工看一眼。
+          const expectedPatches = ['market-B', 'market-D-server', 'market-route-auth-U2', 'market-D-client']
+          // 反向断言：已退役的补丁不得悄悄回到注册表（退役记录见 registry.json 的 retired 段）。
+          const retiredPatches = ['market-A', 'market-C']
           for (const id of expectedPatches) {
             if (!marketplacePatches.some((patch) => patch.id === id)) throw new Error(`missing registered marketplace patch: ${id}`)
+          }
+          for (const id of retiredPatches) {
+            if (marketplacePatches.some((patch) => patch.id === id)) {
+              throw new Error(`retired marketplace patch is registered again: ${id} —— 重启退役补丁须人工复核来源链适配器与本清单`)
+            }
           }
           const sourceFiles = listFiles(path.join(sourceRoot, 'src')).map((file) => ({
             path: path.relative(sourceRoot, file).replaceAll(path.sep, '/'),

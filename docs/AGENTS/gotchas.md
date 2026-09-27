@@ -928,3 +928,10 @@
     标签不再是 `#1`，锚定式 sed 恒不命中 ⇒ 取到空串；空串又被 `test -n` / 字符串比较静默吃掉，于是「判据没生效」表现为「命令莫名退出 1」。探针实测定性（run 36311334613 的 PROBE A/B/C）：`--print-certs` 本身就打印 `V3.0 Signer:`，与是否加 `--verbose` 无关——**问题在标签措辞，不在输出流向**。
     **修法**：判据不再依赖任何行的前缀与措辞——抓 stdout+stderr、加 `--verbose`、去掉冒号并转小写后，只要求**期望指纹出现在输出里**；不出现就把 apksigner 原始输出整段打进日志再判红。另加构建前**自证**：用同一把 keystore 签一个探针包再读回来，验证「这条判据本身可用」，使工具/keystore 的问题在 2 分钟内暴露，而不是等 30 分钟打包跑完才在末尾判红（那两轮各烧掉约一小时，且产物被丢弃）。
     **复验证据**：探针 run 36311334613 打出 `V3.0 Signer: certificate SHA-256 digest: 1dde9d98…`（PROBE A/B/C 三种取法）；修后 run 36307651694 全链通过，日志 `签名检查 out/v0.14.2/…apk -> 1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`；本地用**另一个版本**的 apksigner 独立复核同一 APK，证书 DN `C=US, O=Android, CN=Android Debug`、指纹同为 `1dde9d98…`。
+
+196. **上游退役补丁后，来源链的期望补丁集与适配器锚点没跟上（2026-09-27，远程 run 36311846352）**：
+    **现象**：合并上游 0.1.7-rc.2-fx-1（#269）后重跑来源构建，第 14 步 `Apply project patches to the source-built marketplace` 抛 `shared patch runner changed; review the source-build marketplace adapter before updating it`，构建在约 10 分钟处终止。
+    **真因**：#269 让 `market-A`、`market-C` 两个市场补丁退役（上游 0.1.7 自己修好了 A 的 waterfall 崩溃；C 的置灰对象被上游 `installCheck` 过滤掉，客户端拿不到不可安装的行），共享执行器 `scripts/patches/apply-patches.mjs` 里 A 的锚点整段消失。来源链适配器 `apply-source-marketplace-patches.mjs` 仍按旧锚点做「源码构建产物专用改写」，锚点断言失败即判红——**这是守卫按设计工作**：它要求人工复核适配器，而不是静默生成一份错的执行器。同一处 workflow 的期望集 `expectedPatches` 也还写着 A、C（适配器过了下一步照样判红）。
+    **修法**：按守卫要求复核后——适配器删掉已成死代码的 A 改写，只保留「把生成副本的 HERE 指回 `scripts/patches`」那一处（锚点整体失配不需要适配器兜底：共享执行器对「check 为假且 apply 零改动」本就判红并拒报 ALL OK）；workflow 期望集去掉 A/C，并**加反向断言**「退役补丁不得悄悄回到注册表」，重启退役补丁必须人工复核来源链。
+    **为什么记进坑位**：来源链与主链共用同一份补丁执行器，**上游每退役一个补丁都可能同时打断两条链**——主链会自动跟随注册表，来源链却带着自己的期望集与锚点改写，属于「同一事实两处登记」的典型漂移面。
+    **复验证据**：本地以 `vendor` 跑适配器（check 档）→ `apply-patches: ALL OK（13/13，changed=0）`、vendor 树零改动；期望集/退役集断言按注册表实跑通过；完整来源构建须由下一次远程 run 验证。
