@@ -1,13 +1,9 @@
 #!/usr/bin/env node
 /**
- * boot-pending-G1 回归测试（issue #126 P3）。
+ * dsh-app-boot 启动审计回归。
  *
- * 断言「第三方插件 pending 不再阻断 web boot，官方包 pending / 任何 FAILED 仍然致命」。
- * 直接调用 dsh-app-boot 导出的 assertEntriesActivated，用最小 stub ctx 驱动，
- * 不需要真实 cordis 树。
- *
- * 目标文件来源同 pi-toolcall.test.mjs（--boot <path> / DSH_BOOT_FILE / 默认 stage）。
- * 找不到时跳过（退出码 0）。
+ * 固定 Harness 0.1.7-rc.2 导出 auditStartupEntries：全局必需 id 未激活时
+ * 启动失败，其他条目未激活时报告告警。直接调用产物导出并注入最小 Loader stub。
  *
  * 用法：node scripts/tests/boot-pending.test.mjs [--boot <path>]
  */
@@ -28,15 +24,16 @@ if (!existsSync(target)) {
   process.exit(0)
 }
 
-const { assertEntriesActivated } = await import(pathToFileURL(target).href)
+const { auditStartupEntries } = await import(pathToFileURL(target).href)
+assert.equal(typeof auditStartupEntries, 'function', '固定 dsh-app-boot 必须导出 auditStartupEntries')
 
 const ACTIVE = 2
 const PENDING = 0
 const FAILED = 3
 
-function entry(name, state, { missingService = 'uiConversation', error } = {}) {
+function entry(id, name, state, { missingService = 'uiConversation', error } = {}) {
   return {
-    options: { name },
+    options: { id, name },
     disabled: false,
     fiber: {
       state,
@@ -51,62 +48,62 @@ function ctxOf(entries) {
   return { loader: { entries: () => entries } }
 }
 
-async function capture(fn) {
+async function capture(entries) {
   const warnings = []
-  const original = console.warn
-  console.warn = (...args) => warnings.push(args.join(' '))
   try {
-    await fn()
+    await auditStartupEntries(ctxOf(entries), 'web boot', (line) => warnings.push(line))
     return { threw: undefined, warnings }
   } catch (error) {
     return { threw: error, warnings }
-  } finally {
-    console.warn = original
   }
 }
 
-test('第三方 pending 不再阻断 boot，并留下降级告警', async () => {
-  const { threw, warnings } = await capture(() => assertEntriesActivated(
-    ctxOf([entry('@deepseek-ai/dsh-base', ACTIVE), entry('@nanmicoder/dsh-agent-teams', PENDING)]),
-    'web boot',
-  ))
-  assert.equal(threw, undefined, '第三方 pending 不应抛错')
-  assert.ok(warnings.some((line) => line.includes('dsh-mobile boot tolerance (G1)')), '必须留下降级告警')
-  assert.ok(warnings.some((line) => line.includes('@nanmicoder/dsh-agent-teams')), '告警需点名未激活插件')
+test('第三方 pending 不阻断 boot，并留下点名告警', async () => {
+  const { threw, warnings } = await capture([
+    entry('agent-loop', '@deepseek-ai/dsh-base', ACTIVE),
+    entry('third-party', '@nanmicoder/dsh-agent-teams', PENDING),
+  ])
+  assert.equal(threw, undefined)
+  assert.ok(warnings.some((line) => line.includes('@nanmicoder/dsh-agent-teams')))
+  assert.ok(warnings.some((line) => line.includes('warning: 1 entry did not activate')))
 })
 
-test('官方包 pending 仍然致命', async () => {
-  const { threw } = await capture(() => assertEntriesActivated(
-    ctxOf([entry('@deepseek-ai/dsh-web-app', PENDING)]),
-    'web boot',
-  ))
-  assert.ok(threw, '官方包 pending 必须抛错')
-  assert.match(String(threw.message), /did not activate/)
+test('必需 id pending 仍然致命', async () => {
+  const { threw, warnings } = await capture([entry('webserver', '@deepseek-ai/dsh-web-app', PENDING)])
+  assert.equal(threw?.name, 'Error')
+  assert.match(threw.message, /1 required plugin did not activate/)
+  assert.match(threw.message, /webserver/)
+  assert.equal(warnings.length, 0)
 })
 
-test('FAILED 仍然致命（第三方也不例外）', async () => {
-  const { threw } = await capture(() => assertEntriesActivated(
-    ctxOf([entry('@third/party', FAILED, { error: new Error('boom') })]),
-    'web boot',
-  ))
-  assert.ok(threw, 'FAILED 必须抛错')
-  assert.match(String(threw.message), /did not activate/)
+test('可选第三方 FAILED 产生告警，必需 id FAILED 致命', async () => {
+  const optional = await capture([entry('third-party', '@third/party', FAILED, { error: new Error('boom') })])
+  assert.equal(optional.threw, undefined)
+  assert.ok(optional.warnings.some((line) => line.includes('boom')))
+  const required = await capture([entry('webserver', '@deepseek-ai/dsh-web-app', FAILED, { error: new Error('boom') })])
+  assert.ok(required.threw)
+  assert.match(required.threw.message, /1 required plugin did not activate/)
 })
 
 test('全部 active 时既不抛错也不告警', async () => {
-  const { threw, warnings } = await capture(() => assertEntriesActivated(
-    ctxOf([entry('@deepseek-ai/dsh-base', ACTIVE), entry('@third/party', ACTIVE)]),
-    'web boot',
-  ))
+  const { threw, warnings } = await capture([
+    entry('webserver', '@deepseek-ai/dsh-web-app', ACTIVE),
+    entry('third-party', '@third/party', ACTIVE),
+  ])
   assert.equal(threw, undefined)
   assert.equal(warnings.length, 0)
 })
 
-test('第三方 pending 与官方 pending 混合：仍因官方包失败', async () => {
-  const { threw, warnings } = await capture(() => assertEntriesActivated(
-    ctxOf([entry('@third/party', PENDING), entry('@deepseek-ai/dsh-web-app', PENDING)]),
-    'web boot',
-  ))
-  assert.ok(threw, '官方包 pending 在场时仍必须失败')
-  assert.ok(warnings.some((line) => line.includes('@third/party')), '第三方降级告警仍应输出')
+test('第三方 pending 与必需 id pending 混合时保留两条诊断', async () => {
+  const { threw, warnings } = await capture([
+    entry('third-party', '@third/party', PENDING),
+    entry('webserver', '@deepseek-ai/dsh-web-app', PENDING),
+  ])
+  assert.ok(threw)
+  assert.match(threw.message, /third-party/)
+  assert.match(threw.message, /webserver/)
+  assert.equal(threw.entries.length, 2)
+  assert.ok(threw.entries.some((item) => item.module === '@third/party'))
+  assert.equal(threw.entries.filter((item) => item.required).length, 1)
+  assert.equal(warnings.length, 0)
 })

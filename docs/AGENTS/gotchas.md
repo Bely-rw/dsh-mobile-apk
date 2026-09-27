@@ -871,4 +871,10 @@
     **现象**：Harness 与插件构建通过后，`node-pty` Android ARM64 绑定已成功交叉编译，但原生模块审计发现 trycua、ubjs、sherpa-onnx 和 node-addon-require-builtin 的 Linux ARM64/x64 `.node` 文件，报 `unreviewed native module families` 而中止。
     **真因**：`pnpm deploy` 从固定 Harness 的当前依赖图带入跨平台 Linux GNU 包；审计器只认识先前登记的 Sharp、Koffi 等包族，且把 node-addon-require-builtin 限在旧版 0.1.4，实际部署解析到 0.1.6。这些文件名和包名指向 Linux，不是 Android 绑定，不能把审计报错当作 node-pty 编译失败。
     **修法**：按实际锁定版本、包路径、文件名和架构对应关系增加四个包族的严格匹配；将外平台 payload 与原因记入审计报告，未知版本、架构错配和未知原生包继续拒绝。入口增加正反用例。
-    **复验证据**：远程日志确认 node-pty Android ARM64 绑定已产出并给出 SHA-256；本地包族正反用例通过，完整来源构建须由下一次远程 run 验证。
+    **复验证据**：远程日志确认 node-pty Android ARM64 绑定已产出并给出 SHA-256；本地包族正反用例通过，远程 run 36291780773 的交叉编译及原生模块审计步骤通过。
+
+190. **快照行为测试调用已删除的 boot 导出，会把上游接口更新误报成功能失败（2026-09-27，远程 run 36291780773）**：
+    **现象**：Termux 基座组装完成后，快照构建器执行 `boot-pending.test.mjs`，五个用例全因 `assertEntriesActivated is not a function` 失败；这些断言均未真正进入待测启动逻辑。
+    **真因**：固定 Harness 0.1.7-rc.2 的 `dsh-app-boot` 已改为导出 `auditStartupEntries`，按全局必需 entry id 判定致命错误，可选条目的 pending/failed 只告警。仓库测试仍调用旧导出，并沿用「任何 FAILED 都致命」的旧口径；旧版测试在裸 clone 上因找不到目标而跳过，未及时暴露漂移。
+    **修法**：保持快照构建器的镜像脚本不动，改它调用的测试文件：直接注入 Loader 条目调用当前导出，用必需 id `webserver`、可选第三方、pending/failed 和混合状态验证当前契约；目标存在时先断言导出函数存在。
+    **复验证据**：使用仓库固定的 0.1.7-rc.2 app-boot 产物夹具及已安装依赖，本地五个真实行为用例全绿；完整来源构建须由下一次远程 run 验证。

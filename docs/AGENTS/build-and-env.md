@@ -59,6 +59,8 @@ Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-ven
 
 `check-android-native-runtime-packages.mjs` 对部署树中的 `.node` / `.node.wasm` 逐文件计数、取哈希，并只接受已审计包族。固定 Harness 当前依赖图还带入 trycua、ubjs、sherpa-onnx 与 node-addon-require-builtin 的 Linux GNU 原生文件；它们作为跨平台部署的外平台 payload 记录，不视为 Android 绑定。新增版本、不同架构路径或未知包族继续拒绝；匹配用例在 PR 与来源构建入口运行（坑 189）。
 
+快照构建器会对已注入的 `dsh-app-boot` 产物运行 `scripts/tests/boot-pending.test.mjs`。固定 Harness 0.1.7-rc.2 的启动审计入口是 `auditStartupEntries`：全局必需 id 的 pending/failed 致命，可选第三方条目只产告警；旧测试调用的 `assertEntriesActivated` 已不导出。测试现直接驱动当前导出，并覆盖必需与可选条目交叉状态（坑 190）。构建器里的历史标签 `boot-pending-G1` 仍指向这个测试文件。
+
 **设备验证链路**（真机 arm64 vivo V2425A；模拟器 MuMu x86_64 竖屏 `127.0.0.1:16416`、横屏 `127.0.0.1:16384`——横屏实例勿改回竖屏）：
 - 安装：`adb -s <serial> install -r -t out\v<版本>\...apk`（同签名 debug.keystore；**指纹变更触发 refreshSnapshot 全量重解压（真机 ≈2-4 分钟、模拟器实测 ~8 分钟，勿在解压中杀进程——中途杀进程看门狗会拿半解压运行时拉引擎，见坑 37）**）。
 - 引擎探活：`adb -s <serial> forward tcp:23080 tcp:3080` → `http://127.0.0.1:23080/`。
