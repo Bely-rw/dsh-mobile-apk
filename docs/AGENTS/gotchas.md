@@ -225,3 +225,9 @@
     **真因**：上游固定 Harness 提交的锁文件与其当代 vendor 清单一致，旧版源码替换也带入了旧版 `package.json`；运行 build 前的 pnpm 依赖状态检查要求 importer 的 specifier 与现有清单相同。另 `pnpm-workspace.yaml` 对 `cosmokit`、`schemastery` 强制 `link:vendor/*`，有效 importer 声明是相对 `link:../*`，不能机械写成旧清单原文 `workspace:^`（远程 run 36289257326 二次判红实锤）。
     **修法**：`reconcile-harness-vendor-lock.mjs` 只对来源报告列出的五个 importer 按工作区覆盖后的有效声明改写 specifier、移除旧清单已无的依赖条目；任何旧清单新增而锁文件没有的依赖直接拒绝，不向 registry 重新解析。原锁文件、改动清单、调整前后哈希进入来源 artifact 与策略报告。旧版源码及打包清单保持固定提交原样。
     **复验证据**：纯函数单测覆盖声明更新、`link:` 覆盖、已锁解析保留、缺失解析拒绝；完整来源构建须由后续远程 run 验证。
+
+185. **当前 Harness 全仓类型检查不能与旧版 Cordis loader 源码混跑（2026-09-27，远程 run 36289546067）**：
+    **现象**：旧版源码替换及有效锁文件对齐都完成后，`pnpm run build` 进入 TypeScript 阶段，`speech-to-text`、`llm-deepseek` 等当前包引用的 `loader/volatile-update` 事件在旧版 loader 的 `Events` 中不存在；当前测试还引用旧版 loader 没有的 `src/config/diff.ts`，全仓 `tsc -b tsconfig.host.json` 必红。
+    **真因**：来源链把 0.1.7-rc.2 的其余源码与 overlay 固定的较早 Cordis 源码放进同一次全仓类型检查。两者发布时序不同，旧版包的 API 无法满足当前源码的静态检查；这不是缺失依赖或 TypeScript 缓存问题。
+    **修法**：先按固定 0.1.7-rc.2 提交完成全仓与 Web UI 构建，再替换五个旧版 Cordis 包、对齐它们的锁文件 importer，单独用各包 tsconfig 和 tsdown filter 编译旧版包。打包时五个旧版 manifest 与源码仍等于固定旧提交，当前其余包来自固定 Harness 提交，不改上游源码。
+    **复验证据**：远程 run 36289546067 证明锁文件复检已通过、进入全仓 TypeScript 并在上述不兼容处失败；调整后的完整构建须由后续远程 run 验证。

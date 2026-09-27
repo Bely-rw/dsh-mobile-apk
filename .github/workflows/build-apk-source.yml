@@ -146,14 +146,6 @@ jobs:
           done
           test -n "$deployment_pnpm"
           printf '%s\n' "$deployment_pnpm" >> "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
-          python3 "$GITHUB_WORKSPACE/scripts/source-build/prepare-harness-vendor-overrides.py" \
-            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
-            "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
-            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json"
-          node "$GITHUB_WORKSPACE/scripts/source-build/reconcile-harness-vendor-lock.mjs" \
-            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
-            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json" \
-            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-lock-reconciliation.json"
           root_manifest="package.json"
           root_manifest_backup="$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-root-package.json.original"
           cp "$root_manifest" "$root_manifest_backup"
@@ -196,6 +188,27 @@ jobs:
           cp "$root_manifest_backup" "$root_manifest"
           corepack pnpm --recursive --if-present run bundle
           corepack pnpm run build:web
+          # The current Harness source refers to loader APIs absent from the older
+          # Cordis versions pinned by the Android overlay. Finish the upstream
+          # build first, then compile only those five pinned vendor packages.
+          python3 "$GITHUB_WORKSPACE/scripts/source-build/prepare-harness-vendor-overrides.py" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
+            "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json"
+          node "$GITHUB_WORKSPACE/scripts/source-build/reconcile-harness-vendor-lock.mjs" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-lock-reconciliation.json"
+          node ./node_modules/typescript/bin/tsc -b \
+            vendor/loader vendor/timer vendor/group vendor/include vendor/hmr
+          for package in \
+            @deepseek-ai/cordis-plugin-loader \
+            @deepseek-ai/cordis-plugin-timer \
+            @deepseek-ai/cordis-plugin-group \
+            @deepseek-ai/cordis-plugin-include \
+            @deepseek-ai/cordis-plugin-hmr; do
+            corepack pnpm exec tsdown --env.DSH_BUILD_FACE host --filter "$package"
+          done
           workspace_config="$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness/pnpm-workspace.yaml"
           workspace_backup="$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-workspace.original.yaml"
           package_backup_dir="$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure"
