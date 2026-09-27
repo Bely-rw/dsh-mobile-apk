@@ -75,7 +75,9 @@ jobs:
               (cd "$1" && npm install --no-audit --no-fund)
             fi
           }
-          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability dsh-shell-termux dsh-client-ui-responsive; do
+          # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
+          # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module（真实 run 实测）。
+          for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability; do
             echo "== npm build $d =="
             install_deps "$d"
             (cd "$d" && npm run build)
@@ -172,7 +174,9 @@ jobs:
         shell: bash
         run: |
           set -e
-          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability dsh-shell-termux dsh-client-ui-responsive; do
+          # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
+          # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module（真实 run 实测）。
+          for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability; do
             if [ -f "$d/package-lock.json" ]; then (cd "$d" && npm ci --no-audit --no-fund); else (cd "$d" && npm install --no-audit --no-fund); fi
             (cd "$d" && npm run build)
           done
