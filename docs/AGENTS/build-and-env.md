@@ -57,6 +57,8 @@ Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-ven
 
 来源构建还会从本仓九个带 `package-lock.json` 的插件/组件目录执行 `npm ci`。`check-package-lock-roots.mjs` 在 PR 与来源构建的早期步骤核对各目录 `package.json` 与锁文件根声明中的名称、版本及四类依赖，发现镜像后的旧声明就立即报错，避免完成 Harness 和 Termux 构建后才在插件安装阶段失败（坑 188）。锁文件更新后还应对受影响目录运行 `npm ci --dry-run --ignore-scripts --no-audit --no-fund`，因为根声明一致不能证明整份依赖图有效。
 
+`check-android-native-runtime-packages.mjs` 对部署树中的 `.node` / `.node.wasm` 逐文件计数、取哈希，并只接受已审计包族。固定 Harness 当前依赖图还带入 trycua、ubjs、sherpa-onnx 与 node-addon-require-builtin 的 Linux GNU 原生文件；它们作为跨平台部署的外平台 payload 记录，不视为 Android 绑定。新增版本、不同架构路径或未知包族继续拒绝；匹配用例在 PR 与来源构建入口运行（坑 189）。
+
 **设备验证链路**（真机 arm64 vivo V2425A；模拟器 MuMu x86_64 竖屏 `127.0.0.1:16416`、横屏 `127.0.0.1:16384`——横屏实例勿改回竖屏）：
 - 安装：`adb -s <serial> install -r -t out\v<版本>\...apk`（同签名 debug.keystore；**指纹变更触发 refreshSnapshot 全量重解压（真机 ≈2-4 分钟、模拟器实测 ~8 分钟，勿在解压中杀进程——中途杀进程看门狗会拿半解压运行时拉引擎，见坑 37）**）。
 - 引擎探活：`adb -s <serial> forward tcp:23080 tcp:3080` → `http://127.0.0.1:23080/`。
