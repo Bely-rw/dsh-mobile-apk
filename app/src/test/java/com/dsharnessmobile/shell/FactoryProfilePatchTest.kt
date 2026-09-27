@@ -646,4 +646,97 @@ class FactoryProfilePatchTest {
     val second = FactoryProfilePatch.merge(result.text, newShapeFactory)
     assertEquals("二次 merge 不得再改", result.text, second.text)
   }
+
+  // ── 结构校验的判别力（Lead 追加的两条反证）───────────────────────────────
+  //
+  // 校验若只是「看着对」的摆设，这两条用来钉它：删掉校验 / 漏搬一个键，都必须判红。
+
+  /** 校验的正例：合法归一结果必须通过四条判据。 */
+  @Test
+  fun verifyNormalizationAcceptsAWellFormedResult() {
+    val after = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    assertEquals(
+      "合法结果必须通过校验",
+      null,
+      FactoryProfilePatch.verifyNormalization(legacySinglePointLive, after),
+    )
+  }
+
+  /**
+   * 反证（Lead 追加 ①）：**只搬 provider、漏掉 model** ⇒ 必须判红。
+   * 证明 (c)「用户 config 逐行保留」是判据本体，不是摆设。
+   */
+  @Test
+  fun verifyNormalizationRejectsAResultThatDroppedOneConfigKey() {
+    val lostModel = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, lostModel)
+    assertTrue("漏搬 model 必须被判红，实得: " + why, why != null)
+  }
+
+  /**
+   * 反证（Lead 追加 ②）：**归一结果里 -mobile 没删掉** ⇒ id 集合不符 ⇒ 判红。
+   * 等价于「删掉校验」时会被放过的坏结果之一。
+   */
+  @Test
+  fun verifyNormalizationRejectsAResultThatKeptTheLegacyId() {
+    val keptMobile = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: agent-default-model-mobile
+            name: '@deepseek-ai/dsh-agent-default-model'
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, keptMobile)
+    assertTrue("残留 -mobile 必须被判红，实得: " + why, why != null)
+  }
+
+  /** 反证：上游 id 仍带 disabled: true ⇒ 判红。 */
+  @Test
+  fun verifyNormalizationRejectsAResultThatLeftTheDisableInPlace() {
+    val stillDisabled = """
+      - id: agent-default-model
+        disabled: true
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, stillDisabled)
+    assertTrue("残留 disabled 必须被判红，实得: " + why, why != null)
+  }
+
+  /** 校验取值与归一实际搬的是同一份（同一 helper）——防「校验与实现漂移」。 */
+  @Test
+  fun legacyMobileConfigLinesIsTheSharedSourceOfTruth() {
+    val lines = FactoryProfilePatch.legacyMobileConfigLines(legacySinglePointLive)
+    assertTrue("必须取到 config 键行", lines.any { it.trim() == "config:" })
+    assertTrue("必须含用户 provider", lines.any { it.contains("provider: xiaomimimo") })
+    assertTrue("必须含用户 model", lines.any { it.contains("model: mimo-v2.5") })
+    assertTrue(
+      "不满足形态时返回空（用于「不动」判定）",
+      FactoryProfilePatch.legacyMobileConfigLines("- id: unrelated\n").isEmpty(),
+    )
+  }
 }

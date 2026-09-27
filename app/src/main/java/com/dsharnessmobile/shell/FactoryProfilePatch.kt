@@ -161,6 +161,14 @@ internal object FactoryProfilePatch {
     val normalized = normalizeLegacyAgentDefaultModel(liveText)
     val live = normalized.text
     changes += normalized.changes
+    // 归一的**结构化校验**（Lead 要求：放宽必须是有结构的收窄，不是削弱校验）。
+    // 失败即抛：绝不把一个未校验的归一结果交给后续 reconcile/append，更不落盘。
+    if (normalized.changes.isNotEmpty()) {
+      val why = verifyNormalization(liveText, live)
+      if (why != null) {
+        throw IllegalStateException("归一校验失败（拒绝落盘）: " + why)
+      }
+    }
     val factoryBlocks = parseBlocks(factoryText)
     val factoryDisabled = LinkedHashMap<String, Boolean>()
     val factoryEntryIds = LinkedHashSet<String>()
@@ -327,6 +335,59 @@ internal object FactoryProfilePatch {
       }
     }
     return Result(sb.toString(), changes)
+  }
+
+  /**
+   * 归一的**结构化校验**（Lead 要求：放宽必须是有结构的收窄，不是削弱校验）。
+   *
+   * 四条判据（任一不成立即拒绝落盘）：
+   *  (a) id 集合 == 原集合 - {[LEGACY_MOBILE_ID]} —— 除它之外**一个都没少、也没多**；
+   *  (b) [LEGACY_UPSTREAM_ID] 仍在场，且**不带**条目级 `disabled: true`；
+   *  (c) 原 `-mobile` 块 config 的**每一行文本**都能在归一后的上游 config 里找到
+   *      —— 这是「用户值逐字保留」的**机械判据**（少搬一键必判红，而不是靠人看）；
+   *  (d) 归一后全文仍可解析（[topLevelBlocks] 能枚举出块且非空）。
+   *
+   * @return 拒绝理由（null = 通过）。
+   */
+  internal fun verifyNormalization(before: String, after: String): String? {
+    if (after.isBlank()) return "归一结果为空"
+    val beforeIds = LinkedHashSet<String>()
+    for (block in parseBlocks(before)) for (entry in block.entries) beforeIds += entry.id
+    val afterIds = LinkedHashSet<String>()
+    for (block in parseBlocks(after)) for (entry in block.entries) afterIds += entry.id
+    // (a) 只允许少一个 id，且必须是 -mobile。
+    val expected = LinkedHashSet(beforeIds)
+    expected.remove(LEGACY_MOBILE_ID)
+    if (afterIds != expected) {
+      val missing = expected - afterIds
+      val extra = afterIds - expected
+      return "id 集合不符：缺失=" + missing.joinToString(",") + " 多出=" + extra.joinToString(",")
+    }
+    // (b) 上游 id 在场且未 disabled。
+    var upstreamFragment: String? = null
+    var upstreamKeyIndent = 2 // 顶层条目的键缩进 = 条目缩进(0) + 2
+    for (block in parseBlocks(after)) {
+      if (block.isInsert) continue
+      val entry = block.entries.firstOrNull { it.id == LEGACY_UPSTREAM_ID } ?: continue
+      upstreamFragment = lineRange(block.lines, entry.startLine, entry.endLine)
+      upstreamKeyIndent = entry.indent.length + 2
+      break
+    }
+    val upstream = upstreamFragment ?: return "归一后 " + LEGACY_UPSTREAM_ID + " 不在场"
+    // 只认**条目自身层级**的 disabled（config 块内更深的同名键不算）。
+    if (disabledAtIndent(upstream, upstreamKeyIndent) == true) {
+      return "归一后 " + LEGACY_UPSTREAM_ID + " 仍带 disabled: true"
+    }
+    // (c) 用户 config 逐行保留（机械判据）——从**归一前**的文本里自己取，避免调用方各取一份而漂移。
+    val mobileConfigLines = legacyMobileConfigLines(before)
+    // 排除 `config:` 键行本身（它带缩进，故用 trim 比较而不是 startsWith）。
+    val body = mobileConfigLines.filter { it.trim() != "config:" && it.trim().isNotEmpty() }
+    for (line in body) {
+      if (!upstream.contains(line.trim())) return "用户 config 行未保留: " + line.trim()
+    }
+    // (d) 可解析。
+    if (parseBlocks(after).none { it.entries.isNotEmpty() }) return "归一结果无法解析出条目"
+    return null
   }
 
   /**
@@ -720,6 +781,23 @@ internal object FactoryProfilePatch {
     val stillHasEntries = parseBlocks(rewritten).any { it.entries.isNotEmpty() }
     if (!stillHasEntries) return null
     return rewritten
+  }
+
+  /**
+   * 从 [liveText] 取出旧「单点」`-mobile` 块的 config 段各行（无则空）。
+   *
+   * 抽出来给两处共用（归一 + 校验），避免两边各写一份取值逻辑而漂移 ——
+   * 校验若用自己那份，就可能与归一实际搬的东西不一致，那样校验会变成摆设。
+   */
+  internal fun legacyMobileConfigLines(liveText: String): List<String> {
+    for (block in parseBlocks(liveText)) {
+      if (!block.isInsert) continue
+      val entry = block.entries.firstOrNull { it.id == LEGACY_MOBILE_ID } ?: continue
+      val fragment = lineRange(block.lines, entry.startLine, entry.endLine)
+      if (!fragment.contains(LEGACY_MOBILE_NAME)) continue
+      return extractConfigLines(fragment)
+    }
+    return emptyList()
   }
 
   /**
