@@ -213,3 +213,9 @@
     **判据**：插件单测的收口证据必须是聚合门禁的整行输出（含文件数与项数），不得是单文件退出码。
     **为什么记进坑位**：单文件快循环是很自然的工作方式，而它与「验证充分」之间隔着一整类**跨文件断言漂移**，
     后者恰好是本项目测试里最常见的一类（断言写在 A 文件、被改的实现被 B 文件消费）。
+
+183. **来源审计构建在 pnpm 安装后备份整个 vendor 包目录，会沿工作区符号链接递归（2026-09-27，远程 run 36261389579）**：
+    **现象**：`build-apk-source` 第 9 步在 `prepare-harness-vendor-overrides.py:172` 的 `shutil.copytree(target, backup, symlinks=False)` 抛出异常；日志在 `raise Error(errors)` 后约 5 小时没有新输出，最终碰到 GitHub Actions 6 小时上限而取消，APK 步骤均未执行。此前的 Corepack 下载重试已生效，不能把本轮 6 小时归因于下载；下载完成与 Python 脚本开始之间缺少时间戳，前段耗时不能拆分。
+    **真因**：冻结安装先于旧版 Cordis 源码替换，pnpm 已在 `vendor/*/node_modules` 建立工作区链接。锁文件存在 `group → cordis → loader → cordis` 的回环；`symlinks=False` 会跟随链接复制其目标，整个包目录备份因此进入循环依赖图。仅改为 `symlinks=True` 也不够：旧实现随后 `rmtree(target)` 会删掉构建仍需的 `node_modules`。
+    **修法**：包根目录保持原位，只把非 `node_modules` 条目移到临时备份，再复制固定提交的源码条目；任一包失败时倒序清理新源码并移回原条目。拒绝固定源码归档顶层携带 `node_modules`。PR 与来源构建入口先跑包含循环链接和跨包回滚的单测。
+    **复验证据**：本地非链接用例与回滚用例通过；循环符号链接用例需在 Linux CI 运行（当前 Windows 会话无创建符号链接权限）。完整来源构建须以新 run 的步骤 9 与最终 APK 产物确认。

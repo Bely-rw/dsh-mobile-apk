@@ -30,6 +30,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Verify pinned source replacement before the expensive build
+        run: python3 -m unittest discover -s scripts/source-build -p 'test_*.py' -v
       - name: Install archive and signature tools
         run: |
           sudo apt-get update -y
@@ -161,8 +163,7 @@ jobs:
           // absent from the engine overlay, and outside the apps/cli production
           // deploy closure, while the recursive bundle pass below already bundles
           // every workspace package. Removing the clause restores the 0.1.5-rc.1
-          // build shape (measured at 5.9 min for this step against 15-45 min with
-          // it). The clause is dropped for the build only and the root manifest is
+          // build shape. The clause is dropped for the build only and the root manifest is
           // restored before anything is packed, so every packed manifest stays
           // exactly as the pinned release ships it.
           const clause = ' && pnpm --filter @deepseek-ai/dsh-desktop run bundle'

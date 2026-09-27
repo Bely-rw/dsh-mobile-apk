@@ -110,6 +110,44 @@ def stage_archive(
     return sorted(files, key=lambda item: str(item["path"]))
 
 
+def remove_entry(path: pathlib.Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def replace_staged_sources(
+    staged: list[tuple[pathlib.Path, pathlib.Path]], stage_root: pathlib.Path
+) -> None:
+    """Replace package sources without traversing or removing pnpm's node_modules links."""
+    backups: list[tuple[pathlib.Path, pathlib.Path]] = []
+    try:
+        for target, staged_root in staged:
+            if any(entry.name == "node_modules" for entry in staged_root.iterdir()):
+                raise ValueError(f"pinned source contains node_modules: {staged_root}")
+            backup = stage_root / (target.name + ".original")
+            backup.mkdir()
+            backups.append((target, backup))
+            for entry in list(target.iterdir()):
+                if entry.name != "node_modules":
+                    entry.replace(backup / entry.name)
+            for entry in staged_root.iterdir():
+                destination = target / entry.name
+                if entry.is_dir():
+                    shutil.copytree(entry, destination, symlinks=True)
+                else:
+                    shutil.copy2(entry, destination, follow_symlinks=False)
+    except Exception:
+        for target, backup in reversed(backups):
+            for entry in list(target.iterdir()):
+                if entry.name != "node_modules":
+                    remove_entry(entry)
+            for entry in backup.iterdir():
+                entry.replace(target / entry.name)
+        raise
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit(
@@ -165,20 +203,7 @@ def main() -> None:
                 "sourceFiles": files,
             })
 
-        backups: list[tuple[pathlib.Path, pathlib.Path]] = []
-        try:
-            for target, staged_root in staged:
-                backup = stage_root / (target.name + ".original")
-                shutil.copytree(target, backup, symlinks=False)
-                backups.append((target, backup))
-                shutil.rmtree(target)
-                shutil.copytree(staged_root, target, symlinks=False)
-        except Exception:
-            for target, backup in reversed(backups):
-                if target.exists():
-                    shutil.rmtree(target)
-                shutil.copytree(backup, target, symlinks=False)
-            raise
+        replace_staged_sources(staged, stage_root)
 
         report = {
             "repository": "https://github.com/deepseek-ai/deepseek-harness",
