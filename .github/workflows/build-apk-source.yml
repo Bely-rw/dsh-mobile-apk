@@ -787,6 +787,29 @@ jobs:
             > .deploy-tmp/source-build/gradle-artifacts-sha256.txt
           cat .deploy-tmp/source-build/apk-sha256.txt
 
+      - name: Snapshot semantic normalization digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 语义归一化摘要（坑 202）——**必须从产出的 APK 取快照**。
+          # 检查器（check-dsh-source-snapshot.mjs）看到的是注入**前**的快照，而 APK 装的是
+          # 注入**后**的（build-apk.mjs 的 snapIn，经 inject-all.py 生成）；两者条目数都不同
+          # （实测 42443 vs 42839）。把注入前那份的摘要公布出去，等于给外部复核方一个他们
+          # 复算不出来的值——而「可被外部独立复核」正是这条链的核心主张。这是坑 183
+          # （「发布链的快照输入必须是注入后产物」）的同型复发：**只有这一处跑在注入前**，
+          # 其余门禁（build-apk.mjs:304-320）全在 snapIn 上跑。
+          # 本步与复核方**做同一件事**：拿 APK → 取 assets/snapshot.tar.xz → 归一化 → 比摘要。
+          apk=$(find out -type f -name '*.apk' | sort | head -1)
+          test -n "$apk"
+          work=.deploy-tmp/source-build/normalization
+          rm -rf "$work"
+          mkdir -p "$work/tree"
+          unzip -p "$apk" assets/snapshot.tar.xz > "$work/snapshot.tar.xz"
+          tar -xJf "$work/snapshot.tar.xz" -C "$work/tree"
+          node scripts/source-build/normalize-snapshot.mjs "$work/tree" \
+            --out .deploy-tmp/source-build/snapshot-normalization.json
+          rm -rf "$work"
+
       - name: Upload APK and provenance
         uses: actions/upload-artifact@v4
         with:
@@ -826,6 +849,7 @@ jobs:
             .deploy-tmp/source-build/harness-web-preview-exclusion.json
             .deploy-tmp/source-build/post-snapshot-runtime-dependency-check.json
             .deploy-tmp/source-build/source-engine-snapshot-check.json
+            .deploy-tmp/source-build/snapshot-normalization.json
             .deploy-tmp/source-build/pnpm-package-materialization.json
             .deploy-tmp/source-build/engine-patch-copy-reconciliation.json
           if-no-files-found: error
