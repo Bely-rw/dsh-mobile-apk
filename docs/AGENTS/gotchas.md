@@ -897,3 +897,14 @@
     **修法**：删除该步骤的 `rm` + `keytool -genkeypair`，直接使用入库的 keystore；新增产出侧断言——构建后用 apksigner 读 APK 的 `Signer #1 certificate SHA-256 digest`，必须等于固定指纹 `1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`，否则拒出包并把该指纹写入 provenance。**判据放在产出侧而不是输入侧**：只有产出能证伪「keystore 文件在、构建却用了别的密钥」，同时也挡回「再现场生成一次性证书」那种改法。
     **顺带排除的陷阱**：`keytool -list -v` 的输出**不可作为机器判据**——它随 JVM 语言变化（本机 JDK 24 直接输出德语），且在这份 keystore 上会抛 `IllegalFormatConversionException: d != java.lang.String`（`printX509Cert`/`withWeakConstraint`）。故输入侧只查文件在场，指纹一律从 apksigner 读（输出稳定、不本地化）。
     **复验证据**：正证——用入库 keystore 签出的 APK 经 apksigner 读到的指纹 `1dde9d98…45bcbd` 与断言常量逐字相等；反证——本次 run 36296811274 的产物（一次性证书 `64fa4b7e…`）与旧版产物（`4642e0dc…`）代入同一断言均判红。
+
+194. **签名判据锚定 apksigner 的行标签：新版把它从 `Signer #1` 改成 `V3.0 Signer:`，解析取空后静默判死（2026-09-27，远程 run 36303902361）**：
+    **现象**：run 36303902361 在 gradle `BUILD SUCCESSFUL`、APK 已产出之后，于 APK 步骤**静默退出 1**——日志里 `APK=` 之后一行输出都没有，分不清是清单为空、还是工具没解析到。前一轮（36300505103）同样症状。
+    **真因**：签名断言用行首锚定的 `sed -n 's/^Signer #1 certificate SHA-256 digest: //p'` 取指纹，而 runner 上的 build-tools `37.0.0` 把签名者标签改成了**按签名方案版本编号**的形式：
+    ```
+    V3.0 Signer: certificate DN: C=US, O=Android, CN=Android Debug
+    V3.0 Signer: certificate SHA-256 digest: 1dde9d98…
+    ```
+    标签不再是 `#1`，锚定式 sed 恒不命中 ⇒ 取到空串；空串又被 `test -n` / 字符串比较静默吃掉，于是「判据没生效」表现为「命令莫名退出 1」。探针实测定性（run 36311334613 的 PROBE A/B/C）：`--print-certs` 本身就打印 `V3.0 Signer:`，与是否加 `--verbose` 无关——**问题在标签措辞，不在输出流向**。
+    **修法**：判据不再依赖任何行的前缀与措辞——抓 stdout+stderr、加 `--verbose`、去掉冒号并转小写后，只要求**期望指纹出现在输出里**；不出现就把 apksigner 原始输出整段打进日志再判红。另加构建前**自证**：用同一把 keystore 签一个探针包再读回来，验证「这条判据本身可用」，使工具/keystore 的问题在 2 分钟内暴露，而不是等 30 分钟打包跑完才在末尾判红（那两轮各烧掉约一小时，且产物被丢弃）。
+    **复验证据**：探针 run 36311334613 打出 `V3.0 Signer: certificate SHA-256 digest: 1dde9d98…`（PROBE A/B/C 三种取法）；修后 run 36307651694 全链通过，日志 `签名检查 out/v0.14.2/…apk -> 1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`；本地用**另一个版本**的 apksigner 独立复核同一 APK，证书 DN `C=US, O=Android, CN=Android Debug`、指纹同为 `1dde9d98…`。
