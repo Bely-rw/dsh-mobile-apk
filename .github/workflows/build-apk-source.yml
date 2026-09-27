@@ -38,6 +38,7 @@ jobs:
           node --test scripts/source-build/check-android-native-runtime-packages.test.mjs
           node --test scripts/source-build/preset-carriers.test.mjs
           node --test scripts/source-build/restore-overlay-pins.test.mjs
+          node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
@@ -646,6 +647,14 @@ jobs:
           NODE
             exit 1
           fi
+          # 引擎补丁的副本收敛：pnpm 布局下同一包在上层与 `.pnpm/**` store 各有一份物理文件，
+          # 而引擎树补丁只按登记表的顶层 target 写入 ⇒ store 副本保持原样；运行时按依赖查找
+          # 可能解析到 store 那份（设备实锤：node-addon-require-builtin 未打补丁 ⇒ 引擎 boot 硬崩；
+          # 同批 pi-toolcall-G2 亦然）。这里把已打补丁那份的字节写全，随后由快照检查器断言
+          # 「任何副本都不得缺 marker」，两道一起保证这类差异不再出厂。
+          node scripts/source-build/reconcile-engine-patch-copies.mjs \
+            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
+            .deploy-tmp/source-build/engine-patch-copy-reconciliation.json
           node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
             .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
             .deploy-tmp/engine-overlay/source-build-manifest.json \
@@ -811,5 +820,6 @@ jobs:
             .deploy-tmp/source-build/post-snapshot-runtime-dependency-check.json
             .deploy-tmp/source-build/source-engine-snapshot-check.json
             .deploy-tmp/source-build/pnpm-package-materialization.json
+            .deploy-tmp/source-build/engine-patch-copy-reconciliation.json
           if-no-files-found: error
           retention-days: 30

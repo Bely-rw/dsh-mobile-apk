@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { checkDshRuntimeDependencies } from './check-dsh-runtime-dependencies.mjs'
 import { checkAndroidNativeRuntimePackages } from './check-android-native-runtime-packages.mjs'
 import { checkPresetCarriers } from './preset-carriers.mjs'
+import { collectPhysicalFiles, matchesPatchTarget } from './reconcile-engine-patch-copies.mjs'
 
 const snapshotArg = process.argv[2]
 if (!snapshotArg) {
@@ -138,17 +139,30 @@ try {
   const patchRegistry = JSON.parse(readFileSync('scripts/patches/registry.json', 'utf8'))
   const patchChecks = []
   const runtimePrefix = `${packagePrefix}/`
+  const engineFiles = collectPhysicalFiles(engineRoot)
   for (const patch of patchRegistry.patches.filter((item) => item.scope === 'engine' && item.overlayCheck !== false)) {
     const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
     if (!marker) continue
     if (!patch.target.startsWith(runtimePrefix)) throw new Error(`engine patch target escaped the source runtime: ${patch.target}`)
-    const target = resolve(engineRoot, patch.target.slice(runtimePrefix.length))
+    const targetRel = patch.target.slice(runtimePrefix.length)
+    const target = resolve(engineRoot, targetRel)
     if (!within(engineRoot, target) || !existsSync(target)) throw new Error(`source snapshot patch target missing: ${patch.id}`)
     const physicalTarget = realpathSync(target)
     if (!within(physicalEngineRoot, physicalTarget)) throw new Error(`source snapshot patch target link escaped: ${patch.id}`)
     const content = readFileSync(target, 'utf8')
     if (!content.includes(marker)) throw new Error(`source snapshot patch marker missing: ${patch.id} (${marker})`)
-    patchChecks.push({ id: patch.id, target: patch.target, marker })
+    // 副本面（设备实锤，0.14.2 追版后）：pnpm 布局下同一包在上层与 `.pnpm/**` store 各有一份物理文件，
+    // 引擎补丁只按顶层 target 写入 ⇒ store 副本保持原样；而运行时按依赖查找可能解析到 store 那份
+    // （`node-addon-require-builtin` 就是这样 ⇒ 未打补丁 ⇒ 引擎 boot 硬崩；同批 `pi-toolcall-G2` 亦然）。
+    // 故判据不只看 target 本身：**同一目标的任何物理副本都必须带 marker**。
+    const copies = engineFiles.filter((file) => matchesPatchTarget(relative(engineRoot, file).split(sep).join('/'), targetRel))
+    const unpatched = copies.filter((file) => !readFileSync(file, 'utf8').includes(marker))
+    if (unpatched.length > 0) {
+      const paths = unpatched.map((file) => relative(engineRoot, file).split(sep).join('/')).sort()
+      throw new Error(`source snapshot has unpatched copies of ${patch.id}: ${paths.join(', ')}`
+        + '（同一补丁目标在 pnpm store 里有副本没打上 ⇒ 运行时可能加载到未打补丁的那份）')
+    }
+    patchChecks.push({ id: patch.id, target: patch.target, marker, physicalCopies: copies.length })
   }
 
   // 内置预设载体：口径与权威门禁 check-engine-overlay.mjs 的 CARRIERS 同源，漂移由
