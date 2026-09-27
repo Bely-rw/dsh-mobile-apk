@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep, toNamespac
 import { pathToFileURL } from "node:url";
 import z from "@deepseek-ai/schemastery";
 import { FileSystem, FsError, FsTargetKey, FsVersion } from "@deepseek-ai/dsh-fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, realpath } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { TextDecoder, promisify } from "node:util";
@@ -761,6 +761,23 @@ const MAX_DIFF_BASIS_BYTES = Math.min(constants.MAX_LENGTH, constants.MAX_STRING
 * capability-seam Agent Note); enforce
 * containment with a stricter backend or a `tools/execute` permission plugin.
 */
+/* dsh-mobile digest CAS fallback (B): a third party touching mode/owner/timestamps in a shared
+ * directory (the user workspace lives under /storage/emulated/0) changes the version token
+ * without changing one byte, so the version comparison alone rejects every edit and the model
+ * loops read -> stale edit -> read. When the version differs, compare a content digest first:
+ * equal content means the change really was metadata noise and the edit proceeds; different
+ * content keeps FS_STALE_VERSION. ctimeNs stays in the token: it is the only field that still
+ * catches a same-size write with the mtime restored, so weakening the token is not an option. */
+/** Bound on retained digests; only the most recently read targets are kept. */
+const DSH_MOBILE_DIGEST_LIMIT = 256;
+/**
+ * Digest of the exact bytes a caller read, used only to tell metadata noise from a real change.
+ * @param content - the raw bytes read from the target.
+ * @returns the lowercase SHA-256 hex digest.
+ */
+function dshMobileDigestOf(content) {
+	return createHash("sha256").update(content).digest("hex");
+}
 var LocalFileSystem = class extends FileSystem {
 	async watch(target, changed, signal) {
 		signal.throwIfAborted();
@@ -799,6 +816,11 @@ var LocalFileSystem = class extends FileSystem {
 	* window can't interleave, making concurrent writes/edits deterministically
 	* ordered (one wins, the rest see the new version and reject as stale). */
 	locks = /* @__PURE__ */ new Map();
+	/* dsh-mobile digest CAS fallback (B): targetKey -> digest of the bytes read, bounded and
+	 * LRU-ordered so a long session cannot grow it without limit. A missing entry means the
+	 * target was not read by this provider instance, which keeps the safe stale refusal after a
+	 * restart. */
+	readDigests = /* @__PURE__ */ new Map();
 	constructor(ctx, config) {
 		super(ctx);
 		const resolved = config;
@@ -862,10 +884,28 @@ var LocalFileSystem = class extends FileSystem {
 		};
 	}
 	async readText(target, signal) {
-		return readWholeText({
-			displayPath: target.displayPath,
-			targetKey: target.targetKey
-		}, signal);
+		const raw = await readFileAbortable(target.targetKey, "read", signal);
+		throwIfAborted(signal, "read");
+		if (raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) throw new FsError(`cannot read "${target.displayPath}": binary file`, "FS_NOT_TEXT");
+		const content = decodeUtf8(raw, "read", target.displayPath);
+		/* dsh-mobile digest CAS fallback (B): remember what was read, digesting the raw
+		 * bytes so the edit path (which reads the same raw bytes) cannot disagree. */
+		this.rememberReadDigest(target.targetKey, dshMobileDigestOf(raw));
+		return content;
+	}
+	/**
+	 * Record the digest of the bytes just read, evicting the least recently used entry past
+	 * the bound. Re-inserting keeps the map in access order.
+	 * @param targetKey - the resolved target the read observed.
+	 * @param digest - SHA-256 of the raw bytes handed to the caller.
+	 */
+	rememberReadDigest(targetKey, digest) {
+		this.readDigests.delete(targetKey);
+		this.readDigests.set(targetKey, digest);
+		while (this.readDigests.size > DSH_MOBILE_DIGEST_LIMIT) {
+			const oldest = this.readDigests.keys().next().value;
+			this.readDigests.delete(oldest);
+		}
 	}
 	streamText(target, signal) {
 		return Promise.resolve(streamWholeText({
@@ -906,10 +946,16 @@ var LocalFileSystem = class extends FileSystem {
 			if (existing && existing.type !== "file") throw new FsError(`cannot write "${target.displayPath}": not a regular file`, "FS_NOT_REGULAR_FILE");
 			if (expected?.kind === "replaceIfVersion") {
 				if (!existing) throw new FsError(`cannot write "${target.displayPath}": file no longer exists`, "FS_STALE_VERSION");
-				if (existing.version !== expected.version) throw new FsError(`cannot write "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");
+				if (existing.version !== expected.version
+					&& !(await this.dshMobileContentUnchanged(target.targetKey, target.targetKey))) {
+					/* dsh-mobile digest CAS fallback (B): same metadata-noise case as editText. */
+					throw new FsError(`cannot write "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");
+				}
 			} else if (expected?.kind === "createIfAbsent" && existing) throw new FsError(`cannot overwrite existing "${target.displayPath}" without reading it first`, "FS_NOT_OBSERVED");
 			const before = existing !== null && Buffer.byteLength(content, "utf8") < this.config.diffBasisMaxBytes ? await readTextForDiff(target.targetKey, this.config.diffBasisMaxBytes, signal) : null;
 			await writeFileAtomic(target.targetKey, content, existing?.mode, signal, this.internals, expected?.kind === "createIfAbsent" ? { displayPath: target.displayPath } : void 0);
+			/* dsh-mobile digest CAS fallback (B): remember the bytes now on disk. */
+			this.rememberReadDigest(target.targetKey, dshMobileDigestOf(Buffer.from(content, "utf8")));
 			const after = await probe(target.targetKey);
 			return {
 				operation: existing ? "update" : "create",
@@ -924,11 +970,19 @@ var LocalFileSystem = class extends FileSystem {
 			const existing = await probe(target.targetKey);
 			if (!existing) throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");
 			if (existing.type !== "file") throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, "FS_NOT_REGULAR_FILE");
-			if (expected && existing.version !== expected.version) throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");
+			if (expected && existing.version !== expected.version
+				&& !(await this.dshMobileContentUnchanged(target.targetKey, target.targetKey))) {
+				/* dsh-mobile digest CAS fallback (B): the version token moved but the bytes did
+				 * not (a third party touched the shared directory) - proceed. Different bytes still
+				 * throw. */
+				throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");
+			}
 			const original = await readForEdit(target.targetKey, target.displayPath, signal);
 			const edited = applyLiteralEdit(original.content, edit.oldString, edit.newString, edit.replaceAll, target.displayPath);
 			const content = restoreLineEndings(edited.content, original.lineEndings);
 			await writeFileAtomic(target.targetKey, content, existing.mode, signal, this.internals);
+			/* dsh-mobile digest CAS fallback (B): the target now holds the bytes just written. */
+			this.rememberReadDigest(target.targetKey, dshMobileDigestOf(Buffer.from(content, "utf8")));
 			const after = await probe(target.targetKey);
 			return {
 				version: this.versionAfterWrite(after, target),
@@ -942,6 +996,29 @@ var LocalFileSystem = class extends FileSystem {
 	versionAfterWrite(after, target) {
 		if (after) return after.version;
 		return FsVersion(`missing:${target.targetKey}`);
+	}
+	/**
+	 * Whether a version mismatch is metadata noise rather than a real content change.
+	 * The file is re-read only after the versions already disagreed, so the common unchanged
+	 * path pays nothing. A missing digest, an unreadable file, or different bytes all answer
+	 * false, which keeps the caller's FS_STALE_VERSION refusal.
+	 * @param absolutePath - the resolved target key to re-read.
+	 * @param targetKey - the key the digest was remembered under.
+	 * @returns true when the current bytes hash to the digest recorded at read time.
+	 */
+	async dshMobileContentUnchanged(absolutePath, targetKey) {
+		const remembered = this.readDigests.get(targetKey);
+		/* No record (never read by this instance, or evicted, or after a restart): the
+		 * safe answer is the stale refusal. Never default to allowing the write. */
+		if (remembered === void 0) return false;
+		let current;
+		try {
+			current = await readFileAbortable(absolutePath, "edit", void 0);
+		} catch {
+			/* Unreadable now (removed, permissions, I/O): refuse. */
+			return false;
+		}
+		return dshMobileDigestOf(current) === remembered;
 	}
 };
 //#endregion

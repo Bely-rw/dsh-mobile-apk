@@ -139,10 +139,35 @@ class EngineService : Service() {
               engineProcessAlive = engineManager.engineProcessAlive(),
               bootAgeMs = now - EngineManager.lastStartAttemptAt,
               restartDeadConfirmations = restartDeadConfirmations,
+              // 【issue #274 ①】端口归属的**生产口径**。
+              //
+              // 口径是「本进程是否托管着一个活着的引擎子进程」，而不是去反查 3080 的监听者：
+              //   · 探活处于 DEGRADED_HTTP 时端口**必然可连**（否则会是 DEAD）；
+              //   · 此刻若我们确有活着的托管子进程 ⇒ 端口几乎必然是我们的（半死档）；
+              //   · 若我们没有任何托管子进程而端口仍可连 ⇒ 占着它的是**别人**，
+              //     此时盲目重启只会撞 EADDRINUSE，先 HOLD 并留诊断行。
+              //
+              // 这是**代理判据**，不是内核级归属证明（本仓无 netstat/uid 反查的设备无关通道）。
+              // 它偏保守：只有在「我们没有活子进程」时才判为他人占用。
+              // 自愈性：他人进程退出后端口不再可达 ⇒ 状态转为 DEAD ⇒ 该门不再适用（degradedLadderTripped=false），
+              // 重启路径照常恢复，不会形成永久死局。
+              portOwnedByApp = engineManager.engineProcessAlive(),
               feedProbe = { healthy -> engineManager.onEngineProbe(healthy) },
               consumeMarkers = { WatchdogV2.consumeTaskDoneMarkers(this) },
               refreshWake = { WatchdogV2.refreshWakeLock(this) },
-              undoReady = { UndoGate.onProbeFailure(this, WatchdogV2.effectiveFailureCount()) },
+              // 【issue #274 ①】回滚的证据门：探活超时 = 「引擎在忙/磁盘慢」而非故障，
+              // 端口非本进程持有 = 重启/回滚都不解决问题。两者命中时本拍既不 arm 也不 execute。
+              undoReady = {
+                UndoGate.onProbeFailure(
+                  this,
+                  WatchdogV2.effectiveFailureCount(),
+                  UndoGate.RollbackEvidence(
+                    logTail = WatchdogV2.lastLogTail,
+                    portOwnedByApp = engineManager.engineProcessAlive(),
+                    slowOnly = WatchdogV2.lastProbeTimedOut,
+                  ),
+                )
+              },
             )
             for (line in plan.logs) LogCollector.log("dsh-watchdog", line)
             when (plan.action) {

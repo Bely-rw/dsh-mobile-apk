@@ -747,7 +747,7 @@ console.log('== 8. 上游行面不变量（G-4：我们禁用的行必须还在�
        * —— 0.14.1 的 client-hmr 与 rc.1 的 hmr/dsh-hmr 换名就是这个形态。 */
       const ourDisabled = ourRows.filter(r => !r.inInsert && r.disabled)
       const ghost = ourDisabled.filter(r => !upRows.has(r.id))
-      if (ourDisabled.length === 0) fail('profile patch 解析出 0 条 disabled 顶层行——与现网形态不符（实测应为 6 条），判红不放行')
+      if (ourDisabled.length === 0) fail('profile patch 解析出 0 条 disabled 顶层行——与现网形态不符（0.14.2-fx-2 起实测为 6 条：agent-default-model 改走同 id config 覆盖后由 7 减为 6），判红不放行')
       else if (ghost.length > 0) {
         fail('profile patch 禁用了上游不存在的行（禁用即空指向，上游那条真行照常挂载）: '
           + ghost.map(r => r.id).join(', ') + ' —— 上游改名/删除时必然出现；请核对新行 id 后改 profile，别删了这条 YAML 当没事发生')

@@ -862,3 +862,106 @@
     **为什么记进坑位**：两处「让开键盘」的实现分居 Kotlin 与 JS、各自看着都对，
     缺陷只在**同一个量被两侧各算一次**时出现；而症状（上抬量恰好多一个键盘）极易被误读成「留白算大了」而去调系数，
     实际是**通道重复计数**。同类形态（一个事实两条通道各自生效）值得当成一族来查。
+
+186. **上游声明的运行期依赖没随 overlay 走：设备 boot 期 `ERR_MODULE_NOT_FOUND` 硬崩，而本地门禁结构性全绿**（2026-09-27，H-1）
+    **现象**：设备 boot 期引擎硬崩，报 `ERR_MODULE_NOT_FOUND`，被依赖的模块是 `@modelcontextprotocol/client`；
+    而本地全部门禁绿、打包正常 —— 缺陷只在**设备运行期**出现。
+    **真因**：上游 `dsh-mcp-client` 的运行期依赖从 `@modelcontextprotocol/sdk` 换成了 `@modelcontextprotocol/client@2.0.0`（改名/拆包），
+    而我们的 overlay 生成器 `scripts/gen-engine-overlay.mjs:66-90` 的 `collectPackages()` 只收 `@deepseek-ai/*`（`:90` 的 filter），
+    **第三方运行期依赖根本不在它的收集面内**；`vendorTop` 在生成器里**没有任何写入点**（全文只在旧表保留逻辑里被读），
+    靠人工补登 ⇒ 人工没跟上。**三条既有门禁结构性看不见**：`check-engine-overlay` 的正向闭包只对三份 `cordis.patch.yml` 的**行面**问责，
+    而 `dsh-mcp-client` 正是「不在我们装配行面上」的那类宿主。
+    **修法**：① `scripts/snapshot-config/engine-overlay.json` 的 `vendorTop` 补两条
+    `"@modelcontextprotocol/client": "2.0.0"` / `"@modelcontextprotocol/core": "2.0.0"`（36 → 38）；
+    实测该闭包 13 个包里 11 个已在快照内，只缺这两个 ⇒ 最小修法成立。
+    ② 新增门禁 `scripts/check-mcp-client-deps.mjs`：判据 = `@deepseek-ai/dsh-mcp-client` 的**运行期依赖闭包**在快照内全部可解析
+    （逐级读快照内 package.json，缺失即列出**引用者**）；已接进 `check-release-gates.mjs` 声明集（32 → 33）、本地链 `build-apk-013.ps1`、
+    云端链 `build-apk.mjs`（两链门禁集差集实测为 0）与 `check-patch-mirror.mjs` 的 `MIRROR_TOP`。
+    **为什么不动生成器**：`vendorTop` 是「构建期人工裁决」面（哪些第三方要随引擎顶层走，取决于 Node 解析面），把 npm 闭包全量自动化会引入
+    几百条传递依赖的登记抖动；先补缺口 + 用门禁把「再漏」挡住。
+    **复验证据**：正证（闭包完整的最小 tar）`CHECK-MCP-CLIENT-DEPS PASSED` exit=0；反证（同一 tar 删掉 `@modelcontextprotocol/client`）
+    `FAILED：… 闭包在快照内不可解析 1 条: [@modelcontextprotocol/client]` exit=1；修复前现状快照同判红并逐条列出 `MISS … <- @deepseek-ai/dsh-mcp-client`。
+    **同型提醒**：凡「上游改了依赖名/拆了包，而我们的清单/overlay 是人工维护的」，都要问一句「这条依赖有没有进收集面」；
+    行面门禁看不见非行面宿主。
+
+187. **「判据常态为 null」被写成否决条件 ⇒ 守卫恒触发 / 恒不触发**（2026-09-27，task-78）
+    **现象**：为修 issue #274 ①（探活超时即破坏性自愈），第一版判据写成「日志里没有强证据 → HOLD」。
+    跑既有回归时 `degradedHttpLadderEscalatesToRestartOnTheSixthTick` 判红：第 6 拍不再 RESTART，
+    连带 `halfDeadEngineStillReachesUndoAfterTheBootWindowExpires` 的 `undoProbed` 恒为 0。
+    **真因**：`WatchdogV2` 的 `logSignature` 只在日志尾部匹配到已知签名（`plugin tree failed to load` /
+    `uncaught`）时才非空，**其常态就是 null**（生产亦然，不是测试注入口径）。把「缺少证据」当否决条件 ⇒
+    这条守卫在**绝大多数正常路径**上都成立，等于把既有的、必需的阶梯语义整条掐死。
+    **修法**：判据只认**正向证据**（指认「是慢、不是死」：本次探活 `error=timeout`；或端口非本进程持有），
+    且证据是**放行**的理由而不是**前置条件**（`strongEvidenceForDestructiveRecovery` 命中时**解除**「慢」的否决）；
+    对「慢」这类单次观测无法与真卡死区分的形态必须有**有界宽限**：`DEGRADED_SLOW_GRACE_TICKS`（3 倍阶梯 ≈ 90s），
+    宽限用尽仍无改善即视为真卡死放行 —— 否则会制造「引擎卡死且永不重试」的死局。
+    **复验证据**：既有 4 条回归全绿；新增 5 条断言（慢→HOLD / 端口他进程→HOLD / **宽限用尽→放行** /
+    `refused`≠慢→放行 / 子进程已死时第 6 拍 RESTART 仍成立）。
+    **同型提醒**：任何「观测到 X 就否决」的守卫，先查 X 在**正常路径上的取值分布**；常态为 null/false 的 X
+    会让守卫恒触发或恒不触发，与「定义在但没接线」同族。
+
+188. **`treeStats` 把 root 自身计入 ⇒「空目录 = 0 条目」判据永不触发，整条防线作废**（2026-09-27，task-78）
+    **现象**：为 issue #273 ① 写「回滚前体检备份，空备份一律拒绝」的 `verifyPreviousForRollback`，
+    并在单测里造了一份空备份期望被拒 —— 实测**判红**（没被拒）。
+    **真因**：`SnapshotFs.treeStats` 的文档写「不含 root 自身」，实现却从 root 开始 `walk` ⇒ root 被计 1 条；
+    于是空目录报告 `entries=1` 而非 0，`if (stats.entries == 0L)` 恒不成立，
+    **「拒绝半份备份」整条判据全部作废**。这是本仓反复出现的「判据存在但无判别力」形态。
+    **修法**：`treeStats` 只遍历 `dir.listFiles()`（不含 root），并单独处理「root 本身是符号链接」。
+    **复验证据（判别力反证）**：把 `verifyPreviousForRollback` 的返回值硬置 null ⇒
+    `rollbackRefusesAnEmptyBackupInsteadOfWipingLive` **判红**；还原后复绿。
+    **同型提醒**：写「= 0 / 为空」判据时**先证明它造得出来**；造不出来或造出来判据不响，就是边界条件写错了。
+
+189. **测试里的静默 `return` 会伪装成 PASS —— 撤掉修法照样绿（假绿）**（2026-09-27，task-78）
+    **现象**：`backupKeepsSymbolicLinksAndRollbackRestoresThem` 需要建符号链接，本机（Windows，无
+    `SeCreateSymbolicLinkPrivilege`）建不出来，第一版写成「建不出来就 `return`」⇒ 它显示 **PASS**。
+    做判别力反证时（撤掉 A 的修法）**它照样绿**，正是这一点暴露了它：这个用例从来没验过任何东西。
+    **真因**：JUnit 里「无法构造前置条件」只能报 **SKIP**，不能静默返回 —— 静默返回与「断言通过」在报告上无法区分。
+    **修法**：改用 `org.junit.Assume.assumeTrue(...)`（无权限时如实进 SKIP 计数）。
+    **更深一层**：环境受限的能力**不能只靠 e2e** —— 本仓既有范式是把「可能失败/不可观测的一步」做成**可注入原语**
+    （`swap` 的 `move` / `delete` / `ownerProbe` / `spaceCheck`）。符号链接三动作（判链接 / 读目标 / 建链接）
+    同样抽成可注入接缝后，本机即可拿到真判红：正例断言 `createLink` 被调用且目标名逐字相同；
+    反例把它换成「一律当普通文件」判红；反例让 `createLink` 抛 IOException ⇒ 必须**向上冒错**而非静默跳过。
+    **接缝要抽到「做判断的那一步」**：只抽下游动作、分支仍读 `attrs.isSymbolicLink`，注入的替身就**永远不会被问到**
+    ⇒ 又变成「有接缝但无判别力」（本轮实测踩到并自查出）。
+    **复验证据**：SKIP 如实计数（全量实跑 skip=2，含本条与另一条同型 e2e）；
+    可注入判据的红/绿对照见 `SnapshotTransactionTest`（CP-A1b / CP-A1c 两条反证实测判红）。
+    **同型提醒**：`return` / `if (envOk)` 这类「环境不满足就跳过」的写法，与本仓「判据无判别力」是同一件事。
+
+190. **Kotlin 行首 `+` 是一元加号、不是续行 ⇒ 静态自审全绿但编译炸**（2026-09-27，task-78）
+    **现象**：`SnapshotTransaction.kt` 里两处多行字符串拼接写成
+    ```kotlin
+    notes += name + "…" + relink.restored + "/" + relink.expected
+      + " 条（备份缺链接，按 staged 工厂权威补回）"   // 行首 `+`
+    ```
+    编译报 `Unresolved reference 'unaryPlus' for operator '+'`（String 没有 `unaryPlus`）。
+    **真因**：Kotlin 的续行规则是「**上一行以运算符结尾**」，不是「下一行以运算符开头」。行首 `+` 被解析成**一元加号**。
+    只有**圆括号/方括号内部**的换行才无条件合法（`Log.w(...)` 那种调用实参里的行首 `+` 因此没事 —— 它在括号内）。
+    **修法**：把 `+` 挪到上一行行尾，或用括号包住整个多行表达式（本次采用后者，保留可读缩进）。
+    **为什么静态自审抓不到（本条的重点）**：同批改动跑过括号平衡（depth=0）、hash 核对、自写机械核对脚本 28 条全绿
+    —— **没有一条能发现编译错误**。括号平衡只数括号（行首 `+` 不改变括号计数），机械核对只匹配写下的模式串。
+    **静态 ≠ 编译 ≠ 运行**，三者是三个不同的证据等级。
+    **复验证据**：修前编译 `Unresolved reference 'unaryPlus'`（实测）；修后用「行首 `+`/`-` 且处于圆括号/方括号深度 0」的扫描
+    确认**全文件 0 处**（其余行首 `+` 全部合法地位于括号/实参内部，逐个看过上下文）。
+    **同型提醒**：任何「我用脚本查过所以没问题」的结论，都必须先问「这个脚本能不能看见我要防的那类错误」。
+
+191. **`stage/` 目录与 `snapshot.tar.xz` 不同步：门禁读了阶段树而非产物，得出与实际相反的结论**（2026-09-28，task-78）
+    **现象**：`node scripts/check-boot-budget.mjs --pull <serial>` 真检里 C5 的正向对照判 SKIP，理由原文：
+    `引擎树存在但未打过 P1 补丁（无 compose 探针面）：…/snapshot-013/x86_64/stage/root/…/dsh-client-modules/lib/index.js`
+    同一时刻另两条事实与它矛盾：
+      · `snapshot.tar.xz`（同目录，2026-09-28 01:30 重建）**tar 内该文件有 P1 marker**（47,466 B）；
+      · **设备引擎树里 P1 marker 命中 4 处**（设备实际跑的就是含 P1 的树）。
+    **真因**：该 stage 目录 mtime = **2026-09-08 18:21:32**，即**停留在两个月前的树**；
+    而 C5 的输入面读的是 **stage 树** —— 既不是 tar、也不是设备树。重建快照只刷新了 tar，**没有回写 stage**。
+    ⇒ 门禁拿到的是一个既不等于产物、也不等于运行时的第三方副本，于是结论与实际完全相反。
+    **这是同一根因的第二次现身**：第一次表现为 `-Fast` 静默复用陈旧 stage 树 + boot-budget「有设备产物就真检」
+    ⇒ 拿旧读数判红；这一次表现为 C5 正向对照读旧 stage 树 ⇒ 误判「无 P1」。
+    **修法建议（未实施）**：① C5 的输入面改读 **tar 或设备树**（二者至少有一个是真相），不再读 stage；
+    或 ② 构建链在重建快照后**同步刷新 stage**，并给 stage 树加一条「与 tar 同代」的自检（mtime/内容 hash 二选一）。
+    在没有修法之前，读 stage 的正向对照**一律不可信**——它是「第三份副本」，谁都不会去核它。
+    **复验证据（实测）**：
+      · stage 树文件 mtime = 2026-09-08 18:21:32、P1 marker 命中 **0**；
+      · 同目录 tar（01:30 重建）解出该文件 = 47,466 B、P1 marker 命中 **true**；
+      · 设备 `run-as grep -c` 该文件 = **4**；
+      · `grep -E 'SnapshotTransaction|SnapshotFs|UndoGate|WatchdogV2|EngineService' scripts/check-boot-budget.mjs` = **零命中**（该门禁不读壳侧 Kotlin，故三条红与 task-78 无关）。
+    **同型提醒**：凡「门禁/工具读一个中间副本（stage / cache / 中间产物）而不读产物本体或运行时」，
+    都要问一句「这个副本由谁负责刷新、有没有人核它」。**三份副本 = 没有真源。**

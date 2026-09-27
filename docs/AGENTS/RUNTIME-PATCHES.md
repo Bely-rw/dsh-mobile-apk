@@ -20,7 +20,7 @@
 |---|---|---|---|
 | attachment-local-index.js（**47,937**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-attachment-local/lib/index.js（:926） | 生效 | 0.13.7 重出（引擎 0.1.5-rc.1）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）+ 0.14.0 review C1：**与构建期 `attach-durable-F2` 逐字节同源**（F2 已扩为三件套：祖先 fsync 守卫 + 两处 link(2)→rename 回退 + unlink ENOENT 容忍）；内含图片归一化 2048 降采样上限（`DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 2048`）。补丁判定走内容指纹而非内嵌标记 |
 | session-persistence-jsonl-index.js（**145,247**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-session-persistence-jsonl/lib/index.js（:928） | 生效 | 0.13.7 重出 + 0.13.8-b 追加 F5/F7（与构建期同源）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）：两处 link(2) 站点带 EACCES/EPERM/ENOTSUP → rename 回退，发布独占语义由模块级 `dshMobileClaimExclusive/ReleaseClaim` 恢复（O_EXCL 占位 + 失败回收）。**0.14.0 review C1 实锤**：v0.14.0-preview 资产曾是「内联占位 + helper 占位」双占位坏版本（恒 EEXIST 恒 false，旧会话迁移永久失败并留 0 字节毒文件）——修复 = F7 补丁增加 v1→v2 收敛分支 + 本资产从快照重出 + 门禁升级为逐字节比对。行为回归 `scripts/patches/tests/{spj-migration-link-f5,publish-exclusive-reclaim}.test.mjs`（后者支持 `--asset` 直测资产本体） |
-| fs-local-index.js（**43,405**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-fs-local/lib/index.js（:930） | 生效 | **0.14.1 重新入册**（apk issue #246）：`writeFileAtomic` 的 `createIfAbsent` 发布站点是全包唯一的 `link(2)` 调用，且该分支失败即抛、无任何回退 → Android 应用域恒拒 hardlink ⇒ 真机上 `write` 工具建不了任何新文件（覆盖已存在文件走 `rename`，正常）。与构建期 `fs-local-link-F8` 逐字节同源。**本资产是 0.13.3 退役资产的重新入册**——当年退役理由「上游 0.1.2-rc.1 已原生覆盖 rename 回退」对 `createIfAbsent` 站点不成立（0.1.5-rc.1 实测：全文仅此一处 `link` 调用，`EACCES`/`EPERM`/`ENOTSUP` 无任何处理）。补丁判定走内容指纹而非内嵌标记。行为回归 `scripts/patches/tests/fs-local-link-f8.test.mjs`（支持 `--asset` 直测资产本体） |
+| fs-local-index.js（**47,793**，2026-09-26 由出厂态 fixture 经补丁链重建：F8 + B） | dsh-fs-local/lib/index.js（:930） | 生效 | **0.14.1 重新入册**（apk issue #246）：`writeFileAtomic` 的 `createIfAbsent` 发布站点是全包唯一的 `link(2)` 调用，且该分支失败即抛、无任何回退 → Android 应用域恒拒 hardlink ⇒ 真机上 `write` 工具建不了任何新文件（覆盖已存在文件走 `rename`，正常）。与构建期 `fs-local-link-F8` 逐字节同源。**本资产是 0.13.3 退役资产的重新入册**——当年退役理由「上游 0.1.2-rc.1 已原生覆盖 rename 回退」对 `createIfAbsent` 站点不成立（0.1.5-rc.1 实测：全文仅此一处 `link` 调用，`EACCES`/`EPERM`/`ENOTSUP` 无任何处理）。补丁判定走内容指纹而非内嵌标记。行为回归 `scripts/patches/tests/fs-local-link-f8.test.mjs`（支持 `--asset` 直测资产本体） | **0.14.2 追加 `fs-local-digest-guard-B`**（版本守卫摘要 CAS 兜底）：资产必须同时含 F8+B 两个 marker，否则引擎启动时会把 B 覆盖回「只有 F8」的旧字节 ⇒ 真机上 B 等于没修（实测踩到：旧资产 43,405 B 与当时快照逐字节一致，门禁因快照陈旧而不响）。重建方式 = 取出厂态 fixture 按 registry 顺序施加该文件全部 engine 补丁（产物 47,793 B），**禁止手改**；门禁见 §7.5 |
 
 已退役资产（不在 `assets/patched/`，`applyAssetPatch` 注册行同步移除，勿再引用）：`primitives-index.js`、`fs-local-index.js`（0.13.3 批退役，d377abc——link(2) 回退族改由构建期补丁承担；**0.14.1 已重新入册，见 §2 的 fs-local-index.js 行与 §7.1 的 `fs-local-link-F8`**——退役时该回退并未真正落到构建期补丁，`createIfAbsent` 站点成了覆盖空洞）；`web-frontend-index.html`（0.13.7fx-1 退役，§8）；`llm-deepseek-index.js`（rc.2 起遗留死资产，随重出批删除）。
 
@@ -55,7 +55,8 @@
 ## 6. 与协调仓 scripts/patches/ 的分工边界
 
 **协调仓 `scripts/patches/`（apply-patches.mjs + registry.json + data/compat-map.json）是快照注入链的构建期补丁框架**，按 `scope` 分两路：
-- `scope: vendor` 打 vendor 固化插件（dshmarketplace-plugin A-D + **U2 exact-route browser-session 鉴权**、dsh-undo-savepoint E1-E8 + **U1 `/api/undo` connection/token 鉴权与 no-store**），在 `build-apk-013.ps1` 阶段施加；对应行为回归在 `scripts/patches/tests/{undo-route-auth,market-route-auth}.test.mjs`。
+- `scope: vendor` 打 vendor 固化插件（dshmarketplace-plugin B/D + **U2 exact-route browser-session 鉴权**；dsh-undo-savepoint E1-E8 + **S1 safe 保留自有插件** + **U1 `/api/undo` connection/token 鉴权与 no-store**），在 `build-apk-013.ps1` 阶段施加；对应行为回归在 `scripts/patches/tests/{undo-route-auth,market-route-auth}.test.mjs`。
+  - **2026-09-26 追版**：两个插件都追到上游新版（marketplace 0.1.5→0.1.7、undo 0.3.8→0.4.9）。已退役：marketplace A（上游 0.1.7 原生修 next 兜底）、marketplace C（上游 0.1.7 用 `installCheck==="passed"` 过滤掉不可安装条目）；新增 undo S1（safe 生成对齐壳侧 `SafeMode.kt`：只摘第三方、保留 `@dsh-android/*` 与全部 `disable` 行——上游原实现整份覆写会重开无鉴权的 `client-hmr` SSE）。详见各 vendor 的 `PATCHES.md` 与 `registry.json` 的 `retired` 段。undo 0.4.9 另有安全收益：`settings.yaml` 纳入脱敏（0.3.8 时代在快照范围内却不脱敏 ⇒ 明文进包）。
 - `scripts/check-api-route-auth.mjs` 与 `api-route-auth-policy.json` 不属于运行时 asset：它们扫描所有 mobile-owned WebServer registration source，要求 protected guard 或窄公开白名单，并在本地/云端/CI/发布链接线。file-incoming 的 queue、claim、content、complete、clean 五个 exact route 均属于 protected 面；content 只接受进程内 ticket，不能返回源绝对路径。
 - `scope: engine` 打引擎树内上游包（当前全量 14 条以 §7.1 表为准，2026-09-25 现数 `scripts/patches/registry.json`：narb-android-N1 / attach-durable-F2 / **fs-local-link-F8** / flock-android-F3 / atomic-stale-lock-F4 / spj-migration-link-F5 / publish-exclusive-F7 / reference-drill-F6 / pi-toolcall-G2 / perf-compile-cache-flush-N2 / combo-probe-P1 / boot-third-party-isolation-G3 / arkweb-resource-protocol-H1 / external-draft-conversation-seam-J1），在 `build-snapshot-013.mjs` 0f 步施加并逐个复查 marker（N1/G3 的 0.14.2 重锚见 §7.4；同批撤销 6 条已不在册：N1/G1/A3/A4/A5/C3，A4 退役理由见 §7.4）。
 
@@ -186,7 +187,7 @@ unlink ENOENT 容忍），与 attachment 资产逐字节同源——此前这三
 |---|---|---|---|
 | `attachment-local-index.js` | 47,321 | **47,937** | 从 0.1.7-rc.1 快照 tar 直接抽出 |
 | `session-persistence-jsonl-index.js` | 137,514 | **145,247** | 同上 |
-| `fs-local-index.js` | 41,407 | **43,405** | 同上 |
+| `fs-local-index.js` | 41,407 | **43,405** → **47,793**（0.14.2 追加 B，见 §7.5） | 同上 |
 
 重建提交 `fix(assets): 运行时补丁资产按 rc.1 快照重建（三条全部不同源，引擎换代后必做）`（apk 侧 22815f8）。
 门禁 `node scripts/check-runtime-assets.mjs x86_64 --require` 按 §7.3 的「资产 ↔ 快照同路径文件逐字节一致」
@@ -249,6 +250,34 @@ darwin/win32/linux-glibc，Android 下 `process.platform` 为 android ⇒ `resol
 （`@deepseek-ai/libreoffice-kit`，:128），两处必须同进同出；逆转条件 = 出现 Android 上真能跑的引擎实现。
 
 **版本号**：`app/build.gradle.kts:35` `versionCode` 40 → **41**，:40 `versionName` 0.14.1 → **0.14.2**。
+
+### 7.5 0.14.2：资产必须覆盖同源补丁全部 marker（快照无关判据，2026-09-26）
+
+**现象**：B（`fs-local-digest-guard-B`）加入后，`assets/patched/fs-local-index.js` 仍是只有 F8 的 43,405 B，
+而当时快照也是同一份旧产物 ⇒ `check-runtime-assets` 的**逐字节判据判绿**（资产与快照确实同源）。
+但引擎每次启动都用该资产整份覆盖运行树 ⇒ **B 在真机等于没修**（覆盖回只有 F8 的字节）。
+
+**为什么旧判据抓不到**：逐字节比对只证「两条路一致」，不证「两条路都含新补丁」。
+快照是补丁加入**之前**构建的时候，资产与它一致反而是**共同缺失**，门禁无从分辨。
+
+**新增判据（快照无关）**：对每个资产，取 registry 里 target 指向同一文件、`scope: engine` 且带 `marker` 的**全部**条目，
+断言资产正文含每一条的 marker。缺任一条即判红并点名 `asset + 补丁 id + marker 原文`。
+这条不依赖快照在场，所以「加了补丁但忘了同步资产」在**构建前**就会被抓住。
+
+**配套**：字节不同源时的诊断改为**方向感知**——
+- 快照缺 marker 而资产齐 ⇒ 报「快照陈旧」，并**禁止** `--write` 回写（回写会把补丁从资产里抹掉，比不修更坏），正确修法是重建快照；
+- 资产缺 marker ⇒ `--write` 从快照回写资产仍是对的。
+
+**重建方式（禁止手改）**：取出厂态 fixture（`scripts/patches/tests/fixtures/dsh-fs-local-0.1.7-rc.2/lib/index.js`），
+按 registry 顺序施加该文件全部 engine 补丁：
+
+```sh
+node scripts/patches/apply-patches.mjs <stage> --apply --scope engine --only fs-local-link-F8,fs-local-digest-guard-B
+# applied 2/2 → 产物 47,793 B → 覆盖 assets/patched/fs-local-index.js
+```
+
+**管线自证**：只施加 F8（不带 B）可**逐字节复现**原 43,405 B 资产（sha256 `368e382cc71c…`），
+证明产物确由该 fixture 经补丁链生成，F8+B 版即其正确超集。
 
 ## 8. 0.13.7fx-1：web-frontend-index.html 退役（2026-09-11）
 

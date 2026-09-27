@@ -245,6 +245,83 @@ try {
       threw === null ? '未抛出（缺陷：被误隔离）' : '')
   }
 
+  // ⑩ H-2（0.14.2-fx-2）判别力：装配清单**完整**时，用户自己挂的官方包必须可隔离。
+  //
+  // 这是本轮 H-2 的核心判据。真因（用户诊断包 → engine.log:138）：用户在 profile 里挂
+  // `@deepseek-ai/dsh-mcp-client`（entry id = mcp-lark）连自己的 MCP server，按**包名前缀**判
+  // 会把这条合法配置当成产品回归 ⇒ 拒绝隔离 ⇒ 引擎 boot 硬崩、exit=1。
+  //
+  // 判据必须成对，缺任一即失去判别力：
+  //   (a) 用户挂的官方包（不在我们装配清单里）⇒ **可隔离**（引擎照常起、日志点名）；
+  //   (b) 我们清单里的官方包/移动侧包 ⇒ **仍然 fail-loud**（不得削弱）。
+  // (b) 已由 ② 的两个用例覆盖；这里补 (a)，且**必须**让清单完整（树里有上游 bundle 行），
+  // 否则判据会回落到保守前缀规则而看不到修复。
+  {
+    const owned = mkdtempSync(join(tmpdir(), 'g3-owned-'))
+    try {
+      const rel = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+      for (const [sub, body] of [
+        ['dsh-base', '- id: mcp-resources\n  name: \'@deepseek-ai/dsh-mcp-resources\'\n- id: settings\n  name: \'@deepseek-ai/dsh-settings\'\n'],
+        ['dsh-web-app', '- id: workspace\n  name: \'@deepseek-ai/dsh-workspace\'\n'],
+      ]) {
+        const p = join(owned, rel, sub, 'cordis.patch.yml')
+        mkdirSync(dirname(p), { recursive: true })
+        writeFileSync(p, body)
+      }
+      const p3 = join(owned, 'home/.dsh/profiles/web/cordis.patch.yml')
+      mkdirSync(dirname(p3), { recursive: true })
+      writeFileSync(p3, '- id: android-bridge\n  name: \'@dsh-android/dsh-android-bridge\'\n')
+      const targetOwned = join(owned, TARGET)
+      mkdirSync(dirname(targetOwned), { recursive: true })
+      writeFileSync(targetOwned, readFileSync(FIXTURE, 'utf8').replace(/\r\n/g, '\n'))
+      const appliedOwned = spawnSync(process.execPath,
+        [join(repoRoot, 'scripts', 'patches', 'apply-patches.mjs'), owned, '--apply', '--scope', 'engine', '--only', 'boot-third-party-isolation-G3'],
+        { encoding: 'utf8' })
+      check('⑩ 清单完整树：G3 apply exits 0', appliedOwned.status === 0,
+        (appliedOwned.stdout || appliedOwned.stderr || '').trim().split('\n').slice(-2).join(' | '))
+      const patchedOwned = readFileSync(targetOwned, 'utf8')
+      const isoOwned = buildIsolator(patchedOwned, async () => {})
+      check('⑩ 清单完整（complete=true）——否则本条判据会回落到保守前缀规则',
+        /"complete":true/.test(patchedOwned), patchedOwned.slice(patchedOwned.indexOf('DSH_MOBILE_ASSEMBLED_MANIFEST'), patchedOwned.indexOf('DSH_MOBILE_ASSEMBLED_MANIFEST') + 90))
+      check('⑩ (a) 用户自挂的官方包 @deepseek-ai/dsh-mcp-client 可隔离（旧前缀判据下为 false = 本轮缺陷）',
+        isoOwned.dshMobileIsIsolatableEntry('@deepseek-ai/dsh-mcp-client') === true,
+        'isolatable=' + isoOwned.dshMobileIsIsolatableEntry('@deepseek-ai/dsh-mcp-client'))
+      check('⑩ (b) 我们装配清单里的官方包仍 fail-loud（@deepseek-ai/dsh-settings / dsh-mcp-resources）',
+        isoOwned.dshMobileIsShippedPlugin('@deepseek-ai/dsh-settings') === true
+        && isoOwned.dshMobileIsShippedPlugin('@deepseek-ai/dsh-mcp-resources') === true
+        && isoOwned.dshMobileIsIsolatableEntry('@deepseek-ai/dsh-settings') === false,
+        JSON.stringify(['@deepseek-ai/dsh-settings', '@deepseek-ai/dsh-mcp-resources'].map((n) => n + '=' + isoOwned.dshMobileIsShippedPlugin(n))))
+      check('⑩ (b) 移动侧 @dsh-android/* 与具名出货插件仍 fail-loud（清单完整时不得削弱）',
+        isoOwned.dshMobileIsIsolatableEntry('@dsh-android/dsh-android-bridge') === false
+        && isoOwned.dshMobileIsIsolatableEntry('dshmarketplace-plugin') === false,
+        ['@dsh-android/dsh-android-bridge', 'dshmarketplace-plugin'].map((n) => n + '=' + isoOwned.dshMobileIsIsolatableEntry(n)).join(' '))
+      check('⑩ (b) 归属不可证仍不可隔离（清单完整时同样）',
+        isoOwned.dshMobileIsIsolatableEntry('./local-plugin.mjs') === false
+        && isoOwned.dshMobileIsIsolatableEntry('file:///tmp/p.mjs') === false)
+      // (a) 的端到端形态：引擎必须照常启动（不抛），且点名跳过。
+      const callsOwned = []
+      let attemptOwned = 0
+      const mountOwned = async (ctx, cfg, patches) => {
+        callsOwned.push({ patches: patches.map((p) => ({ ...p })) })
+        attemptOwned += 1
+        if (attemptOwned === 1) throw importErrorFor(['mcp-lark', '@deepseek-ai/dsh-mcp-client'])
+        return undefined
+      }
+      const isoRun = buildIsolator(patchedOwned, mountOwned)
+      let threwOwned = null
+      try { await isoRun.dshMobileMountRootIncludeTolerant({}, 'dsh', '/cfg/cordis.yml', [], undefined) } catch (error) { threwOwned = error }
+      check('⑩ (a) 端到端：用户挂的官方包失败 → 引擎照常启动（不抛）', threwOwned === null,
+        threwOwned === null ? '' : String(threwOwned.message).slice(0, 120))
+      check('⑩ (a) 端到端：确实隔离并点名该 entry（不是静默吞掉）',
+        callsOwned.length === 2 && callsOwned[1].patches.length === 1
+        && callsOwned[1].patches[0].name === '@deepseek-ai/dsh-mcp-client'
+        && isoRun.warnings.some((w) => w.includes('@deepseek-ai/dsh-mcp-client')),
+        'calls=' + callsOwned.length + ' warnings=' + isoRun.warnings.join(' | ').slice(0, 140))
+    } finally {
+      rmSync(owned, { recursive: true, force: true })
+    }
+  }
+
   console.log(failures.length === 0 ? '\nALL PASS' : '\nFAILED ' + failures.length + ': ' + failures.join('; '))
   process.exit(failures.length === 0 ? 0 : 1)
 } finally {

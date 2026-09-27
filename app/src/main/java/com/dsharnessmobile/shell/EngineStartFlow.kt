@@ -455,14 +455,24 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       // 共同前置——引擎已被前台服务拉起时重开 app 也要消费 .snapshot-transaction 判据，
       // 因此它必须排在「引擎已在跑」早退之前（顺序由 startupRecoverThenProbe 保证）。
       val engineAlreadyRunning = startupRecoverThenProbe(
-        recover = { activity.engineManager.recoverInterruptedRefresh() },
+        recover = {
+          activity.engineManager.recoverInterruptedRefresh()
+          // 0.14.2-fx-2 缺口：恢复期**拒绝回滚**此前只有 logcat/诊断面，没有任何界面提示，
+          // 用户数据被保护了却不知情。这里落结构化码 + 一次性标记 + 诊断包；可见面由
+          // MainActivity 在引擎页面就绪后注入 DOM（引导页会被 showWeb 盖掉，故不切引导页相位）。
+          // 不阻断启动：恢复失败只意味着「这棵树还没收敛」，引擎仍可能正常起。
+          reportRecoveryRejectionIfAny(activity, activity.engineManager.pendingRecoveryFailure)
+        },
+        // M.1（#272）：这里问的是「**我们自己的**引擎是否已在跑」，而不是「HTTP 是否完全就绪」。
+        // `running` 口径未变（含 401）⇒ 401 也算「已在跑」（引擎在、只是要重新认证），
+        // 否则每次冷启动都会被判为「引擎没起」而重复拉起（decision D3/W2 必须保持）。
         probeRunning = { EngineProbe.check().optBoolean("running", false) },
       )
       if (engineAlreadyRunning) {
         // P-AC-04：这条早退路径不经过 spawn 观察线程，补一次 listen 标记（幂等；本进程没记过
         // t_boot_start 时按「未知」记 -1 落盘，而不是让三字段整行缺失）。
         LogCollector.markListen(activity)
-        // C1：探活已经拿到 HTTP 应答（engineAlreadyRunning 来自 EngineProbe.check().running），
+        // C1：探活已经拿到 HTTP 应答（engineAlreadyRunning 覆盖 running 或 401=可认证，见 probeRunning）；
         // 所以首个响应时刻同样可判——否则「进程内接手已在跑的引擎」这一路径永远没有 C1 读数。
         LogCollector.markFirstHttp(activity)
         activity.runOnUiThread { if (isCurrentEngineFlow(generation)) activity.showWeb() }
@@ -542,10 +552,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
             // 【0.14.1 升级路径 P0】必须带上**真因**：`refreshSnapshot` 只回布尔值，真因挂在
             // `EngineManager.lastRefreshFailure`。旧实现此处不传 error → boot-fail.log 只有
             // `error=none(boolean-failure-path)`，排障者拿不到 `Directory not empty` 那条真因。
+            // issue #271 ④：再带上**稳定错误码**（由 SnapshotFsException.code 归类，如
+            // snapshot-delete-residue / snapshot-move-blocked / snapshot-foreign-owner）。
+            // 有了码，boot-fail.log 的一行就说清「是哪一类失败」，不必翻栈。
             val refreshCause = activity.engineManager.lastRefreshFailure
+            val refreshCode = activity.engineManager.lastRefreshFailureCode ?: "snapshot-refresh-failed"
             LogCollector.writeBootFail(
-              activity, "snapshot-refresh-failed",
-              "内嵌运行时快照解压/写入失败（refreshSnapshot 返回 false）"
+              activity, refreshCode,
+              "内嵌运行时快照解压/写入失败（refreshSnapshot 返回 false，code=" + refreshCode + "）"
                 + (refreshCause?.let { " cause=" + it.javaClass.name + ": " + (it.message ?: "无消息") } ?: ""),
               refreshCause,
             )
@@ -561,7 +575,11 @@ internal class EngineStartFlow(private val activity: MainActivity) {
               activity.applyGuidePhase(
                 GuidePhase.Error,
                 "运行时更新失败",
-                diagnosticsLocationHint(dir) + "。可复制该路径或打开控制台查看 engine.log。",
+                // 缺陷 D（fx-2）：这两个显式 hint 会**覆盖** defaultHint，所以安全模式引导
+                // 必须在这里也带上——否则「运行时更新失败」屏的按钮已改成安全模式入口，
+                // 文案却还在让人「重试」，两者对不上。
+                diagnosticsLocationHint(dir) + "。可复制该路径或打开控制台查看 engine.log。" +
+                  activity.getString(R.string.ds_safe_hint_short),
               )
               activity.showGuide()
             }
@@ -578,9 +596,15 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       activity.engineManager.deployUndoCli()
       if (!activity.engineManager.startEngine()) {
         // 任务 19：失败终态落盘（此前这条路径**零落盘**——用户反馈第一条的真因）。
+        //
+        // issue #271 ④：区分「被前置条件拒绝」与「spawn 真失败」。半搬态（live 树缺 node）
+        // 属于前者：不再空等 90s 预算，直接以可归因的原因收口，用户看到的不再是
+        // 「进程在 90s 预算内死亡」这种无指向的结论。
+        val refusal = activity.engineManager.lastStartRefusal
         LogCollector.writeBootFail(
-          activity, "engine-start-false",
-          "EngineManager.startEngine() 返回 false（未能拉起引擎进程）",
+          activity, if (refusal != null) "engine-start-refused" else "engine-start-false",
+          "EngineManager.startEngine() 返回 false（未能拉起引擎进程）"
+            + (refusal?.let { "；refusal=" + it } ?: ""),
         )
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
@@ -605,12 +629,24 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       var booted = false
       while (System.currentTimeMillis() < budgetEnd) {
         if (!isCurrentEngineFlow(generation)) return@Thread
-        if (EngineProbe.check().optBoolean("running", false)) {
+        // M.1（#272）缺陷 b：先看 401 —— 它意味着「引擎在，但当前 cookie 不被接受」，
+        // 必须触发重新认证，**不能**当成「已就绪」放行（旧实现正是这样把用户留在 401 页面且无出口），
+        // 也**不能**当成「引擎死亡」（`running` 仍含 401 ⇒ engineProcessAlive 路径不变，D3/W2 不受影响）。
+        val probe = EngineProbe.check()
+        if (probe.optString("auth") == "required") {
+          LogCollector.log("dsh-engine-start", "engine answered 401 during boot: re-authenticating (cookie rejected)")
+          runCatching { EngineAuth.handleUnauthorized(activity) }
+          // 认证刷新后本拍不算就绪：继续轮询，下一拍 200 才是真的就绪。
+          Thread.sleep(pollStepMs)
+          continue
+        }
+        if (probe.optBoolean("running", false)) {
           booted = true
           // P-AC-04：主路径的 listen 标记（watchEngineListen 线程为主，这里兜底；幂等）。
           LogCollector.markListen(activity)
           // C1（0.14.1 块F）：**首个 HTTP 响应**。上面这次 EngineProbe.check() 真正拿到了 HTTP 应答
-          // （running=true 只在响应码 200/401/303 时成立，见 EngineProbe.check 的判据），这正是 C1
+          // （running=true 只在 200/401/303 时成立，见 EngineProbe.check 的判据），这正是 C1 要的读数。
+          // M.1（#272）新增的是正交的 auth 字段，running 口径未动。
           // 要的「首个 HTTP 响应」而不是 TCP LISTEN。与 t_listen 分开记，使「LISTEN 快、首个响应慢」
           // 这条已验证的假绿路径可被门禁在同一行上同时断言（详档 §5.1 C1）。幂等。
           LogCollector.markFirstHttp(activity)
@@ -652,6 +688,10 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           "引擎进程在 " + ENGINE_BOOT_BUDGET_MS / 1000 + "s 预算内死亡且 Web 端口未就绪（t_listen=-1 形态）；" +
             LogCollector.describeEngineLogState(activity.filesDir),
         )
+        // ── task-79（Bug A）：动态链接失败 ⇒ 判定运行时树损坏并触发一次重抽取 ──────────
+        // 必须在**当拍**读 engine.log：`rotateEngineLog` 每次 spawn 都把 engine.log 截断重写，
+        // 而真机上引擎每 4-10 秒就被拉起一次 ⇒ 等下一拍再读，现场已经被下一次启动冲掉。
+        maybeSelfHealDamagedRuntimeTree(activity)
         // 0.13.1 W3：进程死亡现场镜像到共享目录（含退出码），用户可直接取包反馈。
         // review C5：文案按实际落点回填（共享不可写时回落私有目录）。
         val dir = activity.engineManager.mirrorDiagnosticsToShared("engine-died-during-boot")
@@ -671,6 +711,8 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         return@Thread
       }
       if (booted) {
+        // task-79：启动成功 ⇒ 清掉「运行时树损坏」标记（若不成功，标记留着供诊断与后续决策）。
+        clearRuntimeTreeDamageMarker(activity)
         startEngineService()
         applyShizukuKeepAlive()
         activity.runOnUiThread { if (isCurrentEngineFlow(generation)) activity.showWeb() }
@@ -815,6 +857,111 @@ internal fun diagnosticsLocationHint(dir: java.io.File?): String =
 internal fun startupRecoverThenProbe(recover: () -> Unit, probeRunning: () -> Boolean): Boolean {
   recover()
   return probeRunning()
+}
+
+// ── task-79（Bug A）：运行时树损坏 ⇒ 一次受控重抽取 ─────────────────────────────
+
+/**
+ * 本次 app 运行是否已经为「运行时树损坏」自愈过一次（进程内一次性，见 [RuntimeTree.maySelfHeal]）。
+ *
+ * 为什么是**进程内**标记而不是持久化：预算是「每次 app 运行最多一次」——用户重启 app 就是重新给一次机会，
+ * 这与「每次启动都无限重抽取」有本质区别。持久化会让用户永远翻不了身。
+ */
+@Volatile private var runtimeTreeHealedThisRun = false
+
+/**
+ * task-79（Bug A）：引擎**因动态链接失败而死**时，判定运行时树损坏并触发一次受控重抽取。
+ *
+ * 真机现场：`CANNOT LINK EXECUTABLE ... library "libz.so.1" not found` ⇒ 引擎每次拉起都在链接期死，
+ * 而旧判据只看 3 个条目 ⇒ 判「运行时完整」⇒ `shouldDegradeRefresh` 放行降级启动 ⇒ 永远拉起同一棵坏树。
+ *
+ * 自愈动作（**只在预算内**）：
+ *  ① 落壳侧标记 `.runtime-tree-damaged`（含时间戳）——engine.log 每次 spawn 被截断，不能当账本；
+ *  ② 删 `.snapshot-fingerprint` ⇒ `snapshotFresh()` 立即为 false ⇒ 下次刷新走**完整重抽取**；
+ *  ③ 清刷新失败账本 ⇒ 避免降级闸门在新局面下误判（不清则「连续失败达阈 + live 残缺」的旧账会打架）；
+ *  ④ 如实写日志：说清做了什么、以及**不承诺一次成功**。
+ *
+ * 预算外（本次运行已自愈过一次）：**什么都不做**，直接让既有错误页呈现（可读、带诊断包），
+ * 避免「重抽取 → 再失败 → 再重抽取」的死循环把用户永远挡在加载中。
+ *
+ * @param activity 宿主（用其 filesDir 与 engineManager）。
+ */
+private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity) {
+  // 当拍读：engine.log 由 redirectOutput 每次 spawn 截断重写，晚一拍就读不到现场了。
+  val tail = try { PluginMounts.readEngineLogTail(activity, 4_096) } catch (_: Throwable) { "" }
+  if (!RuntimeTree.snapshotLinkFailure(tail)) return
+  LogCollector.log("dsh-engine-start", "engine died from a dynamic-link failure; runtime tree is damaged")
+  if (!RuntimeTree.maySelfHeal(runtimeTreeHealedThisRun)) {
+    // 预算用尽：不再删指纹/重抽取，停在可读错误页（既有 UI 已展示诊断包路径）。
+    LogCollector.log("dsh-engine-start", "runtime tree damage: self-heal budget already spent this run; not re-extracting (avoid a re-extract loop)")
+    return
+  }
+  runtimeTreeHealedThisRun = true
+  try {
+    // ① 壳侧标记（不被引擎截断），供后续启动与诊断读取。
+    java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
+      .writeText(System.currentTimeMillis().toString() + (0x0A).toChar())
+    // ② 删指纹 ⇒ 下次刷新走完整重抽取。
+    val fp = java.io.File(activity.filesDir, ".snapshot-fingerprint")
+    if (fp.exists()) fp.delete()
+    // ③ 清账本（避免降级闸门在新局面下与新判据打架）。
+    activity.engineManager.clearRefreshLedger()
+    LogCollector.log("dsh-engine-start", "runtime tree damage: fingerprint cleared, refresh ledger reset; next start will re-extract the runtime")
+  } catch (t: Throwable) {
+    Log.w("dsh-engine-start", "runtime tree self-heal failed: " + t.javaClass.simpleName + ": " + (t.message ?: ""))
+  }
+}
+
+/**
+ * 0.14.2-fx-2 缺口：把「恢复期拒绝回滚」落成**可见面**所需的全部壳侧事实。
+ *
+ * 为什么必须有人调它：`applyRecovery` 的 ROLLBACK_FAILED 只写 logcat 与
+ * `pendingRecoveryFailure`，没有任何面向 UI 的通道 ⇒ 数据被保护了但用户完全不知情。
+ *
+ * 做三件事（与 :552 的 refreshSnapshot 失败**同族**的落盘面，但可见面不同）：
+ *   ① `LogCollector.writeBootFail(code)` —— 结构化码，排障者 grep 这个码即可归类；
+ *   ② 一次性标记文件 —— 供引擎 WebUI 就绪后**注入 DOM 提示**（可见面，见 MainActivity）；
+ *   ③ 诊断包镜像 —— 用户可取包反馈。
+ *
+ * **为什么不在这里切引导页 Error 相位**（与 :552 的关键差别，改动理由写清以免被当成漏做）：
+ *   · 恢复期拒绝**不阻断启动**——实测场景（plugin-loss）里应用「一直能跑」，引擎照常起；
+ *   · 启动流紧接着就会 `applyGuidePhase(Starting, "正在启动引擎…")`（引擎未起路径）或
+ *     `showWeb()`（引擎已起路径），两者都会**立刻覆盖/隐藏**这里设的 Error 相位；
+ *     结果是用户看到一闪而过的错误页然后恢复正常 —— 比不显示更糟（像是「刚才出错了？」）；
+ *   · 因此可见面唯一可靠的落点是**页面 DOM 注入**（引擎起来、页面 onPageFinished 之后）。
+ *   若引擎最终没起来，既有 boot-fail 错误页已经展示了失败，本条仍完整落在诊断面。
+ */
+private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?) {
+  val notice = SnapshotRecoveryNotice.forRejection(detail) ?: return
+  // ① 结构化落盘。
+  LogCollector.writeBootFail(
+    activity,
+    notice.code,
+    "快照恢复期拒绝回滚（code=" + notice.code + "）：" + (detail ?: ""),
+  )
+  // ② 一次性标记（注入成功后由 MainActivity consume）。
+  SnapshotRecoveryNotice.markPending(activity.filesDir, detail)
+  // ③ 诊断包镜像（不切界面相位，理由见上方注释）。
+  activity.engineManager.mirrorDiagnosticsToShared(notice.code)
+}
+
+/**
+ * 启动**成功**时清掉损坏标记（Lead 裁决第 4 条：启动成功即清标记）。
+ *
+ * 为什么要清：标记的语义是「上次我们判定树坏了」。若树其实已经修好（重抽取成功），
+ * 标记留着会让后续诊断误判、也可能让将来新增的读取方做出错误决策。
+ * 只删文件，不改预算变量——预算按「每次 app 运行」计，不因成功而重置（同一次运行内不重复自愈）。
+ */
+private fun clearRuntimeTreeDamageMarker(activity: MainActivity) {
+  try {
+    val marker = java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
+    if (marker.exists()) {
+      marker.delete()
+      LogCollector.log("dsh-engine-start", "runtime tree damage marker cleared after a successful boot")
+    }
+  } catch (t: Throwable) {
+    Log.w("dsh-engine-start", "could not clear damage marker: " + t.javaClass.simpleName)
+  }
 }
 
 // ── FX-212.2：启动轮询预算与引导页倒计时文案的同一真源 ────────────────────────

@@ -43,6 +43,71 @@ function saveImpl(target, vendorRoot) {
   writeFileSync(join(vendorRoot, target), IMPL_state[target])
 }
 
+/* ── H-2（0.14.2-fx-2）：G3 的归属判据真源 ────────────────────────────────────────
+ * 旧判据按**包名前缀**（`@deepseek-ai/`、`@dsh-android/`）判「这条失败算不算我们自己的产品回归」，
+ * 于是用户自己挂的官方包（实测：`@deepseek-ai/dsh-mcp-client`，用户在 profile 里配的 mcp-lark）
+ * 被当成产品回归 ⇒ `dshMobileIsIsolatableEntry` 返回 false ⇒ **拒绝隔离** ⇒ 引擎 boot 硬崩。
+ *
+ * 正确的问题是「**这条 entry 是不是我们装配的**」，真源只能是**我们自己的装配清单**：
+ *   ① `scripts/profile-web.cordis.patch.yml` 的 `- id:` / `name:` 条目（我们追加的行）；
+ *   ② 上游两份 bundle patch（dsh-base / dsh-web-app）的行面——它们是**快照内固化**的内容，
+ *      构建期从 stage 树里读出（本脚本拿得到 vendorRoot），不在场时退化为「只有①」；
+ *   ③ 注入集与外部包的包名（`scripts/plugin-dirs.json` 的 dirs + externals 的 package.json name）。
+ *
+ * 在 apply 期算好并**逐字固化进位补丁**，运行期不读任何文件（boot 路径上不能有 IO）。
+ */
+/** 从一份 cordis.patch.yml 抽出 `name:` 值集合（够用的最小状态机；与 check-engine-overlay 同口径）。 */
+function assembledNamesFromPatchText(text) {
+  const out = new Set()
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = /^\s*-?\s*name:\s*(.+?)\s*$/.exec(line)
+    if (m) out.add(m[1].replace(/^['"]|['"]$/g, ''))
+  }
+  return out
+}
+
+const ASSEMBLED_ENTRY_NAMES = (() => {
+  const names = new Set()
+  const ROOT_DIR = join(HERE, '..', '..')
+  // ① 我们自己的 profile patch（权威装配面）
+  try {
+    for (const n of assembledNamesFromPatchText(readFileSync(join(ROOT_DIR, 'scripts', 'profile-web.cordis.patch.yml'), 'utf8'))) names.add(n)
+  } catch { /* 协调仓布局缺席（apk 自包含树）：退化为②③ */ }
+  // ③ 注入集 + 外部包的 package.json name（不用目录名：目录名与包名可不一致）
+  try {
+    const dirs = JSON.parse(readFileSync(join(ROOT_DIR, 'scripts', 'plugin-dirs.json'), 'utf8'))
+    for (const rel of [...(dirs.dirs ?? []), ...(dirs.externals ?? [])]) {
+      try { names.add(JSON.parse(readFileSync(join(ROOT_DIR, rel, 'package.json'), 'utf8')).name) } catch { /* 目录缺席 */ }
+    }
+  } catch { /* plugin-dirs.json 缺席 */ }
+  // 具名出货插件（非 scoped 的 vendor 包）
+  names.add('dsh-undo-savepoint')
+  names.add('dshmarketplace-plugin')
+  return [...names].filter((n) => typeof n === 'string' && n.length > 0).sort()
+})()
+
+/**
+ * ② 上游 bundle patch 的行面：vendorRoot 在场时读出来并入集合（apply 期一次性）。
+ *
+ * **完整性标记（关键）**：上游 bundle 行读不到时（净检出 / 合成夹具树），我们**不知道**产品面
+ * 覆盖了哪些官方包。此时绝不能把「不在我的清单里」当成「用户自装的证据」——那会削弱 fail-loud，
+ * 让真正的产品回归被静默跳过。故返回 complete=false，由判据回落到保守的旧前缀规则。
+ * @returns { names: string[], complete: boolean } complete=false 表示上游行面缺席。
+ */
+function assembledManifestFromStage(vendorRoot) {
+  const out = new Set(ASSEMBLED_ENTRY_NAMES)
+  const base = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+  let rowsRead = 0
+  for (const rel of [
+    base + '/dsh-base/cordis.patch.yml',
+    base + '/dsh-web-app/cordis.patch.yml',
+    'home/.dsh/profiles/web/cordis.patch.yml',
+  ]) {
+    try { const t = readFileSync(join(vendorRoot, rel), 'utf8'); for (const n of assembledNamesFromPatchText(t)) out.add(n); rowsRead += 1 } catch { /* 该面缺席 */ }
+  }
+  return { names: [...out].sort(), complete: rowsRead > 0 }
+}
+
 // F7 v1 双占位形态（0.14.0-preview 实锤坏资产；review C1）：publish 站先内联 open("wx") 占位、
 // 随后又调 helper 占位 → 同一路径第二次 O_EXCL 必得 EEXIST → publishCurrentExclusive 恒 return false。
 // 该串是坏形态的唯一特征（v2 正确形态只在模块级 helper 内出现一次，且变量名是 targetPath）。
@@ -284,6 +349,32 @@ const IMPLS = {
     },
   },
 
+  // ── undo-safe-align-S1：safe 生成逻辑对齐壳侧 SafeMode.kt（保留自有插件 + disable 行）──
+  // 真因（2026-09-26，用户口径「undo 要确保保留我们自己的插件」）：上游 safeModeSet 把
+  // cordis.patch.yml **整份覆写**成只含一条 insert 的最小文件（core.mjs 的 `const minimal = ...`），
+  // 于是 10 个 @dsh-android/* 全被摘掉、7 条 disabled: true 也一并丢失——其中 client-hmr 是
+  // 安全关键的（它会重开无鉴权的 /plugins/events SSE）。
+  // 壳侧 SafeMode.kt（fx-2 缺陷 D，704 单测全绿）已按用户口径实现：只摘「第三方 insert 子条目」，
+  // 保留我方装配的插件与全部顶层 disable 行。本补丁把同一口径移植到 vendor 的生成逻辑上，
+  // 让模型工具面 undo_safe_mode 与壳侧按钮产出同一语义（两套实现同口径，不是两套语义）。
+  // 不变量：safe on -> off 后 patch 逐字节等于进入前（off 仍是整份 copyFile 还原，未改）。
+  'undo-safe-align-S1': {
+    file: 'dsh-undo-savepoint/lib/core.mjs',
+    check: (s) => s.includes('dsh-mobile safe keeps shipped plugins (S1)'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile safe keeps shipped plugins (S1)')) return s
+      // 上游文件是 CRLF：锚点用正则匹配（\r?\n），否则跨行锚点永远失配（实测踩到）。
+      const MINIMAL_RE = /    const minimal = `# dsh-undo-savepoint SAFE MODE[\s\S]*?`;\r?\n    await fs\.writeFile\(patch, minimal, 'utf8'\);/;
+      if (!MINIMAL_RE.test(s)) throw new Error('undo-safe-align 锚点未命中：minimal 覆写段已变（上游改了 safe 生成逻辑，请人工核对）')
+      // 注入片段从独立文件读入（LF），避免在补丁源码里嵌套转义：
+      // 直接内联会让 \n/\s 被外层字符串先吃掉（实测踩到两处：字面换行与 \s 变 s）。
+      const MINIMAL_NEW = readFileSync(join(HERE, 'data', 'undo-safe-align-snippet.mjs'), 'utf8').replace(/\n$/, '')
+      s = s.replace(MINIMAL_RE, MINIMAL_NEW)
+      if (!s.includes('dsh-mobile safe keeps shipped plugins (S1)')) throw new Error('undo-safe-align 复核失败——不写回')
+      return s
+    },
+  },
+
   // ── undo-api-auth-U1：/api/undo 更长 prefix 不得绕过 /api 信任栅栏（apk #222）──
   // 上游 webserver 先匹配 exact、随后 longest-prefix；/api/undo 因此不会进入 client-connection
   // 注册的 /api prefix handler。此补丁在 undo handler 的**第一条语句**重建同一 Host/Origin/cookie
@@ -495,6 +586,118 @@ const IMPLS = {
     },
   },
 
+  // ── ptc-argv-L1：PTC 子进程 V8 堆参数移出 argv + 可执行文件守卫（0.14.2 fx-2 缺陷 C 更深一层）──
+  //
+  // 缺陷现场：模型在 PTC 里连最简代码块都失败，报
+  //   code run failed (worker-exit): Node process exited before completing (1):
+  //   error: expected absolute path: "--max-old-space-size=512"
+  // 0.14.2-fx-1 只把 profile 的 ptc-runtime.nodeExecutable 钉成绝对路径，**没有改 argv 构造**，
+  // 所以 worker spawn bug 原封留在 rc.2 产物上（本补丁的锚点就是那一行）。
+  //
+  // 真因链（逐段可核对）：
+  //   ① 产物 index.js:944 heapFlag = `--max-old-space-size=${maxOldGenerationSizeMb}`；
+  //   ② :947 `...packaged ? [] : [heapFlag],` ⇒ packaged===false 时 heapFlag 落在 argv[1]；
+  //   ③ executable 来自 :941 resolveExecutable(config.nodeExecutable)；direct exec 被拒时壳侧改走
+  //      系统链接器，于是它可能是 /apex/com.android.runtime/bin/linker64（process.execPath 亦被污染）；
+  //   ④ linker64 把**第一个非选项参数**当程序路径，而 heapFlag 正好排在它前面 ⇒ linker64 自己报
+  //      expected absolute path 并退出，Node 根本没被加载。
+  //
+  // 修法两条：
+  //   1) 结构修复：heapFlag **永不进 argv**（删掉 :947 那一项），改由 env.NODE_OPTIONS 传给子 node；
+  //      env.NODE_OPTIONS 移出 `if (packaged)` 无条件设置（DSH_PTC_RUNTIME_NODE 仍只在 packaged 下）。
+  //   2) 守卫（fails loud，不静默回退、不猜替代路径）：executable 必须是绝对路径字符串；
+  //      且不得是安卓系统动态链接器（basename = linker / linker64 / ld.so / ld.so.N）。
+  //
+  // NODE_OPTIONS 为什么在这里安全（已实证，不是推断）：PTC 子进程自己的 bootstrap（同包 lib/process.js）
+  // 启动时把 STARTUP_ENVIRONMENT_NAMES 之外的 env 键全部删除、并把 process.env 换成 null 原型空对象：
+  //   process.js:1063  for (const key of Object.keys(processState.env)) if (!STARTUP_ENVIRONMENT_NAMES.has(key.toUpperCase())) Reflect.deleteProperty(processState.env, key);
+  //   process.js:1064  processState.env = Object.create(null);
+  //   process.js:1134  runNodeMain(openInheritedControlChannel(), Number(process.argv[2]), process);  ← 传的是全局 process
+  // 白名单只有 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP（process.js:1044-1051），NODE_OPTIONS 不在其中 ⇒
+  // 被 delete 掉，孙进程读不到。行为实证（本机 node v24.17）：按同序执行「设 NODE_OPTIONS → delete →
+  // process.env = Object.create(null) → spawnSync 孙进程」，孙进程 NODE_OPTIONS = undefined。
+  //
+  // 另记一处**既有行为**，避免后来人误当新增副作用：本补丁把 env.NODE_OPTIONS 由「被 tombstone 成
+  // undefined」改成「恰为我们的 heap flag」，不是新开继承面——上游 subprocess-local 的 childEnv() 是
+  // {...scrubbedParentEnv(), ...spec.env}（spawn.ts:44-54 posix），targetEnvironment() 再 filter 掉
+  // 值为 undefined 的项（runner-launch.ts:300-314），而现有代码那份 env 先把非启动项全部 tombstone
+  // 成 undefined（index.js:956）。代价（如实登记）：引擎自己若设了 NODE_OPTIONS 会被我们覆盖，
+  // 但既有行为里子进程本就看不到它，故不构成回归。
+  'ptc-argv-L1': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile ptc argv heap via NODE_OPTIONS (L1)'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile ptc argv heap via NODE_OPTIONS (L1)')) return s
+      const OLD_EXEC = [
+        "\t\t\tconst executable = await this.ctx.subprocess.resolveExecutable(this.config.nodeExecutable, void 0, signal);",
+        "\t\t\tif (settled) return await result.promise;",
+      ].join('\n')
+      const NEW_EXEC = [
+        "\t\t\tconst executable = await this.ctx.subprocess.resolveExecutable(this.config.nodeExecutable, void 0, signal);",
+        "\t\t\t// dsh-mobile ptc argv heap via NODE_OPTIONS (L1): fail loud on an unusable executable.",
+        "\t\t\t// Android falls back to the system linker when direct exec of an app-data ELF is denied, and",
+        "\t\t\t// process.execPath is then polluted with that linker path; a linker never loads Node, so the",
+        "\t\t\t// child would die with an absolute-path error before any of our code runs. Guard both shapes",
+        "\t\t\t// here instead of guessing a replacement path.",
+        "\t\t\tif (typeof executable !== 'string' || !isAbsolute(executable)) {",
+        "\t\t\t  throw new Error('ptc-runtime-node: resolved node executable is not an absolute path (' + String(executable) + '); set ptc-runtime.nodeExecutable to an absolute node binary or wrapper path');",
+        "\t\t\t}",
+        "\t\t\tconst __dshMobileExecBase = executable.slice(executable.lastIndexOf('/') + 1);",
+        "\t\t\tif (/^(?:ld\\.so(?:\\.[0-9]+)*|linker(?:64)?)$/.test(__dshMobileExecBase)) {",
+        "\t\t\t  throw new Error('ptc-runtime-node: resolved node executable is the system dynamic linker (' + executable + '); set ptc-runtime.nodeExecutable to an absolute node binary or wrapper path, not a linker');",
+        "\t\t\t}",
+        "\t\t\tif (settled) return await result.promise;",
+      ].join('\n')
+      const OLD_ARGV = [
+"\t\t\tconst argv = [",
+"\t\t\t\texecutable,",
+"\t\t\t\t...packaged ? [] : [heapFlag],",
+"\t\t\t\t...bootstrapArgs(this.ctx.fs, this.config, this.config.maxMessageBytes)",
+"\t\t\t];",
+      ].join('\n')
+      const NEW_ARGV = [
+"\t\t\t// dsh-mobile ptc argv heap via NODE_OPTIONS (L1): the heap flag must never sit at argv[1].",
+"\t\t\t// The system linker (used when direct exec of an app-data ELF is denied) treats the first",
+"\t\t\t// non-option argument as the program path, so a leading --max-old-space-size would be read",
+"\t\t\t// as that path and the child would die before Node loads. It travels via env instead.",
+"\t\t\tconst argv = [",
+"\t\t\t\texecutable,",
+"\t\t\t\t...bootstrapArgs(this.ctx.fs, this.config, this.config.maxMessageBytes)",
+"\t\t\t];",
+      ].join('\n')
+      const OLD_ENV = [
+"\t\t\tif (packaged) {",
+"\t\t\t\tenv.DSH_PTC_RUNTIME_NODE = \"1\";",
+"\t\t\t\tenv.NODE_OPTIONS = heapFlag;",
+"\t\t\t}",
+      ].join('\n')
+      const NEW_ENV = [
+"\t\t\t// dsh-mobile ptc argv heap via NODE_OPTIONS (L1): set for every spawn, not only packaged runs,",
+"\t\t\t// because this is now the ONLY carrier of the heap flag.",
+"\t\t\t// Safe here: the child bootstrap (same package lib/process.js) deletes every env key outside",
+"\t\t\t// STARTUP_ENVIRONMENT_NAMES and replaces process.env with a null-prototype object",
+"\t\t\t// (process.js:1063-1064; entry at :1134 passes the real global process), so NODE_OPTIONS",
+"\t\t\t// never reaches a grandchild process.",
+"\t\t\t// This replaces a tombstone rather than opening a new inheritance path: the code above sets",
+"\t\t\t// every non-startup key to undefined and targetEnvironment() drops undefined entries, so an",
+"\t\t\t// engine-level NODE_OPTIONS -- which the child never saw before either -- is now overwritten",
+"\t\t\t// by this value instead of removed.",
+"\t\t\tenv.NODE_OPTIONS = heapFlag;",
+"\t\t\tif (packaged) {",
+"\t\t\t\tenv.DSH_PTC_RUNTIME_NODE = \"1\";",
+"\t\t\t}",
+      ].join('\n')
+      for (const pair of [[OLD_EXEC, 'executable 解析行'], [OLD_ARGV, 'argv 构造块'], [OLD_ENV, 'env 赋值块']]) {
+        if (!s.includes(pair[0])) {
+          throw new Error('ptc-argv 锚点未命中：' + pair[1] + '——引擎升级后请人工核对 dsh-ptc-runtime-node/lib/index.js')
+        }
+      }
+      s = s.replace(OLD_EXEC, NEW_EXEC).replace(OLD_ARGV, NEW_ARGV).replace(OLD_ENV, NEW_ENV)
+      if (!s.includes('dsh-mobile ptc argv heap via NODE_OPTIONS (L1)')) throw new Error('ptc-argv 复核失败——不写回')
+      return s
+    },
+  },
   // ── atomic-stale-lock-F4：0.14.2 rc.2 追版退役（上游原生满足前提）──
   // 上游 rc.2 的 withFileLock 已自带孤儿锁回收 takeOverExitedLock()：重试循环里 isLockContention
   // 命中后立即尝试回收（claim 文件独占仲裁 + 回收前二次读锁 + 重新探活），语义比 F4 更严谨——
@@ -996,25 +1199,49 @@ const IMPLS = {
         ' * disables the offending third-party entry (via the Loader patch mechanism) and retries, then',
         ' * names every skipped plugin in engine.log. Official and shipped-mobile entries still fail loud. */',
         '/** Scopes owned by the product: a failure here is a real regression and must stay fatal. */',
+        '/* Conservative fallback only: used when the assembly manifest is incomplete (see below). */',
         'const DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES = ["@deepseek-ai/", "@dsh-android/"];',
         // 0.14.1：`@aiwayds/dsh-model-sync` 随插件整体摘除（审查 §9，用户裁定）——它留在本名单里
         // 的后果很具体：名单成员的加载失败**按产品回归 fail-loud**，而它已经不在注入集里了，
         // 老设备上任何残留挂载都会把引擎启动打挂（fail-loud 用在了错误的对象上）。
         // 摘除插件时，这里必须同步删掉——名单就是「谁算我们自己的插件」的单一真源。
         'const DSH_MOBILE_SHIPPED_PLUGIN_NAMES = ["dsh-undo-savepoint", "dshmarketplace-plugin"];',
+        /* H-2（0.14.2-fx-2）：归属由**我们的装配清单**证明，不再由包名前缀证明。
+         * 真源 = 快照构建实际装配的 entry 集合（profile-web.cordis.patch.yml 的 id/name
+         * + 上游两份 bundle patch 的行面 + 注入集/外部包的包名），构建期从树里读出并逐字固化。
+         * 为什么不能再用前缀：用户完全可以自己挂一个官方包（实测 @deepseek-ai/dsh-mcp-client），
+         * 按前缀判会把**用户的合法配置**当成产品回归 → 拒绝隔离 → 引擎硬崩。 */
+        'const DSH_MOBILE_ASSEMBLED_MANIFEST = ' + JSON.stringify(assembledManifestFromStage(CURRENT_STAGE_ROOT)) + ';',
+        'const DSH_MOBILE_ASSEMBLED_ENTRY_NAMES = DSH_MOBILE_ASSEMBLED_MANIFEST.names;',
         '/** Isolation cap: never tolerate an unbounded number of broken plugins. */',
         'const DSH_MOBILE_BOOT_SKIP_LIMIT = 8;',
         'const DSH_MOBILE_BOOT_SKIPPED_PLUGINS = [];',
         'Object.defineProperty(globalThis, "__dshMobileBootSkippedPlugins", { value: DSH_MOBILE_BOOT_SKIPPED_PLUGINS, configurable: true });',
         '/**',
         '* Whether a failing entry belongs to the product rather than to the user.',
+        '*',
+        '* H-2: ownership is proven by OUR assembly list, not by a package-name prefix.',
+        '* All @deepseek-ai/* used to count as product surface, so a user-mounted official',
+        '* package (measured: @deepseek-ai/dsh-mcp-client, the user profile mcp-lark entry)',
+        '* was misread as a product regression and refused isolation, crashing boot.',
+        '* A name prefix says who published a package, not who assembled the entry.',
+        '*',
+        '* Source of truth = DSH_MOBILE_ASSEMBLED_MANIFEST, frozen at build time from our own',
+        '* assembly lists. Names not on it are NOT proof of a user-installed plugin: when the',
+        '* upstream bundle rows could not be read (complete=false) we fall back to the old prefix',
+        '* rule, because weakening fail-loud would hide a real product regression.',
         '* @param name - the Loader entry name (package specifier).',
-        '* @returns true when the entry is official or shipped with the mobile build.',
+        '* @returns true when the entry must fail loud (product surface / ownership unprovable).',
         '*/',
         'function dshMobileIsShippedPlugin(name) {',
         '\tconst value = String(name ?? "");',
-        '\tif (DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES.some((prefix) => value.startsWith(prefix))) return true;',
-        '\treturn DSH_MOBILE_SHIPPED_PLUGIN_NAMES.includes(value);',
+        '\tif (DSH_MOBILE_ASSEMBLED_ENTRY_NAMES.includes(value)) return true;',
+        '\tif (DSH_MOBILE_SHIPPED_PLUGIN_NAMES.includes(value)) return true;',
+        '\t/* Manifest incomplete (no upstream bundle rows on the tree): stay conservative. */',
+        '\tif (DSH_MOBILE_ASSEMBLED_MANIFEST.complete !== true) {',
+        '\t\tif (DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES.some((prefix) => value.startsWith(prefix))) return true;',
+        '\t}',
+        '\treturn false;',
         '}',
         '/**',
         '* Whether a failing entry may be isolated. Only a bare package specifier proves that the entry',
@@ -1124,6 +1351,212 @@ const IMPLS = {
         || !s.includes('__dshMobileBootSkippedPlugins')
         || s.includes('\t\tawait mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl, binName);')) {
         throw new Error('boot-third-party-isolation 复核失败——不写回')
+      }
+      return s
+    },
+  },
+
+  // ── fs-local-digest-guard-B：版本守卫的**摘要 CAS 兜底**（0.14.2 缺陷 B，scope=engine）──
+  // 现象：模型在「读 → 编辑」之间只要有一次**第三方元数据写入**（用户工作区在共享存储
+  // /storage/emulated/0/... ，任何别的 App 都能合法 touch/chmod），edit 就恒判 FS_STALE_VERSION
+  // ⇒ 模型陷入「读→编辑失败→读」死循环（用户截图实锤）。
+  // 真因（设备实测；已排除 FUSE 抖动/挂载别名/延迟落定/媒体扫描/read 自改 ctime/realpath 分叉）：
+  // 版本 token = dev:ino:size:mtimeNs:ctimeNs（versionOf，本文件 :145-146），**内容一个字节没改**
+  // 但 mtime/ctime 变了 ⇒ 版本不等 ⇒ 直接抛 stale，守卫把「元数据噪声」误判成「内容已变」。
+  // 反向实验（专项侦察员实测）证明**不能靠删 ctimeNs 修**：真实改内容 + 同尺寸 + touch -d 还原 mtime 时，
+  // 只有 ctimeNs 还不同 ⇒ 删它会让守卫**放过真实改动**（假阴性）。加宽限窗口同样判否（ctime 无时间上界）。
+  // 修法（唯一被实测验证的一条）：**版本不一致时才比内容摘要**。
+  //   - 摘要相同 ⇒ 内容确实未变（真因是元数据噪声）⇒ 放行；
+  //   - 摘要不同 ⇒ 照旧抛 FS_STALE_VERSION（CAS 语义一字不改）；
+  //   - **无摘要记录 ⇒ 照旧抛 stale**（引擎重启/换实例后必须回落安全行为，绝不默认放行）。
+  // 为什么能**只改本包**：摘要记录挂在 LocalFileSystem 实例上，read 时记、写/edit 后刷新，
+  // 生命周期与 stale 判据同属一个对象——不需要跨包把 digest 从 tool-fs 经 fs-observation-policy
+  // 传进来（那条路要动 4 个包：dsh-fs 类型 / tool-fs / fs-observation-policy / fs-local）。
+  // 单包版的语义边界如实登记：摘要只覆盖「本 provider 实例亲眼读过」的目标；没读过就必须 stale。
+  // 有界性：只保留最近 DSH_MOBILE_DIGEST_LIMIT 条（Map 插入序即 LRU 序，命中即重插尾部），
+  // 超限从最旧淘汰——不设界会让每个被读过的文件永久留一份摘要（长跑会话无界增长）。
+  // 成本：sha256 只在**版本不一致**时算一次（版本相同走原快路径，零额外 IO），实测 4 MiB ≈ 19 ms。
+  'fs-local-digest-guard-B': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile digest CAS fallback (B)')
+      && s.includes('dshMobileDigestOf(')
+      && (s.match(/this\.dshMobileContentUnchanged\(/g) || []).length === 2,
+    apply: (s) => {
+      if (s.includes('dsh-mobile digest CAS fallback (B)')
+        && s.includes('dshMobileDigestOf(')
+        && (s.match(/this\.dshMobileContentUnchanged\(/g) || []).length === 2) return s
+
+      // ① 摘要工具：node:crypto 已在文件顶部 import randomUUID，同模块补 createHash。
+      const IMPORT_OLD = 'import { randomUUID } from "node:crypto";'
+      const IMPORT_NEW = 'import { createHash, randomUUID } from "node:crypto";'
+      if (!s.includes(IMPORT_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：node:crypto import')
+      s = s.replace(IMPORT_OLD, IMPORT_NEW)
+
+      // ② 有界摘要上限 + 摘要函数，插在 LocalFileSystem 类声明之前。
+      const CLASS_ANCHOR = 'var LocalFileSystem = class extends FileSystem {'
+      if (!s.includes(CLASS_ANCHOR)) throw new Error('fs-local-digest-guard 锚点未命中：LocalFileSystem 类声明')
+      const HELPERS = [
+        '/* dsh-mobile digest CAS fallback (B): a third party touching mode/owner/timestamps in a shared',
+        ' * directory (the user workspace lives under /storage/emulated/0) changes the version token',
+        ' * without changing one byte, so the version comparison alone rejects every edit and the model',
+        ' * loops read -> stale edit -> read. When the version differs, compare a content digest first:',
+        ' * equal content means the change really was metadata noise and the edit proceeds; different',
+        ' * content keeps FS_STALE_VERSION. ctimeNs stays in the token: it is the only field that still',
+        ' * catches a same-size write with the mtime restored, so weakening the token is not an option. */',
+        '/** Bound on retained digests; only the most recently read targets are kept. */',
+        'const DSH_MOBILE_DIGEST_LIMIT = 256;',
+        '/**',
+        ' * Digest of the exact bytes a caller read, used only to tell metadata noise from a real change.',
+        ' * @param content - the raw bytes read from the target.',
+        ' * @returns the lowercase SHA-256 hex digest.',
+        ' */',
+        'function dshMobileDigestOf(content) {',
+        '\treturn createHash("sha256").update(content).digest("hex");',
+        '}',
+        CLASS_ANCHOR,
+      ].join('\n')
+      s = s.replace(CLASS_ANCHOR, HELPERS)
+
+      // ③ 实例字段：有界摘要表（Map 插入序即 LRU 序）。
+      const FIELD_OLD = '\tlocks = /* @__PURE__ */ new Map();'
+      const FIELD_NEW = [
+        FIELD_OLD,
+        '\t/* dsh-mobile digest CAS fallback (B): targetKey -> digest of the bytes read, bounded and',
+        '\t * LRU-ordered so a long session cannot grow it without limit. A missing entry means the',
+        '\t * target was not read by this provider instance, which keeps the safe stale refusal after a',
+        '\t * restart. */',
+        '\treadDigests = /* @__PURE__ */ new Map();',
+      ].join('\n')
+      if (!s.includes(FIELD_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：locks 字段')
+      s = s.replace(FIELD_OLD, FIELD_NEW)
+
+      // ④ readText 记录摘要：改走 readWholeText 的同款步骤，但把**原始字节**留作摘要口径。
+      //    为什么用原始字节而不是解码后的字符串：上游 readForEdit 会做 LF 归一化，而 readWholeText 不会——
+      //    两侧口径不一致就永不相等（修完恒 stale 的 CRLF 陷阱）。对原始字节算摘要两侧天然同口径。
+      const READ_OLD = [
+        '\tasync readText(target, signal) {',
+        '\t\treturn readWholeText({',
+        '\t\t\tdisplayPath: target.displayPath,',
+        '\t\t\ttargetKey: target.targetKey',
+        '\t\t}, signal);',
+        '\t}',
+      ].join('\n')
+      const READ_NEW = [
+        '\tasync readText(target, signal) {',
+        '\t\tconst raw = await readFileAbortable(target.targetKey, "read", signal);',
+        '\t\tthrowIfAborted(signal, "read");',
+        '\t\tif (raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) throw new FsError(\`cannot read "${target.displayPath}": binary file\`, "FS_NOT_TEXT");',
+        '\t\tconst content = decodeUtf8(raw, "read", target.displayPath);',
+        '\t\t/* dsh-mobile digest CAS fallback (B): remember what was read, digesting the raw',
+        '\t\t * bytes so the edit path (which reads the same raw bytes) cannot disagree. */',
+        '\t\tthis.rememberReadDigest(target.targetKey, dshMobileDigestOf(raw));',
+        '\t\treturn content;',
+        '\t}',
+        '\t/**',
+        '\t * Record the digest of the bytes just read, evicting the least recently used entry past',
+        '\t * the bound. Re-inserting keeps the map in access order.',
+        '\t * @param targetKey - the resolved target the read observed.',
+        '\t * @param digest - SHA-256 of the raw bytes handed to the caller.',
+        '\t */',
+        '\trememberReadDigest(targetKey, digest) {',
+        '\t\tthis.readDigests.delete(targetKey);',
+        '\t\tthis.readDigests.set(targetKey, digest);',
+        '\t\twhile (this.readDigests.size > DSH_MOBILE_DIGEST_LIMIT) {',
+        '\t\t\tconst oldest = this.readDigests.keys().next().value;',
+        '\t\t\tthis.readDigests.delete(oldest);',
+        '\t\t}',
+        '\t}',
+      ].join('\n')
+      if (!s.includes(READ_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：readText 实现')
+      s = s.replace(READ_OLD, READ_NEW)
+
+      // ⑤ 共用判据：版本不等时才比摘要（版本相同调用方根本不进这个分支 ⇒ 快路径零额外 IO）。
+      const VAW_OLD = [
+        '\tversionAfterWrite(after, target) {',
+        '\t\tif (after) return after.version;',
+        '\t\treturn FsVersion(\`missing:${target.targetKey}\`);',
+        '\t}',
+      ].join('\n')
+      const VAW_NEW = [
+        VAW_OLD,
+        '\t/**',
+        '\t * Whether a version mismatch is metadata noise rather than a real content change.',
+        '\t * The file is re-read only after the versions already disagreed, so the common unchanged',
+        '\t * path pays nothing. A missing digest, an unreadable file, or different bytes all answer',
+        '\t * false, which keeps the caller\'s FS_STALE_VERSION refusal.',
+        '\t * @param absolutePath - the resolved target key to re-read.',
+        '\t * @param targetKey - the key the digest was remembered under.',
+        '\t * @returns true when the current bytes hash to the digest recorded at read time.',
+        '\t */',
+        '\tasync dshMobileContentUnchanged(absolutePath, targetKey) {',
+        '\t\tconst remembered = this.readDigests.get(targetKey);',
+        '\t\t/* No record (never read by this instance, or evicted, or after a restart): the',
+        '\t\t * safe answer is the stale refusal. Never default to allowing the write. */',
+        '\t\tif (remembered === void 0) return false;',
+        '\t\tlet current;',
+        '\t\ttry {',
+        '\t\t\tcurrent = await readFileAbortable(absolutePath, "edit", void 0);',
+        '\t\t} catch {',
+        '\t\t\t/* Unreadable now (removed, permissions, I/O): refuse. */',
+        '\t\t\treturn false;',
+        '\t\t}',
+        '\t\treturn dshMobileDigestOf(current) === remembered;',
+        '\t}',
+      ].join('\n')
+      if (!s.includes(VAW_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：versionAfterWrite')
+      s = s.replace(VAW_OLD, VAW_NEW)
+
+      // ⑥ editText：版本不等 → 比摘要 → 相同则放行；不同仍抛 FS_STALE_VERSION。
+      const ET_OLD = '\t\t\tif (expected && existing.version !== expected.version) throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");'
+      const ET_NEW = [
+        '\t\t\tif (expected && existing.version !== expected.version',
+        '\t\t\t\t&& !(await this.dshMobileContentUnchanged(target.targetKey, target.targetKey))) {',
+        '\t\t\t\t/* dsh-mobile digest CAS fallback (B): the version token moved but the bytes did',
+        '\t\t\t\t * not (a third party touched the shared directory) - proceed. Different bytes still',
+        '\t\t\t\t * throw. */',
+        '\t\t\t\tthrow new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");',
+        '\t\t\t}',
+      ].join('\n')
+      if (!s.includes(ET_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：editText stale 判定')
+      s = s.replace(ET_OLD, ET_NEW)
+
+      // ⑦ writeText 的 replaceIfVersion 同病同治（实测 TOUCH/CHMOD/同字节 rename 三例同样被拒）。
+      const WT_OLD = '\t\t\t\tif (existing.version !== expected.version) throw new FsError(`cannot write "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");'
+      const WT_NEW = [
+        '\t\t\t\tif (existing.version !== expected.version',
+        '\t\t\t\t\t&& !(await this.dshMobileContentUnchanged(target.targetKey, target.targetKey))) {',
+        '\t\t\t\t\t/* dsh-mobile digest CAS fallback (B): same metadata-noise case as editText. */',
+        '\t\t\t\t\tthrow new FsError(`cannot write "${target.displayPath}": file changed since it was read`, "FS_STALE_VERSION");',
+        '\t\t\t\t}',
+      ].join('\n')
+      if (!s.includes(WT_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：writeText replaceIfVersion 判定')
+      s = s.replace(WT_OLD, WT_NEW)
+
+      // ⑧ 写成功后刷新摘要（edit 与 write 都经 writeFileAtomic 落盘）。
+      const ET_TAIL_OLD = '\t\t\tawait writeFileAtomic(target.targetKey, content, existing.mode, signal, this.internals);'
+      const ET_TAIL_NEW = [
+        ET_TAIL_OLD,
+        '\t\t\t/* dsh-mobile digest CAS fallback (B): the target now holds the bytes just written. */',
+        '\t\t\tthis.rememberReadDigest(target.targetKey, dshMobileDigestOf(Buffer.from(content, "utf8")));',
+      ].join('\n')
+      if (!s.includes(ET_TAIL_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：editText 落盘行')
+      s = s.replace(ET_TAIL_OLD, ET_TAIL_NEW)
+
+      const WT_TAIL_OLD = '\t\t\tawait writeFileAtomic(target.targetKey, content, existing?.mode, signal, this.internals, expected?.kind === "createIfAbsent" ? { displayPath: target.displayPath } : void 0);'
+      const WT_TAIL_NEW = [
+        WT_TAIL_OLD,
+        '\t\t\t/* dsh-mobile digest CAS fallback (B): remember the bytes now on disk. */',
+        '\t\t\tthis.rememberReadDigest(target.targetKey, dshMobileDigestOf(Buffer.from(content, "utf8")));',
+      ].join('\n')
+      if (!s.includes(WT_TAIL_OLD)) throw new Error('fs-local-digest-guard 锚点未命中：writeText 落盘行')
+      s = s.replace(WT_TAIL_OLD, WT_TAIL_NEW)
+
+      if (!s.includes('dsh-mobile digest CAS fallback (B)')
+        || (s.match(/this\.dshMobileContentUnchanged\(/g) || []).length !== 2
+        || !s.includes('dshMobileDigestOf(')
+        || !s.includes('DSH_MOBILE_DIGEST_LIMIT')) {
+        throw new Error('fs-local-digest-guard 复核失败——不写回')
       }
       return s
     },
@@ -1523,6 +1956,11 @@ let applied = 0
 let failed = 0
 const touched = new Set()
 
+/* H-2：G3 需要从**被施加的那棵树**读出上游 bundle 的行面（装配清单真源②）。
+ * apply() 的签名只有 (src)，故用模块级变量把当前 vendorRoot 传进去——本脚本是单进程串行施加，
+ * 不存在并发歧义。 */
+let CURRENT_STAGE_ROOT = null
+
 /** 前提补丁（registry.requires）：前提未打时依赖补丁的锚点不可能命中——提前给出精确诊断。 */
 const requirementFailure = (meta) => {
   for (const dep of meta?.requires ?? []) {
@@ -1539,6 +1977,7 @@ const requirementFailure = (meta) => {
   return null
 }
 
+CURRENT_STAGE_ROOT = vendorRoot
 for (const id of order) {
   const impl = IMPLS[id]
   const meta = registry.patches.find((p) => p.id === id)

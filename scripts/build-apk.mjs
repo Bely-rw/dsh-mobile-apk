@@ -91,6 +91,9 @@ const GATE_SCRIPTS = [
   'check-snapshot-secrets.mjs',
   'elf-check.mjs',
   'check-runtime-assets.mjs',
+  // H-1（0.14.2-fx-2）：MCP client 运行期依赖闭包必须在快照内可解析（用户自挂入口的面，
+  // 正向闭包看不见它）。与本地链同一份实现，差集必须为 0（check-release-gates 断言）。
+  'check-mcp-client-deps.mjs',
   'check-perf-instrumentation.mjs',
   // 模型面工具 wire 预算（0.14.0 §4.1 渐进披露）：注册集 + 初始可见集双口径（与本地链同一份实现）。
   'check-tool-surface-budget.mjs',
@@ -211,11 +214,13 @@ try {
   // 构建并发上限（0.14.1 用户拍板系统级约束）：不得吃满全部逻辑核（MuMu 模拟器/系统稳定）。
   log('门禁：构建并发上限（固定 8 线程，不得吃满全部核心）…')
   run('node', [gate('check-build-parallel-cap.mjs')])
-  // Kotlin 单测数量反回归（0.14.1 P0）：CI 从不跑 Kotlin 单测，且「只按退出码判」分不清
-  // 「全绿」与「一个用例都没跑」。本门禁逐类比对基线 + 断言无缺席 + 结果新鲜。
-  // 云端链无 gradle 产物 → --allow-missing 显式 SKIP 计数（不计入绿），本地链才有真结果。
+  // Kotlin 单测数量反回归（0.14.1 P0 / 0.14.2-fx-2 G.0 ⑤ 实修）：CI 从不跑 Kotlin 单测时，
+  // 「只按退出码判」分不清「全绿」与「一个用例都没跑」；本门禁逐类比对基线 + 断言无缺席 + 结果新鲜。
+  // **本轮去掉 --allow-missing**：它让「结果目录不存在」变成 SKIP⇒绿，正是 G.0 ⑤ 那条结构性脱节
+  // （类被删/漏编译时 exit 仍 0）。真检点已挂到 apk CI 的 testDebugUnitTest **之后**（那里结果必在），
+  // 云端 build-apk.yml 不产测试结果、不跑本门禁 ⇒ 该路径不再有「用 SKIP 冒充通过」的余地。
   log('门禁：Kotlin 单测数量反回归（逐类基线只许升 + 无缺席 + 结果新鲜）…')
-  run('node', [gate('check-kotlin-test-count.mjs'), '--allow-missing'])
+  run('node', [gate('check-kotlin-test-count.mjs')])
   // 执行地图覆盖与锚点门禁（0.14.2 D7）：输入在 apk 仓，与本地链/发布链同一份实现。
   // 声明集合差集必须为 0 —— 只加一侧即被 check-release-gates 判红。
   log('门禁：执行地图覆盖与锚点（覆盖完整 + 锚点有效 + 编号一致）…')
@@ -332,6 +337,10 @@ try {
   run('node', [gate('elf-check.mjs'), snapIn, ABI])
   log('门禁：运行时补丁资产（严格，快照缺席即失败）…')
   run('node', [gate('check-runtime-assets.mjs'), ABI, '--require'])
+  // H-1（0.14.2-fx-2）：MCP client 运行期依赖闭包（该宿主不在我们装配的行面上，
+  // check-engine-overlay 的正向闭包结构性看不见它——设备实测 boot 硬崩的正是这条）。
+  log('门禁：MCP client 运行期依赖闭包（严格）…')
+  run('node', [gate('check-mcp-client-deps.mjs'), ABI, '--require', '--snapshot', snapIn])
   // A1 出厂声明值对账（P-AC-01，严格档）：注入后快照的 profile 清单必须带 patchReload 出厂值。
   log('门禁：性能度量入口与 A1 出厂值（严格）…')
   run('node', [gate('check-perf-instrumentation.mjs'), '--require', '--snapshot', snapIn, '--abi', ABI])

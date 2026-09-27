@@ -1,0 +1,277 @@
+# release.yml — 一键正式发布链（workflow_dispatch：传入 version + notes）
+#
+# 目标（用户口径）：workflow_dispatch 输入 version + notes -> CI 自动完成
+#   【构建快照（arm64 + x86_64）-> 打包 APK（双 ABI）-> 跑门禁 -> 建 draft Release -> 上传 9 件资产】
+#
+# 现状（2026-09-27）：**本文件是骨架，尚未端到端触发过**（本轮无法真触发 CI）。
+#   - 与既有 .github/workflows/build-snapshot.yml 是同一条链的两个阶段：后者已做到
+#     「注入 -> 门禁 -> 双 ABI APK -> MANIFEST -> upload-artifact」，缺的只有
+#     「从源重建快照」与「建 draft Release / 上传资产」。本 workflow 把这两段补齐并收成一个入口。
+#   - **测试包不走这里**：测试包在本地构建（-Fast / -Suffix 等），理由与影响见
+#     docs/0.14.2-fx-2-DEFECTS-AND-PLAN.md 的 G.2。
+#
+# 刻意保守：只出 draft Release（人工核对后手动转正式）；不 push main；凡未端到端验证的步骤注释里标 [未验证]。
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v，如 0.14.2-fx-2）；必须等于 app/build.gradle.kts 的 versionName'
+        required: true
+        type: string
+      notes:
+        description: '发布说明 markdown 正文；留空则落 notes 模板并保留待填写'
+        required: false
+        type: string
+        default: ''
+      skip_snapshot_rebuild:
+        description: '复用已产出的快照（调试用；正式发布必须 false）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # 建 draft Release + 上传资产
+  actions: read
+
+jobs:
+  # ── J1 从源重建快照（双 ABI）─────────────────────────────────────────────
+  # 独立 job：这是整链最重的一段（本地约 4 分钟/ABI），且不需要 gradle；失败时可只重跑它。
+  snapshot:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.skip_snapshot_rebuild != true }}
+    strategy:
+      matrix:
+        abi: [arm64, x86_64]
+      fail-fast: false
+    env:
+      DSH_APK_DIR: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true                     # base/ 底座是 LFS 归档（快照重建的输入）
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - name: python -> python3
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3 python-is-python3 || sudo ln -sf /usr/bin/python3 /usr/bin/python
+          python --version
+      - name: stage 底座归档（base/ -> .deploy-tmp/<base-dir>/）
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ matrix.abi }}" = "arm64" ]; then bdir="arm64-base"; else bdir="x64-base"; fi
+          mkdir -p ".deploy-tmp/${bdir}"
+          [ -f "base/base-usr-${{ matrix.abi }}.tar.xz" ] || { echo "缺 base/base-usr-${{ matrix.abi }}.tar.xz"; exit 1; }
+          cp "base/base-usr-${{ matrix.abi }}.tar.xz" ".deploy-tmp/${bdir}/base-usr.tar.xz"
+          [ -f "base/base-dsh.tar.xz" ] && cp "base/base-dsh.tar.xz" ".deploy-tmp/${bdir}/base-dsh.tar.xz"
+          du -sh ".deploy-tmp/${bdir}"
+      - name: 构建快照（Termux 源装配 + 注入 + 归档）
+        shell: bash
+        run: |
+          set -e
+          # 原生 Linux 直跑；WSL 重入只在 win32 触发（构建脚本自身判定）。
+          node scripts/build-snapshot-013.mjs "${{ matrix.abi }}"
+      - name: 断言产物存在
+        shell: bash
+        run: |
+          set -e
+          f=".deploy-tmp/snapshot-013/${{ matrix.abi }}/snapshot.tar.xz"
+          [ -f "$f" ] || { echo "::error::快照未产出: $f"; exit 1; }
+          ls -l "$f"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ matrix.abi }}
+          path: .deploy-tmp/snapshot-013/${{ matrix.abi }}/snapshot.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── J2 打包 + 门禁 + draft Release ───────────────────────────────────────
+  release:
+    needs: [snapshot]
+    # J1 被 skip 时仍要跑（needs 的 skipped 会被当失败，故 always + 显式判空）
+    if: always() && (needs.snapshot.result == 'success' || inputs.skip_snapshot_rebuild == true)
+    runs-on: ubuntu-latest
+    env:
+      DSH_APK_DIR: ${{ github.workspace }}
+      ANDROID_USER_HOME: ${{ github.workspace }}/.android-home
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: python -> python3
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3 python-is-python3 || sudo ln -sf /usr/bin/python3 /usr/bin/python
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.skip_snapshot_rebuild != true }}
+        with:
+          path: .deploy-tmp/snapshot-013
+      - name: 归置快照为 ABI 命名（对齐 release/ 规范）
+        shell: bash
+        run: |
+          set -e
+          mkdir -p snapshot
+          if [ "${{ inputs.skip_snapshot_rebuild }}" != "true" ]; then
+            cp .deploy-tmp/snapshot-013/snapshot-arm64/snapshot.tar.xz  snapshot/snapshot-arm64.tar.xz
+            cp .deploy-tmp/snapshot-013/snapshot-x86_64/snapshot.tar.xz snapshot/snapshot-x86_64.tar.xz
+          fi
+          for abi in arm64 x86_64; do
+            [ -f "snapshot/snapshot-${abi}.tar.xz" ] || { echo "::error::缺 snapshot/snapshot-${abi}.tar.xz"; exit 1; }
+          done
+          ls -l snapshot/
+      - name: 版本与纪律断言（versionName == 输入）
+        shell: bash
+        run: |
+          set -e
+          VER=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)
+          echo "build.gradle versionName=$VER versionCode=$CODE ; input=${{ inputs.version }}"
+          [ "$VER" = "${{ inputs.version }}" ] || { echo "::error::versionName($VER) != 输入——先改 build.gradle.kts 并走 PR"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_ENV"
+          echo "code=$CODE" >> "$GITHUB_ENV"
+      - name: 准备固定签名 keystore（与历史发布同一把）
+        run: |
+          mkdir -p "$ANDROID_USER_HOME/.android"
+          cp keystore/debug.keystore "$ANDROID_USER_HOME/.android/debug.keystore"
+          ls -l "$ANDROID_USER_HOME/.android/debug.keystore"
+      - name: 准备 Android SDK build-tools（apksigner 供产出侧签名断言）
+        run: |
+          yes | sudo "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+          find "${ANDROID_HOME}/build-tools" -maxdepth 2 -type f -name apksigner | tail -1
+      - name: 构建插件（有锁文件走 npm ci）
+        shell: bash
+        run: |
+          set -e
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability dsh-shell-termux dsh-client-ui-responsive; do
+            if [ -f "$d/package-lock.json" ]; then (cd "$d" && npm ci --no-audit --no-fund); else (cd "$d" && npm install --no-audit --no-fund); fi
+            (cd "$d" && npm run build)
+          done
+      - name: Kotlin 单测（check-kotlin-test-count 的输入）
+        shell: bash
+        run: |
+          set -e
+          # 为什么必须在这里跑：聚合门禁里的 check-kotlin-test-count.mjs **按设计**在没有
+          # gradle 结果时判红（它拒绝「一个用例都没跑」冒充通过，见脚本 :352-361）。
+          # 没有本步，发布链会**必然**死在那条门禁上；而 G.0 ⑤ 记录的正是这条结构性脱节
+          # （CI 只跑 compileDebugKotlin，从不跑 Kotlin 单测、也从不调这个计数门禁）。
+          # 结果目录 app/build/test-results/testDebugUnitTest 会被下面的门禁就地读取并比对基线。
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
+      - name: 跑发布门禁（聚合入口，严格档 SKIP=0）[未验证]
+        shell: bash
+        run: |
+          set -e
+          # 本轮未在 CI 端到端跑过本步。本地等价命令：
+          #   node scripts/check-release-gates.mjs --run --require --snapshot-dir snapshot
+          # 注意：声明集里含需要 git 干净工作区 / 设备产物的项，CI 上需按 G.3 的最小充分集调整。
+          node scripts/check-release-gates.mjs --run --require --snapshot-dir snapshot
+      - name: 子仓打包（发布资产里的 3 个 tgz）
+        shell: bash
+        run: |
+          set -e
+          # 与 build-snapshot.yml:98-105 同一套口径（那份已在 CI 真跑过）——
+          # shell-termux / ui-responsive 需先 build；host-web-compat 源码入库，只 pack。
+          # 三个包的 name 由各自 package.json 决定（实测: dsh-android-dsh-<name>-<version>.tgz），
+          # 不在这里改写文件名：MANIFEST 与 Release 资产名都按 pack 的原样名走。
+          mkdir -p plugins
+          (cd dsh-shell-termux && npm ci --no-audit --no-fund && npm run build && npm pack --pack-destination "$GITHUB_WORKSPACE/plugins")
+          (cd dsh-client-ui-responsive && npm ci --no-audit --no-fund && npm run build && npm pack --pack-destination "$GITHUB_WORKSPACE/plugins")
+          (cd dsh-host-web-compat && npm pack --pack-destination "$GITHUB_WORKSPACE/plugins")
+          count=$(find plugins -maxdepth 1 -name '*.tgz' | wc -l)
+          echo "packed tgz count=$count"
+          [ "$count" -ge 3 ] || { echo "::error::子仓 tgz 少于 3 件（实测 pack 名见上），发布资产会缺件"; ls -l plugins/; exit 1; }
+          ls -l plugins/
+      - name: 双 ABI APK 构建（注入后快照 + 固定指纹）
+        shell: bash
+        run: |
+          set -e
+          chmod +x gradlew
+          OUT="release/v${ver}"
+          mkdir -p "$OUT/apk" "$OUT/snapshot" "$OUT/plugins"
+          for pair in "arm64-v8a:snapshot-arm64.tar.xz" "x86_64:snapshot-x86_64.tar.xz"; do
+            ABI=${pair%%:*}; SNAP=${pair##*:}
+            cp "snapshot/${SNAP}" app/src/main/assets/snapshot.tar.xz
+            sha256sum "snapshot/${SNAP}" | awk '{print $1}' > app/src/main/assets/snapshot.sha256
+            ./gradlew :app:assembleDebug --no-daemon --rerun-tasks
+            cp app/build/outputs/apk/debug/app-debug.apk "$OUT/apk/dsh-mobile-apk-v${ver}-${ABI}.apk"
+          done
+          cp snapshot/snapshot-arm64.tar.xz snapshot/snapshot-x86_64.tar.xz "$OUT/snapshot/"
+          # 子仓 tgz 由上一「子仓打包」步产出；这里不许 || true 吞掉缺件（发布资产会静默少 3 件）。
+          cp plugins/*.tgz "$OUT/plugins/"
+          ls -lR "$OUT"
+      - name: 产出侧签名断言（固定证书指纹）
+        shell: bash
+        run: |
+          set -e
+          # 判据不依赖任何行的前缀/措辞（build-tools 版本间措辞会变：37.0.0 出的是
+          # `V2 Signer: certificate SHA-256 digest:`，而不是 `Signer #1 ...`——PR #268 的 CI 就
+          # 死在按旧措辞 sed 上）。这里只要求期望指纹出现在输出里。
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -maxdepth 2 -type f -name apksigner | sort | tail -1)
+          [ -x "$APKSIGNER" ] || { echo "::error::找不到 apksigner"; exit 1; }
+          # 期望指纹以仓库内 keystore 真读为准（不写死常量）。
+          EXPECT=$(keytool -list -v -keystore keystore/debug.keystore -storepass android -alias androiddebugkey 2>/dev/null \
+            | grep -m1 -i 'SHA256:' | sed 's/.*SHA256: *//' | tr -d ':' | tr 'A-F' 'a-f')
+          [ -n "$EXPECT" ] || { echo "::error::读不出 keystore 的 SHA-256 指纹"; exit 1; }
+          echo "expect sha256=$EXPECT"
+          fail=0
+          for apk in release/v${ver}/apk/*.apk; do
+            out=$("$APKSIGNER" verify --print-certs --verbose "$apk" 2>&1 || true)
+            echo "--- $apk 签名输出 ---"; echo "$out"
+            got=$(printf '%s\n' "$out" | grep -m1 -i 'certificate SHA-256 digest:' | sed 's/.*digest: *//' | tr -d ':' | tr 'A-F' 'a-f')
+            if [ -z "$got" ]; then
+              echo "::error::$apk 无法从 apksigner 输出解析出证书指纹（措辞可能又变了，见上方完整输出）"; fail=1; continue
+            fi
+            if [ "$got" != "$EXPECT" ]; then
+              echo "::error::$apk 签名指纹 $got != keystore $EXPECT（非本仓固定 keystore 签名，用户无法覆盖安装升级）"; fail=1; continue
+            fi
+            echo "ok: $apk sha256=$got"
+          done
+          exit $fail
+      - name: MANIFEST.txt + notes.md
+        shell: bash
+        env:
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          set -e
+          OUT="release/v${ver}"
+          ( cd "$OUT" && find . -type f ! -name MANIFEST.txt ! -name notes.md | sort | while read -r f; do
+              rel=${f#./}
+              echo "$(sha256sum "$f" | awk '{print $1}')  ${rel}  $(stat -c%s "$f")"
+            done > MANIFEST.txt )
+          # 用 env 传多行 notes（避免把表达式直接嵌进 heredoc——YAML 缩进与多行内容都会出问题）
+          printf '%s\n' "$RELEASE_NOTES" > "$OUT/notes.md"
+          [ -s "$OUT/notes.md" ] || printf '# v%s 发布说明\n\n## 改动\n- \n' "${ver}" > "$OUT/notes.md"
+          cat "$OUT/MANIFEST.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-v${{ inputs.version }}
+          path: release/v*/
+          retention-days: 30
+      - name: 建 draft Release 并上传资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          TAG="v${{ inputs.version }}"
+          # 幂等：已存在则复用，避免重跑 422
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，复用"
+          else
+            gh release create "$TAG" --repo "${{ github.repository }}" --draft \
+              --title "dsh-mobile $TAG" --notes-file "release/v${ver}/notes.md"
+          fi
+          for f in release/v${ver}/apk/*.apk release/v${ver}/snapshot/*.tar.xz release/v${ver}/plugins/*.tgz release/v${ver}/MANIFEST.txt release/v${ver}/notes.md; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+          done
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name'

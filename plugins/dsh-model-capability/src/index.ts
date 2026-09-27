@@ -821,12 +821,24 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
     const runAutoPass = async () => {
       const routes = routesToConsider()
       diag(`runAutoPass: routes=${JSON.stringify(routes)}`)
-      const descriptor = readDescriptor()
+      // L.2（2026-09-26）：**每个 route 各取一次描述符**。
+      // 旧实现只读一次就传给所有 route（:838 的 descriptor override），但任一 route 写成功后
+      // settings 的 revision 就会推进（服务端 revisions Map），于是后续 route 手里的 override
+      // 必然过期——它们只能靠重试兜底，而重试本身又被并发写者挤掉。
+      // 在循环内重取比「靠重试兜底」更正确：override 的语义是「刚读到的、还没被任何人改过」，
+      // 一旦本轮写过一次，它就**不再是**刚读到的了；在源头纠正比在下游反复撞墙便宜且可推理
+      // （重试次数有限，源头每轮只多一次 describe）。
+      const tickValue = readDescriptor()?.value
+      // L.2：本轮里已经写成功过吗？写成功才会推进 revision，才让手里的描述符过期。
+      // **不能无条件每个 route 重读**——那会给首轮多加一次 describe，破坏 T1 的
+      // 「每 tick describe 次数上界」判据（t1-poll-cost.test.mjs 的 E-P2-4 会判红，实测踩到）。
+      // 只在「本轮已经写过」之后才重读：首轮零额外开销，多路由时也只在必要时才多读一次。
+      let wroteThisPass = false
       for (const route of routes) {
         try {
           // offline 保持既有「不联网」语义，useCachedModelsDev 让 S3 用缓存参与补给；
           // allowModelsDevNetwork=false 保证 tick 绝不触发网络（T1 回归判据，见 t1-poll-cost.test.mjs）。
-          const found = await discover(route, { offline: true, useCachedModelsDev: true, allowModelsDevNetwork: false }, descriptor?.value)
+          const found = await discover(route, { offline: true, useCachedModelsDev: true, allowModelsDevNetwork: false }, tickValue)
           if (!found) continue
           diag(`runAutoPass(${route}): models=${found.report.models.length} efforts=${JSON.stringify(found.report.models.map((m) => [m.id, m.reasoningEfforts ?? null]))}`)
           // 自动补给写回全部缺失字段（不只是 reasoningEfforts）：S3/S5 的价值就是补长尾的
@@ -835,7 +847,14 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
           const patches = patchesFrom(found.report)
           diag(`runAutoPass(${route}): patches=${patches.length}`)
           if (patches.length === 0) continue
+          // 只在「本轮已写过」之后重读：那时描述符才真的过期；否则沿用 tick 首次读到的。
+          if (wroteThisPass) {
+            tickSection = undefined
+            readDescriptor()
+          }
+          const descriptor = readDescriptor()
           const result = await applyModelPatch(settings, route, patches, logWithTrace, stamps, descriptor)
+          if (result.wrote) wroteThisPass = true
           diag(`runAutoPass(${route}): wrote=${result.wrote} reason=${result.reason} changes=${JSON.stringify(result.changes)}`)
           if (result.wrote) log?.info?.(`auto-apply ${route}: ${result.changes.join('；')}`)
         } catch (error) {

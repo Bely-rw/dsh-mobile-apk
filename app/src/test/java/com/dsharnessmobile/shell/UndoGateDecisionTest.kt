@@ -185,4 +185,74 @@ class UndoGateDecisionTest {
       UndoGate.decide(threshold, armedAt + 10 * UndoGate.WATCH_MS, null, armedAt),
     )
   }
+
+  // ── M.3 F（issue #274 ①）：回滚的**证据门槛** ──────────────────────────────────
+  //
+  // 真因：assessProbe 在 HTTP 超 2.5s 预算时给 DEGRADED_HTTP（注释自承实测出现过 3061ms）。
+  // 长 turn / 慢磁盘即可让它连续 6 拍（30s）⇒ 回滚用户配置 + 强杀活引擎。
+  // 一次慢响应不该有这种权限。
+  //
+  // 判据刻意**不动** [decide]（坑 153 依赖它的计数语义：半死引擎必须仍能走到 EXECUTE），
+  // 而是把「证据语义」独立成第二道门。两道门的分工是本修复的关键。
+
+  /** 正证：无证据（默认）时必须**不否决** —— 既有调用点/既有语义不受影响。 */
+  @Test
+  fun noEvidenceDoesNotRefuseRollback() {
+    assertEquals(
+      "默认无证据不得否决（否则半死引擎再也救不回来，坑 153 被破坏）",
+      null,
+      UndoGate.rollbackEvidenceRefusal(UndoGate.RollbackEvidence.NONE),
+    )
+  }
+
+  /** 反证：日志有 EADDRINUSE ⇒ 否决（端口被别人占着，回滚/重启都不解决问题）。 */
+  @Test
+  fun eaddrinuseRefusesRollback() {
+    val refusal = UndoGate.rollbackEvidenceRefusal(
+      UndoGate.RollbackEvidence(logTail = "Error: listen EADDRINUSE :::3080"),
+    )
+    assertEquals("必须给出可诊断理由", true, refusal != null)
+    assertEquals("理由必须点名 EADDRINUSE", true, refusal!!.contains("EADDRINUSE"))
+  }
+
+  /** 反证：端口确认**不是**本进程持有 ⇒ 否决（重启我们不解决问题）。 */
+  @Test
+  fun foreignPortOwnerRefusesRollback() {
+    val refusal = UndoGate.rollbackEvidenceRefusal(UndoGate.RollbackEvidence(portOwnedByApp = false))
+    assertEquals("端口非本进程持有时必须否决", true, refusal != null)
+    assertEquals("理由必须点名端口归属", true, refusal!!.contains("他进程"))
+  }
+
+  /**
+   * 反证（核心）：**只是略超预算**（长 turn / 慢磁盘）⇒ 否决。
+   * 这是 issue #274 ① 的直接靶子：探活 2.5s 预算被 3061ms 打穿就升级成破坏性自愈。
+   */
+  @Test
+  fun merelySlowProbeRefusesRollback() {
+    val refusal = UndoGate.rollbackEvidenceRefusal(UndoGate.RollbackEvidence(slowOnly = true))
+    assertEquals("仅略超预算时必须否决（一次慢响应不该回滚用户配置）", true, refusal != null)
+    assertEquals("理由必须说明是慢而非故障", true, refusal!!.contains("略超预算"))
+  }
+
+  /** 边界：端口归属**未知**（拿不到归属）不得否决（不因测量失败放宽/收紧破坏性动作）。 */
+  @Test
+  fun unknownPortOwnershipDoesNotRefuse() {
+    assertEquals(
+      "未知归属 = 不否决（测量失败不该变成否决理由）",
+      null,
+      UndoGate.rollbackEvidenceRefusal(UndoGate.RollbackEvidence(portOwnedByApp = null)),
+    )
+  }
+
+  /** 边界：普通日志 + 端口归我们 ⇒ 不否决（确认是「我们的引擎半死」时才允许回滚救）。 */
+  @Test
+  fun ordinaryLogWithOurPortDoesNotRefuse() {
+    assertEquals(
+      "我们的引擎半死时回滚必须仍可用（这是坑 153 要保的能力）",
+      null,
+      UndoGate.rollbackEvidenceRefusal(
+        UndoGate.RollbackEvidence(logTail = "dsh web: listening on 3080", portOwnedByApp = true),
+      ),
+    )
+  }
 }

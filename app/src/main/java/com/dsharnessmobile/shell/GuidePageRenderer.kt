@@ -236,13 +236,24 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       activity,
       GuideCallbacks(
         onStartEngine = {
-          activity.engineFlow.engineRetryCount = 0 // 手动重试归零自动重试计数
-          // 0.14.1 D2：同时清空**跨进程**的快照刷新失败账本。用户显式点「重试」就是要求
-          // 「再试一次刷新」；不清账的话降级闸门会让他永远拿不到那次刷新，按钮就成了摆设。
-          activity.engineManager.clearRefreshLedger()
-          activity.startEngineFlow()
+          // 缺陷 D（fx-2）：同一个主按钮在 **Error 相位**下语义不同——它变成「安全模式启动」。
+          // 分叉放在这里而不是换控件：`GuideChrome` 只有一个 primaryButton，
+          // 复用它的既有样式/锁态/无障碍面比新增按钮更少出事面（也避免用 Phase==Error 之外的判据）。
+          if (lastGuidePhase == GuidePhase.Error) enterSafeMode()
+          else {
+            activity.engineFlow.engineRetryCount = 0 // 手动重试归零自动重试计数
+            // 0.14.1 D2：同时清空**跨进程**的快照刷新失败账本。用户显式点「重试」就是要求
+            // 「再试一次刷新」；不清账的话降级闸门会让他永远拿不到那次刷新，按钮就成了摆设。
+            activity.engineManager.clearRefreshLedger()
+            activity.startEngineFlow()
+          }
         },
         onOpenConsole = { activity.startActivity(Intent(activity, ConsoleActivity::class.java)) },
+        // M.1（#272）缺陷 b：手动自救出口。**不依赖任何 401 判定**——无条件丢 cookie 重取 + 重启引擎 + 重载。
+        // 为什么把「重新认证」与「重启引擎」合成一个动作：两者对用户是同一件事（「把连接弄回来」）；
+        // 分成两个按钮会让用户在「凭证问题还是进程问题」上做一次他无从判断的选择。
+        // 顺序：先失效本地凭证（invalidate）→ 重新换取 → 重启引擎（引擎重启会换新 token，故顺序无关但先拿后启更省一次重试）。
+        onReauthEngine = { onReauthEngine() },
         onCheckUpdate = { onUpdateButton() },
         onGrantStorage = { activity.dirPickerController.requestStorageGrant() },
         onCopyLog = { copyGuideLog() },
@@ -300,7 +311,9 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     chrome.primaryButton.alpha = if (lockPrimary) 0.55f else 1f
     chrome.primaryButton.text = when (phase) {
       GuidePhase.Closed -> activity.getString(R.string.ds_restart)
-      GuidePhase.Error -> activity.getString(R.string.ds_retry)
+      // 缺陷 D（fx-2）：启动失败时主按钮是「安全模式启动」而不是「重试」。
+      // 用户口径：失败的当下，重试往往只是再撞一次同一堵墙；能自救的那条路是带着上下文进安全模式。
+      GuidePhase.Error -> activity.getString(R.string.ds_safe_start)
       GuidePhase.Recovering -> activity.getString(R.string.ds_recovering)
       GuidePhase.Starting, GuidePhase.Extracting -> activity.getString(R.string.ds_starting)
       GuidePhase.Updating -> activity.getString(R.string.ds_updating)
@@ -326,6 +339,103 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     chrome.statusDot.background = DsUi.oval(dotColor)
     setStatusPulse(busy)
     refreshGuideMeta()
+  }
+
+  /**
+   * M.1（apk #272）缺陷 b：手动自救——重新认证 + 重启引擎 + 重载界面。
+   *
+   * 关键性质：**不依赖 401 判定**。旧实现的自愈完全挂在「检测到 401」上（而 401 又被当成健康），
+   * 于是判定链一坏，用户就再无出路。本方法只依赖「用户点了按钮」这一个事实。
+   *
+   * 步骤与理由：
+   *  ① `EngineAuth.handleUnauthorized` = force 刷新：先 invalidate 本地 cookie（内存 + prefs）再重取，
+   *     特意**绕过缓存短路**——若沿用 mayReuseCachedCookie 的短路，被服务端拒绝的旧 cookie 会被原样返回，
+   *     这条路径就形同空转（该函数注释里记着 ST-13 的实测教训：手动失效后审批卡不再弹出，只能重启 App）。
+   *  ② 注入新的 CookieManager（页面同源 XHR/WS 自动携带；注入失败只是本拍无效，不阻断重启）。
+   *  ③ `engineFlow.restart()` 重启引擎：进程级兜底，覆盖「凭证链本身坏了」的情况。
+   *  ④ 回执如实：认证成功/失败、引擎重启是否受理，都写进副文案（不承诺「一定能连上」）。
+   *
+   * refresh 内含同步 HTTP（最长 8s）且持 EngineAuth 锁 ⇒ **必须在后台线程**（与既有 onAuthRetry 同纪律）。
+   */
+  private fun onReauthEngine() {
+    applyFlowHint("正在重新认证并重启引擎…")
+    Thread {
+      val cookie = try { EngineAuth.handleUnauthorized(activity) } catch (_: Throwable) { null }
+      if (cookie != null) {
+        try {
+          android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie)
+        } catch (_: Throwable) {
+          // 注入失败不阻断：重启引擎后仍会走既有首屏 cookie 注入路径。
+        }
+      }
+      val restarted = try { activity.engineFlow.restart() } catch (_: Throwable) { false }
+      activity.runOnUiThread {
+        val authText = if (cookie != null) "凭证已重新获取" else "凭证未能重新获取（可打开控制台排查）"
+        val bootText = if (restarted) "，正在重启引擎…" else "，引擎重启未受理（可能正在启动中）"
+        applyFlowHint(authText + bootText)
+      }
+    }.apply { isDaemon = true; name = "dsh-guide-reauth" }.start()
+  }
+
+  /**
+   * 缺陷 D（fx-2）：点「安全模式启动」——进入安全模式 + 把修复 prompt 塞进剪贴板。
+   *
+   * 顺序是按用户价值排的，不是随手写的：
+   *  ① 先取失败现场（boot-fail.log 尾巴），因为**它可能被后续启动轮转掉**；
+   *  ② 进安全模式（摘第三方插件条目、保留我们自己的；事务纪律见 [SafeMode.enter]）；
+   *  ③ 组装 prompt（含①的原文 + 「保留自有插件」「先定位真因」两条约束）并写剪贴板；
+   *  ④ 如实回执：成功/失败都要说清哪一步没成，**不承诺一定能修复**。
+   *
+   * ④ 回执给用户看一小会儿，随后**真的以 safe 状态重启引擎**（用户口径：点一下就以 safe 状态运行）。
+   *
+   * 为什么回执与重启之间留一小段延时：安全模式改的是装配清单，引擎**重启后才生效**，
+   * 所以必须重启；但若立刻重启，`Starting` 相位会立刻用相位文案覆盖掉回执，
+   * 用户就看不到「prompt 已复制 / 复制失败」这个结果——而那正是本按钮的主要交付物之一。
+   * 用 `chrome.root.postDelayed`（View 自带的 Handler）而不是自建 Handler：
+   * View 的延时任务随视图 detach 自动失效，**不存在 Activity 泄漏面**；
+   * 回调里再判一次 `lastGuidePhase == Error`，避免用户在延时窗口内又点了别的东西后仍被强制重启。
+   *
+   * 重启前清快照刷新账本与重试计数：与既有「手动重试」同口径——用户显式要求「以 safe 状态运行」，
+   * 就该真的发起一次启动尝试，而不是被上一次失败的降级闸门挡住。
+   */
+  private fun enterSafeMode() = activity.runOnUiThread {
+    val engine = activity.engineManager
+    val (stage, logTail) = SafeMode.readFailureContext(activity)
+    val result = SafeMode.enter(
+      patch = SafeMode.patchFile(engine),
+      homePatch = SafeMode.homePatchFile(engine),
+      autoDir = SafeMode.autoDir(engine),
+      id = SafeMode.newId(),
+    )
+    if (!result.ok) {
+      // 备份不成功就绝不进入（[SafeMode.enter] 保证未改任何文件）——回执必须带真因。
+      applyGuideHint(activity.getString(R.string.ds_safe_failed, result.message))
+      return@runOnUiThread
+    }
+    val prompt = buildSafeModePrompt(
+      stage = stage,
+      detail = result.message,
+      logTail = logTail,
+      safeModeActive = true,
+    )
+    val copied = SafeMode.copyToClipboard(activity, prompt)
+    // 回执按「剪贴板成没成」分两句：prompt 的交付是这条路径的主要价值，不能含糊过去。
+    applyGuideHint(
+      if (copied) activity.getString(R.string.ds_safe_entered)
+      else activity.getString(R.string.ds_safe_prompt_copy_failed),
+    )
+    // 回执看一小会儿，然后真的以 safe 状态重启（见方法注释：为什么留延时、为什么用 View 的 postDelayed）。
+    chrome.root.postDelayed({
+      if (lastGuidePhase != GuidePhase.Error) return@postDelayed
+      activity.engineFlow.engineRetryCount = 0
+      activity.engineManager.clearRefreshLedger()
+      activity.startEngineFlow()
+    }, SAFE_RESTART_DELAY_MS)
+  }
+
+  private companion object {
+    /** 回执可见时长：足够读完一句「修复指令已复制到剪贴板」，又不至于让用户以为按钮没反应。 */
+    const val SAFE_RESTART_DELAY_MS = 1_500L
   }
 
   /** 只更新副标题（不动相位/状态点/主按钮）。
@@ -399,7 +509,9 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     GuidePhase.Updating -> "下载并校验快照后会自动切换运行时。"
     GuidePhase.Recovering -> "看门狗正在拉起引擎，通常几秒内恢复。"
     GuidePhase.Undoing -> "正在把配置/插件回滚到最后良好快照（自动回撤）。"
-    GuidePhase.Error -> "可打开控制台查看 engine.log，或点击重试。"
+    // 缺陷 D（fx-2）：失败页的默认副文案要说清「这个按钮现在做什么」——
+    // 旧文案只提「重试」，而按钮此刻已被改成安全模式入口（文案与事实必须对齐）。
+    GuidePhase.Error -> activity.getString(R.string.ds_safe_hint)
     GuidePhase.Closed -> "引擎已停止，不会自动恢复。"
     GuidePhase.Idle -> "引擎就绪后将进入 " + UserCopy.APP_NAME + "。首次使用需授予存储权限——导出文件与日志要写在公共目录。"
     GuidePhase.Info -> "运行时随安装包一起更新：安装新版 APK 即完成升级。"
