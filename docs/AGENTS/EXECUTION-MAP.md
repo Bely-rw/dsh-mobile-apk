@@ -879,7 +879,7 @@ flowchart TD
   - 指纹文件 `.snapshot-fingerprint`：`EngineManager.fingerprintFile()`(:74) 写、`snapshotFresh()`(:81-86) 读、`UpdateManager`(:97) 也写 —— 三处共用一个文件是两条更新链的接缝。
   - 用户面集合：`SnapshotUserData.preservedNames`(:30-34) 由 `EngineManager` 传入 `swap`；`home` 顶层走 seed-if-absent(:331-337)；profiles 根两个清单走 `mergePackageJson`(:598) / `FactoryProfilePatch.merge`(:655-658)。
   - 退役插件迁移：`REMOVED_PROFILE_PLUGINS`(SnapshotTransaction.kt:43-46) 的「挂载 id + 包名」是 `reconcileRemovedProfilePlugins`(:385) 的唯一输入 —— 新增摘除必须在此登记，否则老设备摘不掉。
-  - 退役 disabled 行：`FactoryProfilePatch.RETIRED_DISABLED_ROW_IDS`(FactoryProfilePatch.kt:41) 同时被 `EngineManager.repairProfilePatch`(:1159) 与 `FactoryProfilePatch.merge`(:88) 读。
+  - 退役 disabled 行：`FactoryProfilePatch.RETIRED_DISABLED_ROW_IDS`(FactoryProfilePatch.kt:65) 同时被 `EngineManager.repairProfilePatch`(:1159) 与 `FactoryProfilePatch.merge`(:88) 读。
   - 在线更新状态文件：`.update-pending` / `.update-pending-at` / `usr-old` / `update-stage` / `update.tar.xz` 由 `UpdateManager` 写、`EngineManager.onEngineProbe`(:1344) 读收口；`DEFAULT_MANIFEST_URL`(:154)、`EMULATOR_HOST`(:157)、`validateManifestUrl`(:168) 是入口准入面。
   - 下载落盘：`DownloadSaver` 依赖 `EngineProbe.ENGINE_URL`（`isEngineSource`，DownloadSaver.kt:17）、`EngineAuth.attach`(:101)、`dshDataDir/exports`；`UpdateChecker` 依赖 `BuildConfig.VERSION_NAME`(:115) 与 `Documents/dshdata/updates`(:38)。
 - **关键坐标**：
@@ -890,7 +890,9 @@ flowchart TD
   - `app/src/main/java/com/dsharnessmobile/shell/SnapshotFs.kt`（`deletePath`）— 逐项容错 + `newDirectoryStream` 枚举（P0-B：避开 API 34 的 `Stream.toList`）；0.14.1 D1 起容错面为 `Exception` + `LinkageError`（重抛 `VirtualMachineError`），判定在顶层 `isTolerableDeletionFailure`
   - `app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt:196` — 刷新失败路径：回滚结果未判 + 无条件清 marker（D-3 逃逸点）
   - `app/src/main/java/com/dsharnessmobile/shell/UpdateManager.kt:34` — 未配置可信发布源即拒绝（S-10 fail-closed）
-  - `app/src/main/java/com/dsharnessmobile/shell/FactoryProfilePatch.kt:79` — 工厂 disabled 语义纠正入口
+  - `app/src/main/java/com/dsharnessmobile/shell/FactoryProfilePatch.kt:149`（`merge`）— 工厂 disabled 语义纠正入口；
+    入口内**先**跑 `normalizeLegacyAgentDefaultModel`(:261) 归一旧「单点」写法（`agent-default-model` disabled + 同包换 id insert）
+    为「就地按上游 id 覆盖 config」，保住用户 config 逐字不变。启动期另有一次 `repairRetiredDisabledRows`(:338)。
 - **不变量**：
   1. marker 是恢复唯一权威：任何条目被触碰前必须先写进 journal；`clearMarker` 只允许在「已收敛」时发生（STAGED 丢弃、前滚、**成功**回滚、finish）。违反 → 半成品树被当成正常树，症状是「插件注册了但不真实可用」。
   2. 用户数据从不被 move/copy/delete：`preservedNames` 命中即原地保留；`home` 顶层 seed-if-absent；profiles 根的两个清单是用户面（只做并集/按 id 增补）。
