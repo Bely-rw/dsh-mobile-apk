@@ -61,6 +61,8 @@ Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-ven
 
 快照构建器会对已注入的 `dsh-app-boot` 产物运行 `scripts/tests/boot-pending.test.mjs`。固定 Harness 0.1.7-rc.2 的启动审计入口是 `auditStartupEntries`：全局必需 id 的 pending/failed 致命，可选第三方条目只产告警；旧测试调用的 `assertEntriesActivated` 已不导出。测试现直接驱动当前导出，并覆盖必需与可选条目交叉状态（坑 190）。构建器里的历史标签 `boot-pending-G1` 仍指向这个测试文件。
 
+`check-dsh-source-snapshot.mjs` 的内置预设载体断言与权威门禁 `check-engine-overlay.mjs` 的 CARRIERS 同源，清单在 `scripts/source-build/preset-carriers.mjs`：载体是 `agent-preset/skills/` 与 `web-app/presets/`（0.1.7 把 `dsh-agent-presets` 拆成 agent-preset + agent-preset-registry 后的新形态），判据是目录在场且递归文件数 ≥ 1。`preset-carriers.test.mjs` 读权威源文本双向比对两侧载体集合——权威源重锚而本侧没跟上的话，判红落在秒级的 PR 门禁上，而不是四十分钟后的云端构建（坑 191）。
+
 **设备验证链路**（真机 arm64 vivo V2425A；模拟器 MuMu x86_64 竖屏 `127.0.0.1:16416`、横屏 `127.0.0.1:16384`——横屏实例勿改回竖屏）：
 - 安装：`adb -s <serial> install -r -t out\v<版本>\...apk`（同签名 debug.keystore；**指纹变更触发 refreshSnapshot 全量重解压（真机 ≈2-4 分钟、模拟器实测 ~8 分钟，勿在解压中杀进程——中途杀进程看门狗会拿半解压运行时拉引擎，见坑 37）**）。
 - 引擎探活：`adb -s <serial> forward tcp:23080 tcp:3080` → `http://127.0.0.1:23080/`。

@@ -878,3 +878,9 @@
     **真因**：固定 Harness 0.1.7-rc.2 的 `dsh-app-boot` 已改为导出 `auditStartupEntries`，按全局必需 entry id 判定致命错误，可选条目的 pending/failed 只告警。仓库测试仍调用旧导出，并沿用「任何 FAILED 都致命」的旧口径；旧版测试在裸 clone 上因找不到目标而跳过，未及时暴露漂移。
     **修法**：保持快照构建器的镜像脚本不动，改它调用的测试文件：直接注入 Loader 条目调用当前导出，用必需 id `webserver`、可选第三方、pending/failed 和混合状态验证当前契约；目标存在时先断言导出函数存在。
     **复验证据**：使用仓库固定的 0.1.7-rc.2 app-boot 产物夹具及已安装依赖，本地五个真实行为用例全绿；完整来源构建须由下一次远程 run 验证。
+
+191. **来源审计链的检查器停在上一代引擎事实：预设载体断言在 pin 抬到 0.1.7-rc.2 后必然判红（2026-09-27，远程 run 36293117340）**：
+    **现象**：快照成功产出（492.2 MB，sha256=e36b77b8…），pnpm 物化、运行时依赖链接、原生模块审计三个后续检查全过，紧接着 `check-dsh-source-snapshot.mjs` 抛 `source snapshot has no built-in dsh-agent-presets entries`，签名与 APK 步骤未执行。
+    **真因**：该检查器是权威门禁 `check-engine-overlay.mjs` 的等价实现，而权威源在 0.14.2 追版时已把预设载体从 `@deepseek-ai/dsh-agent-presets/presets/` 重锚为 `agent-preset/skills/` + `web-app/presets/`（0.1.7 把该包拆成 agent-preset + agent-preset-registry）；等价实现没跟上。旧断言此前能通过，是因为上一版 pin 是 0.1.5-rc.1（那一代确有 `agent-presets/presets`，实测 4 项），本链把 pin 抬到 0.1.7-rc.2 后旧载体已不存在——**同一条链在换代后判红，指向的是门禁自身过期，不是产物缺失**。
+    **修法**：载体清单抽成 `scripts/source-build/preset-carriers.mjs`（与权威源同口径：目录在场且递归**文件**数 ≥ 1；只断「包在场」是冗余，overlay 已覆盖包版本），检查器改为调用它并把逐载体计数记入报告；新增 `preset-carriers.test.mjs` 双向漂移守卫——它读权威源文本里的 CARRIERS 数组，比对两侧载体路径集合，权威源重锚即判红。测试接进 PR 与来源构建两处入口的早期步骤。
+    **复验证据**：本地 6 例全绿；判别力反证两轮（把权威源载体路径改名 / 删掉 CARRIERS 结构）守卫均判红，还原后复绿；pin 侧实测：`packages/preset/agent-preset/skills` 15 个文件、`packages/bundle/web-app/presets` 4 个 `.patch.yml`，两者都在各自 package.json 的 `files` 里，故产物面应非空。完整来源构建须由下一次远程 run 验证。

@@ -9,7 +9,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -18,6 +17,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { checkDshRuntimeDependencies } from './check-dsh-runtime-dependencies.mjs'
 import { checkAndroidNativeRuntimePackages } from './check-android-native-runtime-packages.mjs'
+import { checkPresetCarriers } from './preset-carriers.mjs'
 
 const snapshotArg = process.argv[2]
 if (!snapshotArg) {
@@ -151,9 +151,10 @@ try {
     patchChecks.push({ id: patch.id, target: patch.target, marker })
   }
 
-  const presetsRoot = join(engineRoot, 'node_modules/@deepseek-ai/dsh-agent-presets/presets')
-  const presetCount = existsSync(presetsRoot) ? readdirSync(presetsRoot).length : 0
-  if (presetCount < 1) throw new Error('source snapshot has no built-in dsh-agent-presets entries')
+  // 内置预设载体：口径与权威门禁 check-engine-overlay.mjs 的 CARRIERS 同源，漂移由
+  // preset-carriers.test.mjs 双向复核。此处曾盯 0.1.5-rc.1 时代的 `dsh-agent-presets/presets`
+  // ——该包在 0.1.7 被拆分，本链抬 pin 后旧断言必然判红（坑 191）。
+  const carrierChecks = checkPresetCarriers(engineRoot)
 
   const report = {
     source: sourceManifest.source,
@@ -172,11 +173,12 @@ try {
     nativeCheck,
     canvasAndroidArm64: { version: canvasManifest.version, size: canvasBytes.length, sha256: sha256(canvasBytes) },
     patchChecks,
-    builtInPresetCount: presetCount,
+    presetCarriers: carrierChecks,
   }
   mkdirSync(sourceBuildRoot, { recursive: true })
   writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
-  console.log(`source snapshot check passed: ${packageChecks.length} pinned packages, ${dependencyCheck.dependencyCount} dependency links, ${patchChecks.length} engine patch markers, ${presetCount} presets`)
+  const carriers = carrierChecks.map((carrier) => `${carrier.label} ${carrier.fileCount}`).join(', ')
+  console.log(`source snapshot check passed: ${packageChecks.length} pinned packages, ${dependencyCheck.dependencyCount} dependency links, ${patchChecks.length} engine patch markers, preset carriers: ${carriers}`)
 } finally {
   rmSync(tempRoot, { recursive: true, force: true })
 }

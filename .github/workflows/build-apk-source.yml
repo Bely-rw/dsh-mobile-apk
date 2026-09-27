@@ -36,6 +36,7 @@ jobs:
           node --test scripts/source-build/reconcile-harness-vendor-lock.test.mjs
           node --test scripts/source-build/check-package-lock-roots.test.mjs
           node --test scripts/source-build/check-android-native-runtime-packages.test.mjs
+          node --test scripts/source-build/preset-carriers.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
