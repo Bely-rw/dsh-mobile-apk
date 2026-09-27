@@ -585,19 +585,18 @@ jobs:
             .deploy-tmp/source-build/post-snapshot-native-runtime-check.json
           node scripts/source-build/check-dsh-source-snapshot.mjs "$snapshot_archive"
 
-      - name: Generate ephemeral signing certificate from the installed JDK
+      - name: Verify the repository debug signing keystore
         shell: bash
         run: |
           set -euo pipefail
-          rm -f keystore/debug.keystore
-          keytool -genkeypair -noprompt \
-            -keystore keystore/debug.keystore -storetype PKCS12 \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 3650 \
-            -dname 'CN=DSH Source Build,OU=Ephemeral,O=dsh-mobile-apk,C=US'
-          keytool -list -v -keystore keystore/debug.keystore \
-            -storepass android -alias androiddebugkey \
-            | grep -E '^[[:space:]]*SHA256:' > .deploy-tmp/source-build/signing-certificate-sha256.txt
+          # 固定签名（坑 193）：本链曾现场生成一次性证书，等于重新引入 e65818a 修掉的缺陷
+          # ——每次构建新密钥，产物既装不上已有安装，两次构建的包也互相覆盖不了。
+          # 项目规范（gotchas 坑 10 / DEPENDENCIES.md / design.md / build-snapshot.yml）是
+          # 「CI 与本地同一把 keystore/debug.keystore」，来源链同样走这一把：
+          # 产物可 install -r -t 覆盖、签名可复现，与正式产物的区别只在 -source 版本后缀与 artifact 名。
+          # 这里只查「在场」；证书指纹的判据放在产出侧（用 apksigner，输出不随语言/JDK 版本变），
+          # 因为 keytool -list -v 的文本既会本地化、新版 JDK 上还可能直接抛异常。
+          test -f keystore/debug.keystore
 
       - name: Build ARM64 APK
         shell: bash
@@ -634,6 +633,24 @@ jobs:
           node scripts/build-apk.mjs --abi arm64 --suffix -source
           find out -type f -name '*.apk' -print -exec sha256sum {} \; > .deploy-tmp/source-build/apk-sha256.txt
           test -s .deploy-tmp/source-build/apk-sha256.txt
+          # 产出断言（坑 193）：APK 必须真由仓库固定 keystore 签。判据放在产出侧而不是输入侧，
+          # 因为「keystore 文件在、构建却用了别的密钥」这条断链只有产出能证伪；顺带也挡回
+          # 「现场生成一次性证书」那种改法。apksigner 的输出不随语言/JDK 版本变（keytool 会）。
+          # 期望值是 keystore/debug.keystore 的证书 SHA-256（小写；keytool 打印为大写同值）。
+          expected_signing_certificate='1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd'
+          apksigner_bin=$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -type f -name apksigner | sort | tail -1)
+          test -x "$apksigner_bin"
+          while read -r apk_path; do
+            apk_fingerprint=$("$apksigner_bin" verify --print-certs "$apk_path" \
+              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+            test -n "$apk_fingerprint"
+            if [ "$apk_fingerprint" != "$expected_signing_certificate" ]; then
+              echo "::error::$apk_path 的签名证书 $apk_fingerprint ≠ 仓库固定 keystore 的 $expected_signing_certificate（坑 193：产物必须能覆盖安装，签名必须固定）"
+              exit 1
+            fi
+            echo "signed by the repository debug keystore: $apk_path ($apk_fingerprint)"
+            printf '%s\n' "$apk_fingerprint" > .deploy-tmp/source-build/signing-certificate-sha256.txt
+          done < <(find out -type f -name '*.apk')
           find .deploy-tmp/engine-overlay -maxdepth 1 -type f -name '*.tgz' -print0 \
             | sort -z | xargs -0 -r sha256sum \
             > .deploy-tmp/source-build/engine-overlay-sha256.txt
