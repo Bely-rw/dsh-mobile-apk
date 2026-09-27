@@ -884,3 +884,9 @@
     **真因**：该检查器是权威门禁 `check-engine-overlay.mjs` 的等价实现，而权威源在 0.14.2 追版时已把预设载体从 `@deepseek-ai/dsh-agent-presets/presets/` 重锚为 `agent-preset/skills/` + `web-app/presets/`（0.1.7 把该包拆成 agent-preset + agent-preset-registry）；等价实现没跟上。旧断言此前能通过，是因为上一版 pin 是 0.1.5-rc.1（那一代确有 `agent-presets/presets`，实测 4 项），本链把 pin 抬到 0.1.7-rc.2 后旧载体已不存在——**同一条链在换代后判红，指向的是门禁自身过期，不是产物缺失**。
     **修法**：载体清单抽成 `scripts/source-build/preset-carriers.mjs`（与权威源同口径：目录在场且递归**文件**数 ≥ 1；只断「包在场」是冗余，overlay 已覆盖包版本），检查器改为调用它并把逐载体计数记入报告；新增 `preset-carriers.test.mjs` 双向漂移守卫——它读权威源文本里的 CARRIERS 数组，比对两侧载体路径集合，权威源重锚即判红。测试接进 PR 与来源构建两处入口的早期步骤。
     **复验证据**：本地 6 例全绿；判别力反证两轮（把权威源载体路径改名 / 删掉 CARRIERS 结构）守卫均判红，还原后复绿；pin 侧实测：`packages/preset/agent-preset/skills` 15 个文件、`packages/bundle/web-app/presets` 4 个 `.patch.yml`，两者都在各自 package.json 的 `files` 里，故产物面应非空。完整来源构建须由下一次远程 run 验证。
+
+192. **来源链摘除第一方 overlay 钉，与「按这份清单判定」的 check-contract §7 相撞（2026-09-27，远程 run 36294910834）**：
+    **现象**：快照、预设载体检查与签名证书都通过后，APK 步骤的第一批门禁里 `check-contract.mjs` 第 7 节判红 `engine-overlay.json 里没有 @deepseek-ai/dsh-app-boot 钉 —— 运行时版本无从确定`，其余门禁与打包均未执行。
+    **真因**：来源链要让快照构建器**不可**按登记表回拉上游发布版 tarball 覆盖已注入的源码产物（`build-snapshot-013.mjs` 的 `overlayExtract` 是整目录替换），故构建期把 `@deepseek-ai/*` 全部摘出 `engine-overlay.json`；而 §7 的运行时版本、以及「profile patch 里 `@deepseek-ai/*` 的 insert 行是否与运行时同版」都按这份清单判——后者还决定哪些挂载行会被上游 boot 期**静默禁用**。这条链此前没暴露，是因为该门禁在**拿不到 semver 时 SKIP**，而旧链的产物树恰好提供不了；本次源码产物树能提供（`dsh-shell-termux/node_modules/semver`），门禁随即真判。教训：门禁的 SKIP 分支会掩盖「判据输入本身已经不存在」这类问题，SKIP 期间被放过的东西不构成「验过」。
+    **修法**：新增 `scripts/source-build/restore-overlay-pins.mjs`，在 APK 步骤按 `source-build-policy.json` 记下的摘除清单把钉并回 `engine-overlay.json`（同名不同版判红、清单缺席判红、幂等），还原事实写进 policy provenance；workflow 既有退出 trap 仍把原 overlay 覆盖回去。**不能改为在快照构建期保留**——那正是上面要防的回拉路径。
+    **复验证据**：本地端到端复现——按来源链摘掉 315 个钉后 `check-contract.mjs` 复现出与 CI 逐字相同的判红；跑还原脚本后第 7 节转绿（14 条 insert 全过、0 条会被禁用，含两条按 overlay 判同版的引擎包 insert 行），工作树随后还原干净。

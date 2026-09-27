@@ -63,6 +63,8 @@ Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-ven
 
 `check-dsh-source-snapshot.mjs` 的内置预设载体断言与权威门禁 `check-engine-overlay.mjs` 的 CARRIERS 同源，清单在 `scripts/source-build/preset-carriers.mjs`：载体是 `agent-preset/skills/` 与 `web-app/presets/`（0.1.7 把 `dsh-agent-presets` 拆成 agent-preset + agent-preset-registry 后的新形态），判据是目录在场且递归文件数 ≥ 1。`preset-carriers.test.mjs` 读权威源文本双向比对两侧载体集合——权威源重锚而本侧没跟上的话，判红落在秒级的 PR 门禁上，而不是四十分钟后的云端构建（坑 191）。
 
+来源链在构建期会把 `@deepseek-ai/*` 从 `scripts/snapshot-config/engine-overlay.json` 摘除（否则快照构建器会按登记表回拉上游发布版 tarball，整目录覆盖已注入的源码产物），摘除清单记进 `source-build-policy.json`；APK 步骤先由 `scripts/source-build/restore-overlay-pins.mjs` 把这份清单并回去，再跑门禁集——`check-contract.mjs` 第 7 节正是按它定运行时版本、并判 profile 里引擎包 insert 行是否与运行时同版（该门禁在拿不到 semver 时 SKIP，旧链因此从未真判过）。还原记录进策略 provenance，退出 trap 覆盖回原文件（坑 192）。
+
 **设备验证链路**（真机 arm64 vivo V2425A；模拟器 MuMu x86_64 竖屏 `127.0.0.1:16416`、横屏 `127.0.0.1:16384`——横屏实例勿改回竖屏）：
 - 安装：`adb -s <serial> install -r -t out\v<版本>\...apk`（同签名 debug.keystore；**指纹变更触发 refreshSnapshot 全量重解压（真机 ≈2-4 分钟、模拟器实测 ~8 分钟，勿在解压中杀进程——中途杀进程看门狗会拿半解压运行时拉引擎，见坑 37）**）。
 - 引擎探活：`adb -s <serial> forward tcp:23080 tcp:3080` → `http://127.0.0.1:23080/`。

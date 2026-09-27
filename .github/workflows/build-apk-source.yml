@@ -37,6 +37,7 @@ jobs:
           node --test scripts/source-build/check-package-lock-roots.test.mjs
           node --test scripts/source-build/check-android-native-runtime-packages.test.mjs
           node --test scripts/source-build/preset-carriers.test.mjs
+          node --test scripts/source-build/restore-overlay-pins.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
@@ -626,6 +627,9 @@ jobs:
           }
           fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
           NODE
+          node scripts/source-build/restore-overlay-pins.mjs \
+            scripts/snapshot-config/engine-overlay.json \
+            .deploy-tmp/source-build/source-build-policy.json
           cp scripts/source-build/check-dsh-source-snapshot-gate.mjs scripts/check-engine-overlay.mjs
           node scripts/build-apk.mjs --abi arm64 --suffix -source
           find out -type f -name '*.apk' -print -exec sha256sum {} \; > .deploy-tmp/source-build/apk-sha256.txt
