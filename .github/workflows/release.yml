@@ -191,6 +191,20 @@ jobs:
           # 结果目录 app/build/test-results/testDebugUnitTest 会被下面的门禁就地读取并比对基线。
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
+      # 发布门禁集里有若干条**输入是上游源码树**（check-dead-tokens 读 dsh/packages/client/ui-theme/src/styles，
+      # check-contract 读 dsh/packages/** 并对上游树做 git describe/commit 身份核对）。
+      # apk 仓自身不含 dsh/ ⇒ 不检出上游时它们会以 SKIP 结案，而严格档（--require）下 SKIP 即判红
+      # （真实 run 36355385922 就死在这里）。故在此按仓库固定提交检出上游树。
+      - name: 检出上游 dsh 树（固定提交；门禁面含上游输入）
+        shell: bash
+        run: |
+          set -e
+          git clone --filter=blob:none --no-checkout https://github.com/deepseek-ai/deepseek-harness.git dsh
+          cd dsh
+          git checkout 477b4f420553e8a52c2fbccc464d7561b239c443
+          git describe --tags --always
+          test -d packages/client/ui-theme/src/styles || { echo "::error::上游令牌定义面缺席"; exit 1; }
+          du -sh "$PWD"
       - name: 跑发布门禁（聚合入口，严格档 SKIP=0）[未验证]
         shell: bash
         run: |
