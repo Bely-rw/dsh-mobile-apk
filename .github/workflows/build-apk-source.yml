@@ -189,14 +189,19 @@ jobs:
           fs.writeFileSync('.deploy-tmp/source-build/host-web-compat-pin.json', JSON.stringify(report, null, 2) + '\n')
           console.log(`host-web-compat matches pinned ${report.pinnedCommit.slice(0, 7)} (Cordis pin ${mirror.dependencies[cordisKey]} follows the engine overlay)`)
           NODE
-          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/DshMarketPlace/dsh-plugins-store.git .deploy-tmp/component-sources/marketplace
-          git -C .deploy-tmp/component-sources/marketplace fetch --depth=1 origin 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
-          git -C .deploy-tmp/component-sources/marketplace checkout --detach 8354d9a0a1ad49ad12075d8ec0c2bf44f4349856
-          test "$(git -C .deploy-tmp/component-sources/marketplace rev-parse HEAD)" = "8354d9a0a1ad49ad12075d8ec0c2bf44f4349856"
-          test "$(node -p "require('./.deploy-tmp/component-sources/marketplace/package.json').version")" = "0.1.5"
+          # 市场插件用**固定 npm 发布产物**，不用组件源码树：我们的镜像与全部 market-* 补丁都是
+          # 按发布字节定义的（vendor/dshmarketplace-plugin/PATCHES.md：镜像来自 0.1.7.tgz），
+          # 而从源码树重建会得到不同字节 —— 0.1.5 时代就踩过（源码构建产物与发布产物闭合形态不同，
+          # 需要一条源码构建专用的补丁改写兜着）。改用发布产物后该改写随之退役，锚点天然对齐。
+          marketplace_tarball=.deploy-tmp/component-sources/dshmarketplace-plugin-0.1.7.tgz
+          curl --fail --location --retry 3 --max-time 300 \
+            https://registry.npmjs.org/dshmarketplace-plugin/-/dshmarketplace-plugin-0.1.7.tgz \
+            --output "$marketplace_tarball"
+          printf '%s  %s\n' '881c21ec33a4a91ad65c61676540faab4122440e3f9685f69939533a6dbbc0c1' "$marketplace_tarball" | sha256sum --check -
           rm -rf vendor/dshmarketplace-plugin
           mkdir -p vendor/dshmarketplace-plugin
-          git -C .deploy-tmp/component-sources/marketplace archive HEAD | tar -x -C vendor/dshmarketplace-plugin
+          tar -xzf "$marketplace_tarball" -C vendor/dshmarketplace-plugin --strip-components=1
+          test "$(node -p "require('./vendor/dshmarketplace-plugin/package.json').version")" = "0.1.7"
 
       - name: Build and pack DeepSeek Harness from source
         shell: bash
@@ -431,11 +436,14 @@ jobs:
             .deploy-tmp/source-build/bootstrap-aarch64.zip \
             .deploy-tmp/source-build/bootstrap-extracted/usr
 
-      - name: Build project plugins and marketplace from source
+      - name: Build project plugins from source
         shell: bash
         run: |
           set -euo pipefail
-          for d in plugins/dsh-android-bridge plugins/dsh-android-manage dsh-shell-termux plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay dsh-client-ui-responsive vendor/dshmarketplace-plugin; do
+          # 注意：这里**不含** vendor/dshmarketplace-plugin —— 它是固定 npm 发布产物，tarball 里已带
+          # 打好包的 lib/；再跑一次 `npm run build` 会用不同工具链产出不同字节，把我们按发布字节定义的
+          # market-* 补丁全部锚空（0.1.5 时代就是这么踩的）。
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage dsh-shell-termux plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay dsh-client-ui-responsive; do
             echo "== source build $d =="
             if [ -f "$d/package-lock.json" ]; then
               (cd "$d" && npm ci --no-audit --no-fund)
@@ -445,7 +453,7 @@ jobs:
             (cd "$d" && npm run build)
           done
 
-      - name: Apply project patches to the source-built marketplace
+      - name: Apply project patches to the pinned marketplace artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -454,16 +462,9 @@ jobs:
           const crypto = require('node:crypto')
           const fs = require('node:fs')
           const path = require('node:path')
-          const cp = require('node:child_process')
-          const sourceRoot = '.deploy-tmp/component-sources/marketplace'
           const packageRoot = 'vendor/dshmarketplace-plugin'
+          const tarball = '.deploy-tmp/component-sources/dshmarketplace-plugin-0.1.7.tgz'
           const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
-          const listFiles = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-            const full = path.join(dir, entry.name)
-            return entry.isDirectory() ? listFiles(full) : [full]
-          }).sort()
-          const commit = cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
-          const sourcePackage = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package.json'), 'utf8'))
           const patchRegistry = JSON.parse(fs.readFileSync('scripts/patches/registry.json', 'utf8'))
           const marketplacePatches = patchRegistry.patches
             .filter((patch) => patch.target.startsWith('dshmarketplace-plugin/'))
@@ -481,17 +482,15 @@ jobs:
               throw new Error(`retired marketplace patch is registered again: ${id} —— 重启退役补丁须人工复核来源链适配器与本清单`)
             }
           }
-          const sourceFiles = listFiles(path.join(sourceRoot, 'src')).map((file) => ({
-            path: path.relative(sourceRoot, file).replaceAll(path.sep, '/'),
-            sha256: sha256(file),
-          }))
+          const sourcePackage = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'))
           const provenance = {
             repository: 'https://github.com/DshMarketPlace/dsh-plugins-store',
-            sourceCommit: commit,
-            sourceTree: cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim(),
+            // 输入是**固定 npm 发布产物**（不是组件源码树）：我们的镜像与 market-* 补丁都按发布字节定义。
+            publishedTarball: 'https://registry.npmjs.org/dshmarketplace-plugin/-/dshmarketplace-plugin-0.1.7.tgz',
+            publishedTarballSha256: sha256(tarball),
             packageVersion: sourcePackage.version,
-            buildCommand: 'npm run build',
-            sourceFiles,
+            inputKind: 'pinned npm publish artifact (trusted binary input, hash-pinned in the workflow)',
+            inputReason: 'The vendored mirror and every market-* patch are defined against the published bytes (vendor/dshmarketplace-plugin/PATCHES.md); rebuilding from the component source tree yields different bytes and mis-anchors those patches.',
             projectCommit: process.env.GITHUB_SHA,
             patchRegistrySha256: sha256('scripts/patches/registry.json'),
             patchImplementationSha256: sha256('scripts/patches/apply-patches.mjs'),
@@ -763,7 +762,7 @@ jobs:
             sha256sum "$d/package.json" "$d/package-lock.json" 2>/dev/null || true
           done > .deploy-tmp/source-build/plugin-lock-sha256.txt
           printf '%s\n' "$GITHUB_SHA" > .deploy-tmp/source-build/project-source-commit.txt
-          node -e 'const fs=require("fs"); const cp=require("child_process"); const dirs={"dsh-host-web-compat":".deploy-tmp/component-sources/host-web-compat","dshmarketplace-plugin":".deploy-tmp/component-sources/marketplace"}; const out={projectCommit:process.env.GITHUB_SHA,deepseekHarnessCommit:cp.execFileSync("git",["-C",".deploy-tmp/deepseek-harness","rev-parse","HEAD"],{encoding:"utf8"}).trim(),components:{}}; for(const [name,dir] of Object.entries(dirs)) out.components[name]={commit:cp.execFileSync("git",["-C",dir,"rev-parse","HEAD"],{encoding:"utf8"}).trim()}; out.components["dsh-undo-savepoint"]={source:"checked-in JavaScript source",fileSha256:require("crypto").createHash("sha256").update(fs.readFileSync("vendor/dsh-undo-savepoint/lib/index.js")).digest("hex")}; fs.writeFileSync(".deploy-tmp/source-build/component-source-provenance.json",JSON.stringify(out,null,2)+"\n")'
+          node -e 'const fs=require("fs"); const cp=require("child_process"); const dirs={"dsh-host-web-compat":".deploy-tmp/component-sources/host-web-compat"}; const out={projectCommit:process.env.GITHUB_SHA,deepseekHarnessCommit:cp.execFileSync("git",["-C",".deploy-tmp/deepseek-harness","rev-parse","HEAD"],{encoding:"utf8"}).trim(),components:{}}; for(const [name,dir] of Object.entries(dirs)) out.components[name]={commit:cp.execFileSync("git",["-C",dir,"rev-parse","HEAD"],{encoding:"utf8"}).trim()}; out.components["dshmarketplace-plugin"]={source:"pinned npm publish artifact",tarball:"https://registry.npmjs.org/dshmarketplace-plugin/-/dshmarketplace-plugin-0.1.7.tgz",tarballSha256:require("crypto").createHash("sha256").update(fs.readFileSync(".deploy-tmp/component-sources/dshmarketplace-plugin-0.1.7.tgz")).digest("hex")}; out.components["dsh-undo-savepoint"]={source:"checked-in JavaScript source",fileSha256:require("crypto").createHash("sha256").update(fs.readFileSync("vendor/dsh-undo-savepoint/lib/index.js")).digest("hex")}; fs.writeFileSync(".deploy-tmp/source-build/component-source-provenance.json",JSON.stringify(out,null,2)+"\n")'
           sha256sum app/build.gradle.kts build.gradle.kts settings.gradle.kts \
             > .deploy-tmp/source-build/android-build-inputs-sha256.txt
           gradle_artifacts="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2/files-2.1"
