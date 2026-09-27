@@ -63,7 +63,12 @@ export function checkDshRuntimeDependencies(engineRootArg) {
       })
     }
   }
-  if (packageCount < 200) throw new Error(`expected at least 200 deployed first-party packages, found ${packageCount}`)
+  // 地板值与同链的 materialize-dsh-pnpm-packages.mjs:21 同源（那条断言 >= 266 个钉住的第一方
+  // 工作区包；本函数数的是同一群体 + 引擎根包自身，故口径相同）。旧值 200 比真实值（316/317）
+  // 低太多：静默少掉一百多个包也照样判绿，而这条门禁的名字正是「装饰链接都在场」。
+  // 另外 scopeRoot 下的**悬空符号链接**在 :42 被 `existsSync` 静默 continue——那正是「包没装上」
+  // 的形态，它既不计入 packageCount 也不产生 failure，所以地板值就是这类缺损的唯一兜底。
+  if (packageCount < 266) throw new Error(`expected at least 266 deployed first-party packages, found ${packageCount}`)
 
   const report = {
     engineRoot: engineRootArg,

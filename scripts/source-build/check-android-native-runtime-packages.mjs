@@ -154,6 +154,15 @@ if (!ptyLoader.includes('process.platform') || !ptyLoader.includes('process.arch
 }
 const nativeInventory = filesUnder(join(engineRoot, 'node_modules', '.pnpm'),
   (path) => path.endsWith('.node') || path.endsWith('.node.wasm'))
+// 空过守卫：清单为空时 `unreviewed.length === 0` 恒真，本判据会「因为什么都没找到」而判绿——
+// 而采集面全空恰恰说明它失准了。采集根只有 `node_modules/.pnpm` 一处，且 filesUnder 显式跳过
+// 符号链接，布局一变（物化后第一方载荷挪到顶层）就会收不到东西。node-pty / koffi / sharp 那三条
+// 硬断言不受影响，被空过的是「未审阅家族不得入包」这条**完备性**声明。地板取 1 是保守的：
+// 只要采集面还在工作，就必然远大于 1（实测 27）。
+if (nativeInventory.length === 0) {
+  throw new Error('native module inventory is empty: nothing collected under node_modules/.pnpm'
+    + '（采集面失准 ⇒「未审阅家族不得入包」会空过；检查布局是否变化、或载荷是否已不在符号链接之外）')
+}
 const unreviewed = nativeInventory.filter((file) => !isReviewedNativePath(file.path))
 if (unreviewed.length) throw new Error(`unreviewed native module families: ${unreviewed.map((file) => file.path).join(', ')}`)
 

@@ -99,7 +99,16 @@ for (const rel of CHAINS) {
 }
 
 // ── 2. SKIP 纪律（逐脚本静态审计）───────────────────────────────────────────
-const gateFiles = readdirSync(SCRIPTS).filter((f) => f.startsWith('check-') && f.endsWith('.mjs')).sort()
+// 递归覆盖 scripts/ 全树（原先只列顶层）：来源审计链的 check-*.mjs 全部在 scripts/source-build/，
+// 旧实现下它们不在审计面内——将来新增一道「拿不到产物就 SKIP」的来源链门禁，其未计数的 SKIP
+// 不会被抓，发布链 SKIP=0 的口径对来源面也就失效。返回相对 SCRIPTS 的路径（便于报出子目录）。
+const collectGateFiles = (dir, prefix = '') => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+  if (entry.name === 'node_modules' || entry.name.startsWith('.')) return []
+  const rel = prefix ? prefix + '/' + entry.name : entry.name
+  if (entry.isDirectory()) return collectGateFiles(join(dir, entry.name), rel)
+  return entry.name.startsWith('check-') && entry.name.endsWith('.mjs') ? [rel] : []
+})
+const gateFiles = collectGateFiles(SCRIPTS).sort()
 const skipAudit = []
 for (const file of gateFiles) {
   const text = readFileSync(join(SCRIPTS, file), 'utf8')

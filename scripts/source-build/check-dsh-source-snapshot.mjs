@@ -15,6 +15,10 @@ import {
 } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
+// 并行上限的唯一真源（scripts/lib/shell.mjs）：本文件只用它解压校验用快照，见下方 xz 调用。
+// 不写死数字、更不用 `-T0`——`-T0` = 吃满全部逻辑核，本地跑链时会与模拟器抢满 CPU
+// （check-build-parallel-cap.mjs 明文禁止；本文件此前是漏网的一处）。
+import { XZ_THREADS } from '../lib/shell.mjs'
 import { checkDshRuntimeDependencies } from './check-dsh-runtime-dependencies.mjs'
 import { checkAndroidNativeRuntimePackages } from './check-android-native-runtime-packages.mjs'
 import { checkPresetCarriers } from './preset-carriers.mjs'
@@ -71,7 +75,7 @@ for (const item of sourceManifest.packages) {
 
 const tempRoot = mkdtempSync(join(tmpdir(), 'dsh-source-snapshot-'))
 try {
-  const decoder = spawn('xz', ['-d', '-T0', '-c', snapshot], { stdio: ['ignore', 'pipe', 'inherit'] })
+  const decoder = spawn('xz', ['-d', `-T${XZ_THREADS}`, '-c', snapshot], { stdio: ['ignore', 'pipe', 'inherit'] })
   const extractor = spawn('tar', [
     '-xf', '-',
     '-C', tempRoot,
@@ -140,7 +144,21 @@ try {
   const patchChecks = []
   const runtimePrefix = `${packagePrefix}/`
   const engineFiles = collectPhysicalFiles(engineRoot)
-  for (const patch of patchRegistry.patches.filter((item) => item.scope === 'engine' && item.overlayCheck !== false)) {
+  const enginePatches = patchRegistry.patches.filter((item) => item.scope === 'engine' && item.overlayCheck !== false)
+  // 空过守卫：marker 为空时旧实现直接 `continue`，该补丁便既不参与本判据、也不参与
+  // reconcile-engine-patch-copies.mjs 的副本收敛（同一过滤条件）——**两条路径一起静默跳过**。
+  // 于是「新增补丁自动纳入，无需再手改本文件」（下方原注释的承诺）落空：删掉 marker 字段、
+  // 或把它写成全角括号注释（`replace(/（.*$/)` 后为空）即可让任一 engine 补丁退出核验。
+  // 故不再静默：要么补 marker，要么在 registry 显式写 `overlayCheck: false` 走豁免
+  // （豁免在 registry 里留档，是有记录的选择，与本处「忘了写 marker」不是一回事）。
+  const markerless = enginePatches
+    .filter((item) => !String(item.marker ?? '').replace(/（.*$/, '').trim())
+    .map((item) => item.id)
+  if (markerless.length > 0) {
+    throw new Error(`engine patches without a usable marker would be skipped silently: ${markerless.join(', ')}`
+      + '（marker 为空 ⇒ 该补丁在来源链上完全没有判据；请补 marker 或在 registry 显式登记 overlayCheck:false）')
+  }
+  for (const patch of enginePatches) {
     const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
     if (!marker) continue
     if (!patch.target.startsWith(runtimePrefix)) throw new Error(`engine patch target escaped the source runtime: ${patch.target}`)

@@ -949,3 +949,26 @@
     **修法**：新增 `scripts/source-build/reconcile-engine-patch-copies.mjs`——构建期把已打补丁那份的字节写全到「同包 + 同包内相对路径」的其余副本；目标找不到、或所有副本都缺 marker 一律判红。接进快照步骤（重打包之前），报告随 artifact 附出。同时给检查器加**副本面判据**「任何物理副本都不得缺 marker」，并在两个 workflow 的早期步骤跑新单测。
     **踩到的两个坑中坑**（都已固化成用例）：① 判据若用「路径结尾相同」匹配，`lib/bin.js` 这类短后缀会把**别的包**的同名文件误判成副本（实测把 `dsh-experimental-webworker-packer/lib/bin.js` 报成未打补丁）；引擎根包自身的文件必须**精确相等**。② 匹配器的「根」在两个调用点必须同一约定（引擎根 = `@deepseek-ai/dsh` 目录本身）——一度出现检查器传引擎根、收敛脚本传 stage root 的错位，导致精确匹配恒落空。
     **复验证据**：以真实快照的引擎树为靶——收敛前核对报 2 个目标各 1 份未打补丁副本（N1 的 872 B store 副本、G2 的 64152 B store 副本），跑收敛脚本后为 **0**，改写副本与已打补丁那份 sha256 逐字节一致；新单测 5 例全绿（含短后缀误报反证、幂等、全缺 marker 判红、目标缺失判红）。
+
+199. **来源审计链的专有门禁不在任何清单里：新增第三条链时漏了「谁跑哪些门禁」这一步（2026-09-27）**：
+    **现象**：来源链的 5 个专有门禁——`check-package-lock-roots` / `check-dsh-runtime-dependencies` / `check-android-native-runtime-packages` / `check-dsh-source-snapshot` / `check-dsh-source-snapshot-gate`——既不在 `check-release-gates.mjs` 的声明集合（32 项）、也不在 `build-apk.mjs` 的 `GATE_SCRIPTS`、也不在 `check-gate-skips.mjs` 的链枚举里；全仓只被自己那条 workflow 与 docs 引用。实跑 `node scripts/check-gate-skips.mjs` **仍然 PASSED**——盲区是隐形的。其中 `check-package-lock-roots.mjs` 最脆：单测只 import 纯函数 `checkPackageLockRoot`、不走 CLI 主块，两个 workflow 里的调用点删掉后脚本与单测都还在、三条链全绿，而门禁**从未真跑**。
+    **真因**：新增一条构建链时，没把它的门禁登记进「谁跑哪些门禁」这条纪律。而 `check-gate-skips.mjs:78` 的 `CHAINS` **不能简单加第三条**：`executionSites`（:67-77）只认 `.mjs` 的 `gate('x.mjs')` 与 pwsh 的 `node … scripts\check-x.mjs` 两种形态，**没有 YAML 分支**；强行加入会让「声明集合每一项都被本链调用」这条断言对来源链必然判红（它只间接经 `build-apk.mjs` 跑）。同族的两处非递归扫描：`node --check`（`check-release-gates.mjs:251`）只列 `scripts/` 与 `scripts/lib` 两层，`scripts/source-build/` 等 5 个子目录共 **47 个 `.mjs` 从未被解析过**；SKIP 审计（`check-gate-skips.mjs:102`）的 `readdirSync` 同样非递归。
+    **修法**：① `check-release-gates.mjs` 新增独立常量 `SOURCE_GATES` 与第三条链位置 `source-chain`（沿用 `ci-apk` 的 `needsApkTree` 模式；**刻意不进 `GATES`**——`ALL_GATES = GATES.map(...)`，进册会要求本地链与云端链也调用它们）；② 同文件 `node --check` 扫描面改为**递归**遍历 `scripts/` 全树；③ `check-gate-skips.mjs` 的 SKIP 审计同样改递归。
+    **复验证据**：`PASS source-chain 门禁集 ⊇ 声明集合（5 项）`。判别力反证——把 workflow 里 5 个调用点全删 → 5 个全报；只删 1 个 → 精确报那一个。扫描面 75 → **122 个**、SKIP 审计 37 → **44 个**，两门禁仍 PASSED。
+    **未闭合**：`CHAINS` 的反向断言（声明项必须有真实执行点）对第三条链仍无对应实现——本轮用 `source-chain` 位置覆盖了「声明了却没接线」这个主方向，其余待后续把 `executionSites` 扩到 YAML 形态。
+
+200. **判据「空过」：空集恒真、静默 continue、地板值远低于现实（2026-09-27）**：
+    **现象**：四处新判据在「输入为空」时恒真，即**因为什么都没找到而判绿**。
+    ① `check-package-lock-roots.mjs` 的受检集合是**发现式**的（只收存在 `package-lock.json` 的目录），旧实现无空集守卫：删掉/改名任一锁文件它就静默退 0，打印「一致: N 个目录」。而 `build-apk-source.yml` 的插件循环按 `if [ -f package-lock.json ]` 决定 `npm ci` 还是 `npm install`——**锁一缺就从「严格按锁文件」降级成「重新解析版本区间」，产出不再可复现而全链绿**。（对照：同一 workflow 的 pnpm 侧用的是 `--frozen-lockfile`，锁不符即失败。）
+    ② `check-dsh-source-snapshot.mjs` 对 engine 补丁 `if (!marker) continue`：删掉 `marker` 字段、或写成全角括号注释（`replace(/（.*$/, '')` 后为空），该补丁就**同时退出**本判据与 `reconcile-engine-patch-copies.mjs` 的副本收敛（同一过滤条件）——两条路径一起静默跳过，而原注释承诺的「新增补丁自动纳入，无需再手改本文件」随之落空。
+    ③ `check-android-native-runtime-packages.mjs` 的 `unreviewed.length` 在清单为空时恒为 0；采集根只有 `node_modules/.pnpm` 一处，且 `filesUnder` 显式跳过符号链接，布局一变（物化后第一方载荷挪到顶层）就会收不到东西。
+    ④ `check-dsh-runtime-dependencies.mjs` 的地板值 `packageCount < 200`——实测 316/317，**静默少掉一百多个包也照样判绿**；同一条链上 `materialize-dsh-pnpm-packages.mjs:21` 用的是 `>= 266`。
+    **修法**：① 加具名目录断言（`dsh-client-ui-responsive` / `dsh-shell-termux` 不靠发现、是写死在 `packageDirectories` 里的）与空集判红；② 加 markerless 计数并在核验前判红——要么补 `marker`，要么在 registry 显式登记 `overlayCheck:false` 走豁免（豁免有留档，与「忘了写 marker」不是一回事）；③ 加 `nativeInventory.length === 0` 守卫；④ 地板抬到 **266**，与同链 `materialize` 同源。
+    **复验证据**：加守卫前先实测确认现状不会误伤（9 个受检目录全有锁、13 个 engine 补丁 marker 全非空、两处原生清单均为 27 项、实际包数 317）。① 正例「一致: 9 个目录」退 0 不变；反证——空集时逐条指名并退 1。全部 6 个 `source-build` 单测保持 PASS。
+
+201. **来源链在解压校验处写 `xz -T0`，违照明文的并行上限铁律而门禁看不见（2026-09-27）**：
+    **现象**：`scripts/source-build/check-dsh-source-snapshot.mjs:74` 解压快照做校验时用 `spawn('xz', ['-d', '-T0', '-c', snapshot])`——`-T0` = 吃满全部逻辑核。
+    **真因**：`check-build-parallel-cap.mjs` 的受约束清单 `CONSTRAINED` 只有 5 个既有脚本，**来源链一个都不在**；且它的第 1 节只抓 `-T0` 字面量，第 3 节的「写死数字」判据只覆盖 `build-snapshot-013.mjs` 与 `build-apk-013.ps1` 两个文件。于是这条明文铁律（「模拟器优先」，其立项理由正是『构建链原先在压缩/解压处用 `xz -T0`』）在来源链上完全不受约束。本地跑 `run-local-source-chain.mjs`（文档化入口）时会与 MuMu 抢满 16 逻辑核；CI runner 只 4 核，云端反而无害。
+    **修法**：改为消费单一常量 `-T${XZ_THREADS}`（从 `scripts/lib/shell.mjs` 导入），并把该文件列入 `CONSTRAINED` 锁住回归。
+    **复验证据**：`PASS scripts/source-build/check-dsh-source-snapshot.mjs 无吃满型线程参数（-T0）`；判别力反证——`-T0` 字面量判红、`-T${XZ_THREADS}` 通过；`PARALLEL-CAP SELF-TEST PASSED`。
+    **未闭合**：来源链另有两处**有界**的写死线程数（`prepare-termux-bootstrap.py:168` 的 `-T4`、`build-apk-source.yml:673` 的 `-T8`）——不吃满核，但要完全符合「并行度来自单一常量」须改构建命令本身，本轮未动，已在 `CONSTRAINED` 处登记。

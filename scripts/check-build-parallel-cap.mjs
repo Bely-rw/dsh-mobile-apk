@@ -40,6 +40,12 @@ const CONSTRAINED = [
   'scripts/build-apk.mjs',
   'scripts/inject-all.py',
   'scripts/make-snapshot.sh',
+  // 来源审计链：本文件曾在解压校验快照处写 `xz -d -T0`（= 吃满全部逻辑核），而它不在任何受约束
+  // 清单里 ⇒ 与模拟器抢满 16 核。已改为消费 XZ_THREADS；列在这里是为了锁住回归。
+  // 注：来源链另有两处**有界**的写死线程数（prepare-termux-bootstrap.py 的 `-T4`、
+  // build-apk-source.yml 的 `-T8`）——它们不吃满全部核，但要完全符合「并行度来自单一常量」
+  // 需改构建命令本身，故本轮未动，登记以备后续处理。
+  'scripts/source-build/check-dsh-source-snapshot.mjs',
 ]
 
 const failures = []

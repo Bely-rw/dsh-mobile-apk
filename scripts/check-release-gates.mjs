@@ -142,6 +142,18 @@ const GATES = [
 const CI_COORD_GATES = GATES.filter((g) => g.ciCoord).map((g) => g.script)
 const CI_APK_GATES = GATES.filter((g) => g.ciApk).map((g) => g.script)
 const ALL_GATES = GATES.map((g) => g.script)
+/** 来源审计链（`.github/workflows/build-apk-source.yml`）的**专有**门禁。
+ *  它们**刻意不进 GATES**：`ALL_GATES = GATES.map(...)`，一旦进册就会要求本地链与云端链
+ *  也调用它们，而那两条链不跑来源链（口径是「只跑在拥有其输入的那一侧」，第三条链同理）。
+ *  此前这 5 条不在任何清单里：删掉 workflow 里的调用点，本地链 / 云端链 / 协调仓 CI 全绿，
+ *  而它们从未真跑——正是本文件要防的「有人加了一道门禁但没人接线」。 */
+const SOURCE_GATES = [
+  'check-package-lock-roots.mjs',
+  'check-dsh-runtime-dependencies.mjs',
+  'check-android-native-runtime-packages.mjs',
+  'check-dsh-source-snapshot.mjs',
+  'check-dsh-source-snapshot-gate.mjs',
+]
 
 if (argv.includes('--list')) {
   for (const g of GATES) {
@@ -179,6 +191,10 @@ const POSITIONS = [
   // （resolveRel 已处理）。协调仓布局下 apk 树可能不在场（净检出/自包含 CI）——那时**显式 SKIP 并计数**，
   // 绝不回落到本仓自己的 workflow 去满足 ciApk 集合（那是自我循环，会让断言失去判别力）。
   { id: 'ci-apk', file: 'dsh-mobile-apk/.github/workflows/pr-gate.yml', gates: CI_APK_GATES, kind: 'gate-names', needsApkTree: true },
+  // 第三条链：来源审计链有自己的专有门禁（含它临时接管 overlay 门禁用的适配器）。与 ci-apk 同源
+  // 理由——该 workflow 只存在于 apk 仓，协调仓布局下 apk 树不在场时显式 SKIP 并计数（绝不回落到
+  // 别的 workflow 去满足集合，那会变成自我循环、让断言失去判别力）。
+  { id: 'source-chain', file: 'dsh-mobile-apk/.github/workflows/build-apk-source.yml', gates: SOURCE_GATES, kind: 'gate-names', needsApkTree: true },
   { id: 'release-coord', file: 'scripts/build-release.ps1', gates: ALL_GATES, kind: 'aggregator' },
   { id: 'release-apk', file: 'dsh-mobile-apk/scripts/build-release.ps1', gates: ALL_GATES, kind: 'aggregator' },
 ]
@@ -248,9 +264,20 @@ for (const f of ['scripts/build-release.ps1', 'scripts/build-apk-013.ps1']) {
 // 会「镜像一致 PASSED」地同步到两棵树，而所有静态门禁都不解析它——直到真正跑构建才炸，
 // 于是本地一次、CI 一次、发布链一次，三处都白等。语法是最廉价的判据，放在这里当自动挡。
 {
-  const scriptDirs = [join(ROOT, 'scripts'), join(ROOT, 'scripts', 'lib')]
-  const candidates = scriptDirs.flatMap((d) =>
-    existsSync(d) ? readdirSync(d).filter((f) => f.endsWith('.mjs')).map((f) => join(d, f)) : [])
+  // 扫描面**递归**覆盖 scripts/ 全树：旧实现只列 scripts/ 与 scripts/lib 两层，
+  // 于是 scripts/source-build/（来源链 24 个）、patches/、perf/、golden/、tests/
+  // 以及 patches/tests/ 深处的 .mjs 共 47 个从未被解析过——而这道判据的立项理由正是
+  // 「一次语法错要等本地、CI、发布链三处白等」。
+  const candidates = []
+  const collect = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) collect(path)
+      else if (entry.isFile() && entry.name.endsWith('.mjs')) candidates.push(path)
+    }
+  }
+  if (existsSync(join(ROOT, 'scripts'))) collect(join(ROOT, 'scripts'))
   const broken = []
   for (const p of candidates) {
     const r = spawnSync(process.execPath, ['--check', p], { encoding: 'utf8' })
