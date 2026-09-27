@@ -1448,6 +1448,19 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 改动逐条进开发日志；每版本只跑一次（幂等标记），失败不阻塞启动。
    */
   private fun repairProfilePatch() {
+    // 两条**独立**的自愈，各自有自己的幂等标记：
+    //  · 退役行 disabled 残留（apk #214）：标记 .profile-patch-repair-<version>；
+    //  · 旧「单点」写法归一（0.14.2-fx-2，见 normalizeLegacyAgentDefaultModel）：标记 .profile-patch-normalize-<version>。
+    //
+    // **为什么必须独立标记**：本函数原先的早退（marker.exists()）语义是「本版本已修退役行」。
+    // 若归一复用同一标记，则**已经装过同版本**的设备永远补不上这次新修复 —— 实测踩到：
+    // 两台设备在装上含归一的包后，`merge` 因指纹已 fresh 而不跑、本函数因标记已存在而早退，
+    // 于是 live patch 冷启动两次 md5 都不变（归一从未执行）。
+    //
+    // 更一般的教训（既有注释里已写过一次，见本文件下方 #214 段落）：
+    // 「这类设备不一定再触发快照刷新（指纹未变则 merge 不跑），所以自愈必须在引擎读 profile
+    //   之前做一次，不能只依赖 refreshSnapshot」—— 新增修复同样必须走这条通道。
+    normalizeLegacySinglePointPatch()
     val marker = File(context.filesDir, ".profile-patch-repair-" + BuildConfig.VERSION_NAME)
     if (marker.exists()) return
     var failed = false
@@ -1509,6 +1522,80 @@ class EngineManager(private val context: Context, private val pickToken: String?
       }
     } catch (t: Throwable) {
       Log.w(TAG, "profile patch repair failed (non-fatal)", t)
+    }
+  }
+
+  /**
+   * 旧「单点」写法归一（0.14.2-fx-2）的**启动前置**通道。
+   *
+   * 为什么不能只挂在 [FactoryProfilePatch.merge]：那条链只在**快照刷新**时跑
+   * （`if (snapshotFresh()) return true` 早退）—— 指纹已 fresh 的设备永远拿不到修复。
+   * 实测：两台设备装上含归一的包后，冷启动两次 live patch md5 均不变。
+   *
+   * 安全面：沿用本函数既有的三件套（`.pre-<version>.bak` 备份 / 原子写 / 解析校验），
+   * 不新增第二条落盘路径。
+   *
+   * 幂等：**独立**标记 `.profile-patch-normalize-<version>`（不复用退役行那个标记）。
+   * 失败不写标记 ⇒ 下次启动重试；异常一律不阻塞启动。
+   */
+  private fun normalizeLegacySinglePointPatch() {
+    val marker = File(context.filesDir, ".profile-patch-normalize-" + BuildConfig.VERSION_NAME)
+    if (marker.exists()) return
+    var failed = false
+    var normalized = 0
+    try {
+      val profilesRoot = File(File(homeDir, ".dsh"), "profiles")
+      val targets = (profilesRoot.listFiles() ?: emptyArray())
+        .sortedBy { it.name }
+        .filter { isFactoryOwnedProfile(it) }
+        .map { File(it, "cordis.patch.yml") }
+        .filter { it.isFile }
+      for (target in targets) {
+        val live = try { target.readText() } catch (_: Throwable) { failed = true; continue }
+        if (FactoryProfilePatch.legacyMobileConfigLines(live).isEmpty()) continue // 不满足形态 ⇒ 不动
+        val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(live)
+        if (result.text == live) continue // 条件不满足 ⇒ 零改动
+        // 结构化校验（Lead 四条）：id 集合、上游无 disabled、用户 config 逐行保留、可解析。
+        val why = FactoryProfilePatch.verifyNormalization(live, result.text)
+        if (why != null) {
+          Log.w(TAG, "profile patch normalize skipped (verify failed): " + target.absolutePath + " -> " + why)
+          failed = true
+          continue
+        }
+        val backup = File(target.parentFile, target.name + ".pre-" + BuildConfig.VERSION_NAME + ".bak")
+        if (!backup.exists()) {
+          try { backup.writeText(live) } catch (_: Throwable) {}
+        }
+        val tmp = File(target.parentFile, target.name + ".normalize.tmp")
+        try {
+          tmp.writeText(result.text)
+          if (!tmp.renameTo(target)) {
+            target.writeText(result.text)
+            SnapshotFs.deletePath(tmp)
+          }
+        } catch (t: Throwable) {
+          failed = true
+          SnapshotFs.deletePath(tmp)
+          Log.w(TAG, "profile patch normalize write failed (retried next boot): " + target.absolutePath, t)
+          continue
+        }
+        normalized++
+        LogCollector.log(
+          TAG,
+          "profile patch normalized (" + (target.parentFile?.name ?: "?") + "): " +
+            result.changes.joinToString(" | ") + " ; backup=" + backup.name,
+        )
+      }
+      if (failed) {
+        LogCollector.log(TAG, "profile patch normalize deferred (partial failure; retried next start)")
+      } else {
+        marker.writeText("normalized=" + normalized + " targets=" + targets.size + " at " + System.currentTimeMillis() + "\n")
+        if (normalized > 0) {
+          LogCollector.log(TAG, "profile patch normalize (0.14.2-fx-2): " + normalized + " profile(s) migrated; marker=" + marker.name)
+        }
+      }
+    } catch (t: Throwable) {
+      Log.w(TAG, "profile patch normalize failed (non-fatal)", t)
     }
   }
 

@@ -169,6 +169,17 @@ const ALL_GATES = GATES.map((g) => g.script)
 // 声明集合本身不变（33 项）：check-gate-skips 仍逐项要求两条构建链调用，故「移出发布段」不等于「移出防线」。
 const RELEASE_GATES = GATES.filter((g) => g.releaseSink !== false).map((g) => g.script)
 const RELEASE_EXCLUDED = GATES.filter((g) => g.releaseSink === false)
+/**
+ * sink 类型表（下沉门的接管方在哪、是否依赖 apk 树）。
+ *   apkSide=true  ⇒ 路径相对 **apk 仓树根**解析（协调仓布局下可能整树缺席 ⇒ 降级 SKIP）
+ *   needsApkTree  ⇒ 该 sink 的证据只存在于 apk 仓，apk 树缺席时不得判红、也不得回落取证
+ */
+const SINK_KINDS = {
+  'apk-ci': { rel: join('.github', 'workflows', 'pr-gate.yml'), apkSide: true, needsApkTree: true },
+  'coord-ci': { rel: join('.github', 'workflows', 'pr-gate.yml'), apkSide: false, needsApkTree: false },
+  'cloud-chain': { rel: join('scripts', 'build-apk.mjs'), apkSide: true, needsApkTree: true },
+  'local-chain': { rel: join('scripts', 'build-apk-013.ps1'), apkSide: false, needsApkTree: false },
+}
 
 if (argv.includes('--list')) {
   for (const g of GATES) {
@@ -215,15 +226,42 @@ const POSITIONS = [
 const coordLayout = existsSync(join(ROOT, 'dsh-mobile-apk'))
 /** apk 自包含布局判定：只有 apk 仓有 app/src/main/AndroidManifest.xml（协调仓没有）。 */
 const apkSelfContained = existsSync(join(ROOT, 'app', 'src', 'main', 'AndroidManifest.xml'))
+/**
+ * apk 仓树根（显式解析，**不经过 resolveRel 的回落候选**）。
+ *
+ * 为什么必须显式：`resolveRel('dsh-mobile-apk/.github/...')` 在协调仓布局下会回落到
+ * `.github/workflows/pr-gate.yml`（**协调仓自己的** workflow）——用它去满足 apk 侧集合是**自我循环**，
+ * 断言会恒真。apk 侧证据只能来自 apk 仓。
+ *   · apk 自包含布局（ROOT 就是 apk 仓）      ⇒ apk 树根 = ROOT；
+ *   · 协调仓布局                            ⇒ apk 树根 = <root>/dsh-mobile-apk（CI 里常整个缺席）。
+ * `--apk-tree <dir>` 供「两方向实测」把对端指到受控位置（不存在 ⇒ 验降级；指向改过的副本 ⇒ 验判别力）。
+ */
+const apkTreeArg = argOf('apk-tree')
+const APK_TREE = apkSelfContained ? ROOT : (apkTreeArg ? resolve(apkTreeArg) : join(ROOT, 'dsh-mobile-apk'))
+/** apk 树是否在场：以 apk 仓自己的 pr-gate workflow 为锚（协调仓布局缺席时为 false）。 */
+const apkTreePresent = existsSync(join(APK_TREE, '.github', 'workflows', 'pr-gate.yml'))
+/**
+ * 布局降级 SKIP 计数器（静态档）。
+ *
+ * 为什么要有它：协调仓是**独立布局**，`dsh-mobile-apk/` 是独立 git 仓且在协调仓里被 gitignore
+ * ⇒ 协调仓 CI 的检出里**根本没有 apk 树**。凡「需要 apk 树才能核验」的断言，在该布局下都不能硬判红，
+ * 必须**显式 SKIP 并计数**（可见、不冒充绿）；且**不得**回落到协调仓自己的同名文件去「找到」证据
+ * ——那会让断言恒真、失去判别力（CI 实测：PR #68 因为漏了这条降级而必红）。
+ */
+let staticSkipTotal = 0
+const skipStatic = (what, why) => {
+  staticSkipTotal += 1
+  console.log('SKIP(#' + staticSkipTotal + ')  ' + what + '：' + why)
+}
 for (const pos of POSITIONS) {
   if (pos.onlyWithCoordLayout && !coordLayout) {
-    console.log('SKIP(#1) ' + pos.id + ' 门禁集：本布局无协调仓侧 workflow（apk 自包含树）；跨仓面由链上守')
+    skipStatic(pos.id + ' 门禁集', '本布局无协调仓侧 workflow（apk 自包含树）；跨仓面由链上守')
     continue
   }
-  if (pos.needsApkTree && !apkSelfContained && !existsSync(join(ROOT, 'dsh-mobile-apk', '.github', 'workflows', 'pr-gate.yml'))) {
+  if (pos.needsApkTree && !apkTreePresent) {
     // 协调仓布局且 apk 树不在场：`.github/workflows/pr-gate.yml` 会解析到**本仓自己的** workflow，
     // 拿它去满足 ciApk 集合是自我循环 ⇒ 显式 SKIP 并计数（apk 侧由 apk 仓 CI 自检，链上另有全量）。
-    console.log('SKIP(#1) ' + pos.id + ' 门禁集：协调仓布局下 apk 树不在场（自包含 CI）')
+    skipStatic(pos.id + ' 门禁集', '协调仓布局下 apk 树不在场（自包含 CI）')
     continue
   }
   const text = readOrFail(pos.file)
@@ -293,24 +331,41 @@ for (const f of ['scripts/build-release.ps1', 'scripts/build-apk-013.ps1']) {
 // ── 3a-2. 下沉门的接管方断言（G.3，0.14.2-fx-2）─────────────────────────────
 // 移出发布链 --run 段的门禁**必须**在其声明的 sink 里被真实调用，否则就是「防线静默消失」。
 // 这是下沉动作的安全绳：任何 releaseSink:false 项若没人接管，本断言立刻判红。
+//
+// 【协调仓布局降级（CI 实修，PR #68 事故）】本断言第一版漏了布局降级：协调仓是**独立布局**，
+// `dsh-mobile-apk/` 是独立 git 仓且在协调仓被 gitignore ⇒ 协调仓 CI 检出里没有 apk 树，而
+// apk-ci / cloud-chain 两类 sink 的证据**只在 apk 仓里**。第一版直接硬判红（CI 三条 FAIL）。
+// 正确纪律与上面 `ci-apk` 位置断言完全一致：
+//   · apk 树不在场 ⇒ **显式 SKIP 并计数**（可见、不冒充绿）；
+//   · **绝不**回落到协调仓自己的同名文件去「找到」调用点——那是自我循环，断言会恒真、失去判别力
+//     （协调仓的 workflow 满足不了「apk 侧 CI 接管」这个命题）。
+// apk 树在场时（本地 / apk 自包含布局 / apk 仓 CI）断言**保持全判别力**，会真的判红。
 {
-  const SINK_FILES = {
-    'apk-ci': 'dsh-mobile-apk/.github/workflows/pr-gate.yml',
-    'coord-ci': '.github/workflows/pr-gate.yml',
-    'cloud-chain': 'dsh-mobile-apk/scripts/build-apk.mjs',
-    'local-chain': 'scripts/build-apk-013.ps1',
-  }
   for (const g of RELEASE_EXCLUDED) {
-    const sinkFile = SINK_FILES[g.sink]
-    if (!sinkFile) {
+    if (!g.sink || !SINK_KINDS[g.sink]) {
       check('下沉门有合法接管方: ' + g.script, false, 'sink 字段缺失或未知: ' + String(g.sink))
       continue
     }
-    const text = readOrFail(sinkFile)
-    if (text === null) continue
+    const kind = SINK_KINDS[g.sink]
+    // 需要 apk 树的 sink：apk 树不在场 ⇒ 降级 SKIP（不得回落、不得判红）。
+    if (kind.needsApkTree && !apkTreePresent) {
+      skipStatic('下沉门接管方断言: ' + g.script + ' @ ' + g.sink,
+        '协调仓布局下 apk 树不在场（' + rel(APK_TREE) + ' 无 apk 仓）——该 sink 的证据只在 apk 仓里；'
+        + '不在协调仓内回落取证（自我循环），由 apk 仓 CI/链自检')
+      continue
+    }
+    // 解析 sink 文件：apk 侧一类**一律从 APK_TREE 出发**（不经过 resolveRel 的跨布局回落）。
+    const sinkPath = kind.apkSide ? join(APK_TREE, kind.rel) : join(ROOT, kind.rel)
+    if (!existsSync(sinkPath)) {
+      // 契约要求在场的文件却缺席 ⇒ 判红（这不是布局降级，是真缺口）。
+      check('下沉门接管方文件在场: ' + g.script + ' @ ' + g.sink, false,
+        '缺文件: ' + rel(sinkPath) + '（apkTreePresent=' + apkTreePresent + '）')
+      continue
+    }
+    const text = readFileSync(sinkPath, 'utf8')
     // 接管方必须真的点名这条门禁（CI 里是 `node scripts/check-x.mjs`；链里是 gate('check-x.mjs')）
     check('下沉门被接管方调用: ' + g.script + ' @ ' + g.sink, text.includes(g.script),
-      '在 ' + sinkFile + ' 中找不到 ' + g.script + ' —— 移出发布链却无人接管 = 防线静默消失')
+      '在 ' + rel(sinkPath) + ' 中找不到 ' + g.script + ' —— 移出发布链却无人接管 = 防线静默消失')
   }
 }
 

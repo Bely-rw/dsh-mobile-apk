@@ -965,3 +965,23 @@
       · `grep -E 'SnapshotTransaction|SnapshotFs|UndoGate|WatchdogV2|EngineService' scripts/check-boot-budget.mjs` = **零命中**（该门禁不读壳侧 Kotlin，故三条红与 task-78 无关）。
     **同型提醒**：凡「门禁/工具读一个中间副本（stage / cache / 中间产物）而不读产物本体或运行时」，
     都要问一句「这个副本由谁负责刷新、有没有人核它」。**三份副本 = 没有真源。**
+
+192. **自愈只挂在「快照刷新」那条链上 ⇒ 指纹已 fresh 的设备永远拿不到修复**（2026-09-28，task-78）
+    **现象**：0.14.2-fx-2 的「旧单点写法归一」挂在 `FactoryProfilePatch.merge()` 入口，
+    单测全绿、包里也确有该代码（dex 搜到 `normalizeLegacyAgentDefaultModel`），
+    但**两台真机**装上含它的包后，冷启动**两次** `live patch` 的 md5 **一个字节都没变**，
+    旧形态（`- id: agent-default-model / disabled: true` + 换 id 的 `-mobile` 块）原样保留。
+    **真因**：本仓对 profile patch 有**两条**修复通道，各自有独立的门：
+      · `merge()`（归一挂的这条）：只在**快照刷新**时跑（`mergePatchYamlById`），门是 `if (snapshotFresh()) return true` ⇒ 现场**已 fresh，早退**；
+      · `repairProfilePatch()`：每次 `startEngine` 前的启动前置，门是 per-VERSION_NAME 标记 ⇒ 现场标记已存在，早退。`
+    本仓**早已**为同类缺陷写过这条教训（`EngineManager.kt:1443-1444`，apk #214）：
+    原文：「这类设备不一定再触发快照刷新（指纹未变则 merge 不跑），所以自愈必须在引擎读 profile 之前做一次，不能只依赖 refreshSnapshot。」
+    新写归一代码时**只挂了 merge**，等于重蹈这个坑。
+    **修法**：① 归一**同时**挂到 `repairProfilePatch` 的启动前置通道；
+    ② 用**独立**幂等标记 `.profile-patch-normalize-<version>`，**不复用**退役行那个标记 ——
+    复用会让「已装过同版本」的设备永远补不上这次新修复（现标记语义是「本版本已修退役行」）。
+    **复验证据**：修前实测两台 cold start x2 后 md5 均不变（`a7014fab…` / `904788b5…`）；
+    设备 fp == APK `assets/snapshot.sha256`（`b2c7244d…`）⇒ merge 早退成立；
+    `.profile-patch-repair-<version>` 标记在场 ⇒ repair 早退成立。
+    **同型提醒**：凡新增自愈/迁移代码，先问「**它依赖的那条链在这台设备上会不会跑**」。
+    判据是「设备的触发条件是否已满足」，不是「代码在不在包里」——本条的假绿形态正是「包里有、跑不到」。

@@ -154,6 +154,16 @@ class ApiLevelGuardTest {
       ),
       Forbidden("Stream.ofNullable() —— API 34", "34", Regex("""Stream\.ofNullable\s*[({]""")),
       // 容忍 Kotlin 尾随 lambda：`stream.dropWhile { it > 0 }` 没有圆括号，只写 `\s*\(` 会漏判。
+      //
+      // **本条规则刻意保守（只看方法名，不看接收者类型）** —— 这是有意的取舍，不要「精确化」：
+      //   · 事实上 `kotlin.text.takeWhile/dropWhile` 作用在 `String`/`CharSequence` 上时是纯 Kotlin
+      //     标准库，与 API 级别**无关**；真正越级的是 `java.util.stream.Stream.takeWhile()`（API 34）。
+      //   · 但本守卫是**文本正则**扫描（[codeLines] 剥注释/字符串后逐行匹配），文本层面无法可靠
+      //     判定接收者类型：`x.takeWhile {}` 里的 x 可能是 Stream、可能是 String、也可能来自泛型/扩展。
+      //   · 一旦为「String 接收者」开豁免，就等于给真防线开了一个可绕过的口子（改个变量名/加一层包装即可）。
+      //   · 因此取舍是：**保持规则简单且不可协商，改由壳侧源码一律避用该方法名**
+      //     （`FactoryProfilePatch` 的 `leadingSpaces(line)` 就是为此写的显式循环小工具）。
+      //     门禁报红时，正确处理是**改代码**，不是放宽这条规则。
       Forbidden("Stream.dropWhile()/takeWhile() —— API 34", "34", Regex("""\.(dropWhile|takeWhile)\s*[({]""")),
       // 注：**不**禁用 `.collect(Collectors.toList())` —— `Collectors.toList()` since=24，
       // 在 minSdk 26 上安全（api-versions.xml 实测）。只有 `Stream.toList()`（API 34，见上）
