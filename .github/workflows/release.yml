@@ -59,6 +59,27 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3 python-is-python3 || sudo ln -sf /usr/bin/python3 /usr/bin/python
           python --version
+      # 快照构建期会跑 check-browser-syntax-floor（判据 1 依赖真实 TypeScript 解析器），
+      # 并注入各插件的 lib/ ⇒ 缺依赖会以 exit 2「无法判定」拒发（首次派发实测：release run 36352307693 两个 ABI 同因失败）。
+      # 与 build-apk.yml 同一口径：有锁文件走 npm ci（按锁文件可复现），无锁文件走 npm install。
+      - name: 构建插件（有锁文件走 npm ci；dsh-host-web-compat 用已提交 lib）
+        shell: bash
+        run: |
+          set -e
+          install_deps() {
+            if [ -f "$1/package-lock.json" ]; then
+              echo "  deps: npm ci（锁文件在场，可复现）"
+              (cd "$1" && npm ci --no-audit --no-fund)
+            else
+              echo "  deps: npm install（无锁文件，按 package.json 解析）"
+              (cd "$1" && npm install --no-audit --no-fund)
+            fi
+          }
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability dsh-shell-termux dsh-client-ui-responsive; do
+            echo "== npm build $d =="
+            install_deps "$d"
+            (cd "$d" && npm run build)
+          done
       - name: stage 底座归档（base/ -> .deploy-tmp/<base-dir>/）
         shell: bash
         run: |
