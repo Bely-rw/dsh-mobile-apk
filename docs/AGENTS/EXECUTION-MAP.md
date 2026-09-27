@@ -524,7 +524,7 @@ sequenceDiagram
 | B01 | 协同仓权威源 | scripts/patches/**、build-apk-013.ps1、build-snapshot-013.mjs、inject-all.py 等双仓逐字节镜像，单边演进即拒 | scripts/check-patch-mirror.mjs:109,160-279 |
 | B01 | 发布链 build-release.ps1 | 复用同一门禁集与指纹对账，输入走设备侧 make-snapshot.sh 产出的 snapshot/snapshot-*.tar.xz | scripts/build-release.ps1:56-61,89-114,147 |
 | B01 | CI 与云端构建链 | 云端 build-apk.mjs 与本地链门禁集差集必须为 0；apk 仓 build-snapshot.yml 仍走 inject-snapshot.py 三包注入 | scripts/check-release-gates.mjs:191-212,.github/workflows/build-snapshot.yml:104 |
-| B01 | 来源审计 ARM64 构建 | 不读取 base/ LFS 快照；Harness 固定源码提交构建并部署 CLI/依赖/Web UI；安装后原位替换固定旧版 Cordis 源码并保留 pnpm 链接；Termux bootstrap 校验和固定，InRelease 与每个 deb 经签名/哈希校验；插件从本地或固定上游源码构建并导出来源清单 | .github/workflows/build-apk-source.yml:1,scripts/source-build/prepare-harness-vendor-overrides.py:1,scripts/source-build/prepare-termux-bootstrap.py:1,scripts/source-build/prepare-termux-signed-repo.py:1,scripts/source-build/export-dsh-engine.mjs:1,scripts/source-build/seed-dsh-profiles.mjs:1 |
+| B01 | 来源审计 ARM64 构建 | 不读取 base/ LFS 快照；Harness 固定源码提交构建并部署 CLI/依赖/Web UI；安装后原位替换固定旧版 Cordis 源码并保留 pnpm 链接，构建期锁文件只对齐这五个 importer；Termux bootstrap 校验和固定，InRelease 与每个 deb 经签名/哈希校验；插件从本地或固定上游源码构建并导出来源清单 | .github/workflows/build-apk-source.yml:1,scripts/source-build/prepare-harness-vendor-overrides.py:1,scripts/source-build/reconcile-harness-vendor-lock.mjs:1,scripts/source-build/prepare-termux-bootstrap.py:1,scripts/source-build/prepare-termux-signed-repo.py:1,scripts/source-build/export-dsh-engine.mjs:1,scripts/source-build/seed-dsh-profiles.mjs:1 |
 | B02 | B01 | 门禁集由两条编排器逐项调用；聚合入口断言本地链与云端链门禁集差集为 0，并锁发布链必须走 --run | scripts/check-release-gates.mjs:135 |
 | B02 | B03 | 冷启动预算的真数据只能来自设备产物，--require-real 由设备验收承担，构建机与 CI 只计 SKIP | scripts/check-boot-budget.mjs:671 |
 | B02 | K03 | 快照指纹、剥离后置断言、运行时补丁资产三门禁共同守内嵌 assets/snapshot.tar.xz 与 assets/patched 同源 | scripts/check-runtime-assets.mjs:126 |
@@ -2161,7 +2161,8 @@ flowchart LR
   B --> C["固定 Harness commit"]
   C --> D["pnpm install 冻结锁文件"]
   D --> V["原位替换固定 Cordis 源码 保留 node_modules"]
-  V --> P["源码构建"]
+  V --> W["只对齐五个旧版包的锁文件 importer"]
+  W --> P["源码构建"]
   P --> E["导出 first-party overlay tarballs 与源码哈希"]
   B --> F["下载 pinned Termux bootstrap ZIP"]
   F --> G{"SHA-256 匹配"}

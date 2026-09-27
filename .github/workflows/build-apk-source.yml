@@ -31,7 +31,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Verify pinned source replacement before the expensive build
-        run: python3 -m unittest discover -s scripts/source-build -p 'test_*.py' -v
+        run: |
+          python3 -m unittest discover -s scripts/source-build -p 'test_*.py' -v
+          node --test scripts/source-build/reconcile-harness-vendor-lock.test.mjs
       - name: Install archive and signature tools
         run: |
           sudo apt-get update -y
@@ -148,6 +150,10 @@ jobs:
             "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
             "$GITHUB_WORKSPACE/scripts/snapshot-config/engine-overlay.json" \
             "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json"
+          node "$GITHUB_WORKSPACE/scripts/source-build/reconcile-harness-vendor-lock.mjs" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/deepseek-harness" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-overrides.json" \
+            "$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-vendor-lock-reconciliation.json"
           root_manifest="package.json"
           root_manifest_backup="$GITHUB_WORKSPACE/.deploy-tmp/source-build/harness-root-package.json.original"
           cp "$root_manifest" "$root_manifest_backup"
@@ -285,6 +291,8 @@ jobs:
           }
           policy.harnessVendorSourceOverrides = '.deploy-tmp/source-build/harness-vendor-overrides.json'
           policy.harnessVendorSourceOverridesSha256 = require('node:crypto').createHash('sha256').update(fs.readFileSync('.deploy-tmp/source-build/harness-vendor-overrides.json')).digest('hex')
+          policy.harnessVendorLockReconciliation = '.deploy-tmp/source-build/harness-vendor-lock-reconciliation.json'
+          policy.harnessVendorLockReconciliationSha256 = require('node:crypto').createHash('sha256').update(fs.readFileSync('.deploy-tmp/source-build/harness-vendor-lock-reconciliation.json')).digest('hex')
           fs.writeFileSync(policyPath, JSON.stringify(policy, null, 2) + '\n')
           NODE
           node scripts/source-build/export-dsh-engine.mjs \
@@ -645,6 +653,8 @@ jobs:
             .deploy-tmp/source-build/source-build-policy.json
             .deploy-tmp/source-build/effective-engine-overlay.json
             .deploy-tmp/source-build/harness-vendor-overrides.json
+            .deploy-tmp/source-build/harness-vendor-lock-reconciliation.json
+            .deploy-tmp/source-build/harness-pnpm-lock.original.yaml
             .deploy-tmp/source-build/harness-build-script-exclusion.json
             .deploy-tmp/source-build/harness-root-package.json.original
             .deploy-tmp/source-build/android-build-inputs-sha256.txt

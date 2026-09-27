@@ -218,4 +218,10 @@
     **现象**：`build-apk-source` 第 9 步在 `prepare-harness-vendor-overrides.py:172` 的 `shutil.copytree(target, backup, symlinks=False)` 抛出异常；日志在 `raise Error(errors)` 后约 5 小时没有新输出，最终碰到 GitHub Actions 6 小时上限而取消，APK 步骤均未执行。此前的 Corepack 下载重试已生效，不能把本轮 6 小时归因于下载；下载完成与 Python 脚本开始之间缺少时间戳，前段耗时不能拆分。
     **真因**：冻结安装先于旧版 Cordis 源码替换，pnpm 已在 `vendor/*/node_modules` 建立工作区链接。锁文件存在 `group → cordis → loader → cordis` 的回环；`symlinks=False` 会跟随链接复制其目标，整个包目录备份因此进入循环依赖图。仅改为 `symlinks=True` 也不够：旧实现随后 `rmtree(target)` 会删掉构建仍需的 `node_modules`。
     **修法**：包根目录保持原位，只把非 `node_modules` 条目移到临时备份，再复制固定提交的源码条目；任一包失败时倒序清理新源码并移回原条目。拒绝固定源码归档顶层携带 `node_modules`。PR 与来源构建入口先跑包含循环链接和跨包回滚的单测。
-    **复验证据**：本地非链接用例与回滚用例通过；循环符号链接用例需在 Linux CI 运行（当前 Windows 会话无创建符号链接权限）。完整来源构建须以新 run 的步骤 9 与最终 APK 产物确认。
+    **复验证据**：本地非链接用例与回滚用例通过；新远程 run 36288879471 的 Linux 用例通过，五个旧版包在约 1 秒内替换完成，越过原 6 小时卡点。完整来源构建随后遇到锁文件声明漂移（坑 184）。
+
+184. **固定旧版 vendor 清单替换后，构建入口会用冻结锁文件复检声明（2026-09-27，远程 run 36288879471）**：
+    **现象**：旧版 Cordis 包已成功替换，但 `pnpm run build` 立即报 `ERR_PNPM_OUTDATED_LOCKFILE`，例如 `vendor/include` 的 `@deepseek-ai/cordis` 与 loader 从锁文件 `workspace:~` 变为旧清单 `workspace:^`；构建在此正常判红。
+    **真因**：上游固定 Harness 提交的锁文件与其当代 vendor 清单一致，旧版源码替换也带入了旧版 `package.json`；运行 build 前的 pnpm 依赖状态检查要求 importer 的 specifier 与现有清单相同。仅保留安装后的链接无法让旧清单匹配新锁文件。
+    **修法**：`reconcile-harness-vendor-lock.mjs` 只对来源报告列出的五个 importer 改写 specifier、移除旧清单已无的依赖条目；任何旧清单新增而锁文件没有的依赖直接拒绝，不向 registry 重新解析。原锁文件、改动清单、调整前后哈希进入来源 artifact 与策略报告。旧版源码及打包清单保持固定提交原样。
+    **复验证据**：纯函数单测覆盖声明更新、已锁解析保留、缺失解析拒绝；完整来源构建须由后续远程 run 验证。
