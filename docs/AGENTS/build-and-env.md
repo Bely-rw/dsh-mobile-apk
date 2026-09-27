@@ -55,6 +55,8 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 
 Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-vendor-overrides.py` 从固定旧提交提取五个 Cordis 包源码，只移动并替换包根目录下的源码条目，原位保留 `node_modules` 及其 pnpm 工作区链接，然后单独编译和打包这五个旧版包（坑 185）。任一包替换失败时按逆序还原已移动的源码条目。不能对安装后的整个包目录用 `shutil.copytree(..., symlinks=False)` 备份：工作区链接可能形成环，复制会递归进入依赖图（坑 183）。旧版清单的依赖声明与当前上游锁文件不同，`reconcile-harness-vendor-lock.mjs` 在构建期按 `pnpm-workspace.yaml` 的本地链接覆盖计算有效声明，只对这五个 importer 对齐并删除旧版清单已无的条目，保留全部锁定解析与 integrity；原锁文件、差异和双份哈希随 artifact 附出（坑 184）。PR 与来源构建入口均先运行两者的反证用例。
 
+来源构建还会从本仓九个带 `package-lock.json` 的插件/组件目录执行 `npm ci`。`check-package-lock-roots.mjs` 在 PR 与来源构建的早期步骤核对各目录 `package.json` 与锁文件根声明中的名称、版本及四类依赖，发现镜像后的旧声明就立即报错，避免完成 Harness 和 Termux 构建后才在插件安装阶段失败（坑 186）。锁文件更新后还应对受影响目录运行 `npm ci --dry-run --ignore-scripts --no-audit --no-fund`，因为根声明一致不能证明整份依赖图有效。
+
 **设备验证链路**（真机 arm64 vivo V2425A；模拟器 MuMu x86_64 竖屏 `127.0.0.1:16416`、横屏 `127.0.0.1:16384`——横屏实例勿改回竖屏）：
 - 安装：`adb -s <serial> install -r -t out\v<版本>\...apk`（同签名 debug.keystore；**指纹变更触发 refreshSnapshot 全量重解压（真机 ≈2-4 分钟、模拟器实测 ~8 分钟，勿在解压中杀进程——中途杀进程看门狗会拿半解压运行时拉引擎，见坑 37）**）。
 - 引擎探活：`adb -s <serial> forward tcp:23080 tcp:3080` → `http://127.0.0.1:23080/`。

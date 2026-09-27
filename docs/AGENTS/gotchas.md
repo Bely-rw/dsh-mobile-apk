@@ -231,3 +231,9 @@
     **真因**：来源链把 0.1.7-rc.2 的其余源码与 overlay 固定的较早 Cordis 源码放进同一次全仓类型检查。两者发布时序不同，旧版包的 API 无法满足当前源码的静态检查；这不是缺失依赖或 TypeScript 缓存问题。
     **修法**：先按固定 0.1.7-rc.2 提交完成全仓与 Web UI 构建，再替换五个旧版 Cordis 包、对齐它们的锁文件 importer，单独用各包 tsconfig 和 tsdown filter 编译旧版包。打包时五个旧版 manifest 与源码仍等于固定旧提交，当前其余包来自固定 Harness 提交，不改上游源码。
     **复验证据**：远程 run 36289546067 证明锁文件复检已通过、进入全仓 TypeScript 并在上述不兼容处失败；调整后的完整构建须由后续远程 run 验证。
+
+186. **插件镜像的 package-lock 根声明过期，会让来源构建在昂贵前段完成后才失败（2026-09-27，远程 run 36289938732）**：
+    **现象**：Harness 源码构建与 Termux bootstrap 验证均通过后，`Build project plugins and marketplace from source` 在 `dsh-android-linux-env` 的 `npm ci` 报清单与锁文件不同；同类漂移还存在于 browser 与 file-open。
+    **真因**：三个插件的 `package.json` 已钉 Harness 0.1.7-rc.2 和 Cordis 4.0.4，镜像里的 `package-lock.json` 根声明仍是 0.1.1-rc.2 / Cordis 4.0.1；旧锁文件未随清单同步。此处与工作区 pnpm 锁文件调整是两套独立依赖图。
+    **修法**：按各插件现有清单重算其 npm 锁文件；在 PR 与来源构建的早期步骤运行 `check-package-lock-roots.mjs`，逐个对照所有带锁文件的插件/组件根声明，及早拒绝旧镜像。
+    **复验证据**：九份锁文件根声明核对通过，九个目录的 `npm ci --dry-run --ignore-scripts --no-audit --no-fund` 通过，三个修复插件的实际 `npm ci` 与 `npm run build` 通过；完整远程构建结果见后续 run。
