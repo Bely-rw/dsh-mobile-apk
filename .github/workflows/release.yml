@@ -205,14 +205,16 @@ jobs:
           git describe --tags --always
           test -d packages/client/ui-theme/src/styles || { echo "::error::上游令牌定义面缺席"; exit 1; }
           du -sh "$PWD"
-      - name: 跑发布门禁（聚合入口，严格档 SKIP=0）[未验证]
+      # 本地链期望的输入位是 .deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz（**注入前**），
+      # 注入/降级/门禁/打包都在链内完成。J1 产出的正是注入前快照，归置到该位置即可。
+      - name: 归置快照为本地链输入位（pre-injection；注入由链内完成）
         shell: bash
         run: |
           set -e
-          # 本轮未在 CI 端到端跑过本步。本地等价命令：
-          #   node scripts/check-release-gates.mjs --run --require --snapshot-dir snapshot
-          # 注意：声明集里含需要 git 干净工作区 / 设备产物的项，CI 上需按 G.3 的最小充分集调整。
-          node scripts/check-release-gates.mjs --run --require --snapshot-dir snapshot
+          mkdir -p .deploy-tmp/snapshot-013/arm64 .deploy-tmp/snapshot-013/x86_64
+          cp snapshot/snapshot-arm64.tar.xz .deploy-tmp/snapshot-013/arm64/snapshot.tar.xz
+          cp snapshot/snapshot-x86_64.tar.xz .deploy-tmp/snapshot-013/x86_64/snapshot.tar.xz
+          ls -l .deploy-tmp/snapshot-013/*/snapshot.tar.xz
       - name: 子仓打包（发布资产里的 3 个 tgz）
         shell: bash
         run: |
@@ -229,24 +231,33 @@ jobs:
           echo "packed tgz count=$count"
           [ "$count" -ge 3 ] || { echo "::error::子仓 tgz 少于 3 件（实测 pack 名见上），发布资产会缺件"; ls -l plugins/; exit 1; }
           ls -l plugins/
-      - name: 双 ABI APK 构建（注入后快照 + 固定指纹）
+      # 复用仓库自有的本地链，而不是在 YAML 里手搓流水线：链内已包含浏览器语法下限降级、
+      # 单 pass 注入（@dsh-android + vendor 外部插件 + 权威 patch，--all-profiles）、产物面门禁、
+      # 双 ABI 打包，以及 -ExportSnapshots 的「注入后快照 == APK 内嵌快照」一致性校验。
+      # 手搓版缺降级与注入 ⇒ check-inject-completeness 如实判红（真实 run 36356397292）。
+      - name: 本地链全量（语法降级 + 注入 + 门禁 + 双 ABI 打包 + 注入后快照导出）
         shell: bash
         run: |
           set -e
           chmod +x gradlew
+          pwsh -NoProfile -File scripts/build-apk-013.ps1 -Suffix "" -ExportSnapshots
+      - name: 归集发布资产（APK + 注入后快照 + 子仓 tgz）
+        shell: bash
+        run: |
+          set -e
           OUT="release/v${ver}"
           mkdir -p "$OUT/apk" "$OUT/snapshot" "$OUT/plugins"
-          for pair in "arm64-v8a:snapshot-arm64.tar.xz" "x86_64:snapshot-x86_64.tar.xz"; do
-            ABI=${pair%%:*}; SNAP=${pair##*:}
-            cp "snapshot/${SNAP}" app/src/main/assets/snapshot.tar.xz
-            sha256sum "snapshot/${SNAP}" | awk '{print $1}' > app/src/main/assets/snapshot.sha256
-            ./gradlew :app:assembleDebug --no-daemon --rerun-tasks
-            cp app/build/outputs/apk/debug/app-debug.apk "$OUT/apk/dsh-mobile-apk-v${ver}-${ABI}.apk"
-          done
-          cp snapshot/snapshot-arm64.tar.xz snapshot/snapshot-x86_64.tar.xz "$OUT/snapshot/"
+          ls -l "out/v${ver}"
+          for f in out/v${ver}/*.apk; do [ -f "$f" ] && cp "$f" "$OUT/apk/"; done
+          for f in out/v${ver}/snapshot-*.tar.xz; do [ -f "$f" ] && cp "$f" "$OUT/snapshot/"; done
+          for f in out/v${ver}/*.sha256; do [ -f "$f" ] && cp "$f" "$OUT/snapshot/"; done
           # 子仓 tgz 由上一「子仓打包」步产出；这里不许 || true 吞掉缺件（发布资产会静默少 3 件）。
           cp plugins/*.tgz "$OUT/plugins/"
           ls -lR "$OUT"
+          apk_count=$(find "$OUT/apk" -name '*.apk' | wc -l)
+          [ "$apk_count" -ge 2 ] || { echo "::error::APK 少于 2 件（双 ABI 缺件）"; exit 1; }
+          snap_count=$(find "$OUT/snapshot" -name 'snapshot-*.tar.xz' | wc -l)
+          [ "$snap_count" -ge 2 ] || { echo "::error::注入后快照少于 2 件"; exit 1; }
       - name: 产出侧签名断言（固定证书指纹）
         shell: bash
         run: |
