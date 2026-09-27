@@ -36,10 +36,12 @@ const ANDROID_HOME = process.env.ANDROID_HOME || join(ROOT, '.deploy-tmp', 'andr
 const STAGES = [
   { key: 'verify', label: '输入与工具自检', match: /^Verify pinned source replacement/ },
   { key: 'apksigner', label: '解析 apksigner（含签名自证）', match: /^Resolve the Android SDK apksigner/ },
-  { key: 'sources', label: '取固定来源（Harness / 组件 / 市场产物）', match: /^Checkout pinned|^Authenticate official Termux bootstrap/ },
+  { key: 'sources', label: '取固定来源（Harness / 组件 / 市场产物）', match: /^Checkout pinned/ },
   { key: 'harness', label: '从源码构建 Harness 并打包', match: /^Build and pack DeepSeek Harness/ },
   { key: 'plugins', label: '构建插件与市场补丁', match: /^Build project plugins|^Apply project patches/ },
-  { key: 'termux', label: '组装并验签 Termux 基座', match: /^Add Node\.js to the clean Termux base|^Verify signed Termux repository|^Cross-compile node-pty|^Assemble clean Termux base/ },
+  // 注意：bootstrap 认证/取密钥那一步在文件里排得靠前（紧跟 harness 之后），但它属于 Termux 链
+  // ——归到 termux 阶段，`--from termux` 才不会再把它跳过（曾因此报「Termux 签名密钥不在场」）。
+  { key: 'termux', label: '组装并验签 Termux 基座', match: /^Authenticate official Termux bootstrap|^Add Node\.js to the clean Termux base|^Verify signed Termux repository|^Cross-compile node-pty|^Assemble clean Termux base/ },
   { key: 'snapshot', label: '构建运行时快照', match: /^Build runtime snapshot/ },
   { key: 'sign', label: 'keystore 自检', match: /^Verify the repository debug signing keystore/ },
   { key: 'apk', label: '门禁 + 注入 + 打包 ARM64 APK', match: /^Build ARM64 APK/ },
@@ -128,12 +130,19 @@ if (flag('--list')) {
 const from = value('--from', null)
 const to = value('--to', null)
 const only = value('--only', null)
+// 同阶段内续跑：--from-step 用 `--list` 打印的序号（阶段粒度太粗，同一阶段里前几步已完成时用得上）。
+const fromStep = value('--from-step', null) === null ? null : Number(value('--from-step'))
+if (fromStep !== null && (!Number.isInteger(fromStep) || fromStep < 0 || fromStep >= planned.length)) {
+  console.error(`--from-step 需为 0..${planned.length - 1} 的整数`)
+  process.exit(2)
+}
 const stageIndex = (key) => STAGES.findIndex((s) => s.key === key)
 if (from && stageIndex(from) < 0) { console.error(`未知阶段: ${from}（可选：${STAGES.map((s) => s.key).join(', ')}）`); process.exit(2) }
 if (to && stageIndex(to) < 0) { console.error(`未知阶段: ${to}`); process.exit(2) }
 if (only && !STAGES.some((s) => s.key === only)) { console.error(`未知阶段: ${only}`); process.exit(2) }
 
-const selected = planned.filter((item) => {
+const selected = planned.filter((item, index) => {
+  if (fromStep !== null) return index >= fromStep
   if (only) return item.stage === only
   if (from && stageIndex(item.stage) < stageIndex(from)) return false
   if (to && stageIndex(item.stage) > stageIndex(to)) return false
@@ -147,14 +156,23 @@ const preflight = () => {
   for (const rel of ['build-tools/36.0.0/apksigner', 'platforms/android-36/android.jar']) {
     if (!existsSync(join(ANDROID_HOME, rel))) missing.push(`Android SDK 缺少 ${rel}（在 ${ANDROID_HOME}）`)
   }
-  if (!existsSync(join(ROOT, '.deploy-tmp/source-build/ndk/android-ndk-r30'))) missing.push('NDK r30 不在场：.deploy-tmp/source-build/ndk/android-ndk-r30')
-  for (const cmd of ['node', 'python3', 'java', 'xz', 'gpg', 'unzip', 'git', 'curl', 'tar']) {
+  // NDK 不作为前置：它由链自己的 node-pty 步骤下载并按 sha1 校验后解包。**预解一份反而有害**——
+  // 该步骤用 `unzip`（无 -o），已有目录会触发交互式覆盖确认，在非交互环境读到 EOF 即判死。
+  // 注意 `python`（不带 3）：链里的编排器（build-apk.mjs）调的就是它，而 Ubuntu 默认只装 python3。
+  // 缺它时报错发生在编排器内部，表现为**静默退出码 1**（无任何输出），极难定位——故列进前置检查，
+  // 让它在开跑前就带着说明判红。
+  for (const cmd of ['node', 'python', 'python3', 'java', 'xz', 'gpg', 'unzip', 'git', 'curl', 'tar']) {
     const probe = spawnSync('bash', ['-lc', `command -v ${cmd}`], { encoding: 'utf8' })
     if (probe.status !== 0) missing.push(`缺少命令：${cmd}`)
   }
   if (missing.length) {
     console.error('本地前置检查未过：')
     for (const item of missing) console.error(`  - ${item}`)
+    if (missing.some((item) => item.includes('python'))) {
+      console.error('  提示：`python` 缺失时链会在编排器内部静默退出 1；用户级 shim 即可：')
+      console.error('        mkdir -p ~/.local/bin && ln -sf "$(command -v python3)" ~/.local/bin/python')
+      console.error('        （本脚本会把 ~/.local/bin 置于 PATH 前部）')
+    }
     process.exit(2)
   }
   console.log(`前置检查通过（ANDROID_HOME=${ANDROID_HOME}）`)
@@ -189,7 +207,7 @@ const baseEnv = {
   DSH_APK_DIR: ROOT,
   GITHUB_WORKSPACE: ROOT,
   GITHUB_SHA: repoCommit,
-  PATH: `${nodePathPrefix}${join(ANDROID_HOME, 'build-tools', '36.0.0')}:${join(ANDROID_HOME, 'platform-tools')}:${process.env.PATH}`,
+  PATH: `${nodePathPrefix}${join(homedir(), '.local', 'bin')}:${join(ANDROID_HOME, 'build-tools', '36.0.0')}:${join(ANDROID_HOME, 'platform-tools')}:${process.env.PATH}`,
   // pnpm 11 只认自己的前缀：实测 `npm_config_registry` 被忽略、`pnpm_config_registry` 生效
   // （npm 侧仍用 npm_config_registry，两条链各自生效）。
   // 放宽 fetch 超时/重试：国内取件会偶发长尾，默认超时会在大半下载完之后整步判死（实测 1371/1385 被掐）。
@@ -202,6 +220,13 @@ const baseEnv = {
     COREPACK_NPM_REGISTRY: npmMirror,
   } : {}),
 }
+
+// 抹掉 WSL_DISTRO_NAME：本链的步骤全部按 **CI 的原生 Linux 语义**写死路径
+// （`build-snapshot-013.mjs` 的 IN_WSL 分支会把 stage 改到 `~/.dsh-stage/<abi>`，而 workflow 的
+// 后续步骤——materialize / 重打包 / 副本收敛 / 快照检查器——都按 `.deploy-tmp/snapshot-013/<abi>/stage`
+// 取件，stage 一挪就必然 ENOENT）。本地工作区本来就在 ext4，那条 WSL 分支省不到 I/O，
+// 只有害处。shell.mjs 里对 WSL_DISTRO_NAME 的另一处用法只在 Windows 宿主侧生效，不受影响。
+delete baseEnv.WSL_DISTRO_NAME
 
 let failed = 0
 for (const [i, item] of selected.entries()) {

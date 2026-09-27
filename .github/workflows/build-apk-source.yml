@@ -432,6 +432,10 @@ jobs:
           curl --fail --location --retry 3 \
             'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
             --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          # 先清空解包目标：本步对**同一目录**重跑不安全——上一轮按 SYMLINKS.txt 建出的符号链接
+          # 会让这一轮的 safe_member 解析出界（报 `bootstrap path escaped staging root`）。
+          # CI 每轮全新目录所以从不暴露，本地复跑必踩；清掉即幂等。
+          rm -rf .deploy-tmp/source-build/bootstrap-extracted
           python3 scripts/source-build/prepare-termux-bootstrap.py \
             --extract-bootstrap-only \
             .deploy-tmp/source-build/bootstrap-aarch64.zip \
@@ -548,6 +552,8 @@ jobs:
           printf '%s  %s\n' '5107f898313790e449e87eee2183d9a20602dee9' "$ndk_archive" | sha1sum --check -
           printf '%s\n' '5107f898313790e449e87eee2183d9a20602dee9' \
             > .deploy-tmp/source-build/ndk-archive-sha1.txt
+          # 同上：`unzip` 无 -o，目录已在时会走交互式覆盖确认，非交互环境读到 EOF 即判死。
+          rm -rf .deploy-tmp/source-build/ndk/android-ndk-r30
           unzip -q "$ndk_archive" -d .deploy-tmp/source-build/ndk
           node_deb=$(python3 - <<'PY'
           import json, pathlib

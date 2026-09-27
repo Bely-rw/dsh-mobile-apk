@@ -113,6 +113,7 @@ function stepSourceBuildTests() {
   const suites = [
     'preset-carriers.test.mjs',
     'restore-overlay-pins.test.mjs',
+    'reconcile-engine-patch-copies.test.mjs',
     'check-package-lock-roots.test.mjs',
     'reconcile-harness-vendor-lock.test.mjs',
     'check-android-native-runtime-packages.test.mjs',
