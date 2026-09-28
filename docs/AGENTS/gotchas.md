@@ -1156,3 +1156,10 @@
     **为什么此前从未暴露**：来源链的失败点一直停在更早的步骤（凭据、锁文件、市场补丁锚点、平台死重…），**从没走到 APK 步**——**一个晚出现的门禁会被早出现的失败长期遮住**。而这与坑 199 同源：**新链必须逐条满足它所调用的共用编排器的全部前置，而这件事没有任何判据在守**（`check-release-gates` 只断言「声明集合被调用」，不断言「调用的前置已满足」）。
     **修法**：`build-apk-source.yml` 在 APK 步之前补「单元测试门禁前置（`:app:testDebugUnitTest` 全量）」步，与 `release.yml` 同做法；结果目录 `app/build/test-results/testDebugUnitTest` 由后续门禁就地读取并比对基线。
     **复验证据**：同一次 run 里它前面的门禁（`check-snapshot-builder-output`、`check-build-parallel-cap`）均 PASS，说明链路其余部分健康；本步补上后须由下一次远程 run 验证能否走完 APK 步。
+
+212. **归一化摘要要求在**大小写敏感**的文件系统上复算——macOS 上会得到另一个值（2026-09-28）**：
+    **现象**：来源链记的归一化摘要（`61687a40…`）与我拿同一个 APK 在 macOS 上复算的值（`0ba6a36c…`）不同，而**文件数（42783）、四条规则的命中数、跳过数（36）三项全部逐项相等**——计数全等、只有摘要不同，指向「某些条目的内容或路径串不同」。
+    **排除过程**（留作方法）：① 先确认双方看的是同一份快照——APK 内 `assets/snapshot.sha256` 与我实算一致（`f8b70523…`）；② 换一个解包器（bsdtar → Python `tarfile`）得到**同一个**值，说明不是解包器差异；③ 查 tar 里有无**仅大小写不同**的路径——`tr A-Z a-z | sort | uniq -d` 命中 `usr/share/licenses/` vs `usr/share/LICENSES/`、`usr/lib/perl5/5.42.2/pod/` vs `Pod/`。
+    **真因**：**macOS 的 APFS 默认大小写不敏感** ⇒ 上述两组目录在本地被**合并成一个** ⇒ 落在 `LICENSES/` 下的文件被 walk 成 `licenses/…` ⇒ manifest 里的**路径字符串**与 Linux 侧不同 ⇒ 摘要不同。**文件数不变**（合并的是目录、且无文件名冲突），这正是「三项计数全等却摘要不同」的来源。
+    **结论与影响**：**链是对的，本地复算是错的**。公布的归一化摘要**确实可被外部复核**，但复算者必须在**大小写敏感的文件系统**上解包——Linux 天然满足；macOS 需挂在大小写敏感的卷上（或直接以容器/Linux 环境复算）。**同一个坑在本会话里咬了两次**（最早那次链侧 vs 我侧的摘要差异也是它）。
+    **建议的复算姿势**：在 Linux（或 `--case-sensitive` 卷）上 `unzip -p <APK> assets/snapshot.tar.xz | tar -xJ`，再跑 `normalize-snapshot.mjs`；本仓的 workflow 步骤「Snapshot semantic normalization digest」即为该过程的可执行版本。
