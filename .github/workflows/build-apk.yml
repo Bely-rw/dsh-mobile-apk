@@ -24,9 +24,18 @@ on:
         description: 'APK 版本后缀（默认空=正式版纯净版本号；测试构建显式传 -fix 等）'
         type: string
         default: ''
+      source_audit:
+        description: '仅在来源审计 PR 分支上运行固定源码/签名输入构建'
+        type: boolean
+        default: false
 
 jobs:
+  source-audit:
+    if: ${{ inputs.source_audit }}
+    uses: ./.github/workflows/build-apk-source.yml
+
   build:
+    if: ${{ !inputs.source_audit }}
     runs-on: ubuntu-latest
     strategy:
       matrix:

@@ -458,9 +458,12 @@ writeFileSync(INDEX_BODY, gunzipSync(gz.buf))
 const indexText = readFileSync(INDEX_BODY, 'utf8')
 
 const pkgs = new Map()
+// 包名 → 索引里的**原始块**（逐字保留，供 dpkg/available 使用）
+const rawBlocks = new Map()
 for (const block of indexText.split('\n\n')) {
   const name = block.match(/^Package: (.+)$/m)?.[1]
   if (!name) continue
+  rawBlocks.set(name, block)
   const get = (k) => block.match(new RegExp(`^${k}: (.+)$`, 'm'))?.[1]?.trim() ?? ''
   pkgs.set(name, {
     version: get('Version'),
@@ -587,8 +590,16 @@ mkdirSync(join(dpkgDir, 'info'), { recursive: true })
 mkdirSync(join(dpkgDir, 'parts'), { recursive: true })
 writeFileSync(join(dpkgDir, 'status'), dpkgStatus.join('\n'))
 writeFileSync(join(dpkgDir, 'status-old'), dpkgStatus.join('\n'))
-writeFileSync(join(dpkgDir, 'available'), indexText.split('\n\n').filter((b) => b.startsWith('Package:')).join('\n\n') + '\n')
-log('dpkg status: ' + dpkgStatus.length + ' 包')
+// dpkg/available：由**整份活上游索引**改为「本链实际安装的那些包」（坑 210）。
+// 旧实现把 3000+ 条全倒进去，于是上游动一个与本链毫无关系的包（实测相隔 90 分钟两次构建，
+// 上游掉了 codon / ecl 两个包）快照哈希就变一次——而产物**不是逐字节可复现**这件事，
+// 会让「重跑比哈希」这个最廉价的完整性判据永远失效：恒亮的警报灯等于没有警报灯。
+// 本链真正需要的是「装了什么」，那由 needed 定义，与无关包的 churn 无关。
+// 按名排序：索引自身的块顺序不保证稳定，不排序等于把不确定性从「包集合」挪到「块顺序」；
+// status 也是 [...needed].sort()，两者口径一致。块逐字取自索引，不改写内容。
+const availableBlocks = [...needed].sort().map((n) => rawBlocks.get(n)).filter(Boolean)
+writeFileSync(join(dpkgDir, 'available'), availableBlocks.join('\n\n') + '\n')
+log('dpkg status: ' + dpkgStatus.length + ' 包，available: ' + availableBlocks.length + ' 包')
 
 // ── 6. shebang 与 ELF RUNPATH 重写（com.termux → com.dsharnessmobile.shell）──
 log('重写 shebang/RUNPATH…')
@@ -980,6 +991,49 @@ for (const entry of SLIM.engineStalePackages ?? []) {
   if (!existsSync(join(dir, 'package.json'))) continue
   wsl(`rm -rf "${wslPath(dir)}"`)
   log(`  剔除基座残留 ${entry.name}（${entry.lastSeenVersion ?? '?'}，登记表与依赖闭包都不认）`)
+}
+
+// ── 平台死重剔除（来源链体积审计实锤：1.07 GB，APK 3.1 倍）────────────────────
+// 来源链做的是**完整 pnpm deploy**，而 CI 在 Linux 上 ⇒ pnpm 按**宿主平台**解析 optional
+// 依赖，把 linux-x64 / linux-arm64 的原生载荷一并装进引擎树。Android 是 bionic，这些
+// glibc/musl 二进制在设备上**永不加载**，却随 APK 出货。
+// 实测：`usr/lib/node_modules` 1614 MB（正常链 189 MB），APK 489 MB（正常链 158 MB），
+// 差额几乎全在这里——正常链从设备基座出发，基座上本就没有这些 Linux 载荷。
+//
+// 判据是**平台**而不是「在不在登记表」，故与 engineStalePackages 分成两个键：
+// `@deepseek-ai/libreoffice-kit-wasm` 体积同样可观（145 MB）但它是 WASM（平台无关、
+// 设备上可能真能用），**必须保留**——独立成键，免得被这条顺手删掉。
+//
+// 删除面覆盖三处（pnpm 布局下都实测在场）：
+//   ① `<engine>/node_modules/.pnpm/<enc>@<ver>*/`        —— 实体与大文件在这里
+//   ② `<engine>/node_modules/.pnpm/node_modules/<pkg>`  —— 提升副本（可能是软链）
+//   ③ `<engine>/node_modules/<pkg>`                     —— 顶层物化副本（可能不存在）
+// 安全网：删多了会让 check-dsh-runtime-dependencies（只认非 optional 依赖）与
+// check-android-native-runtime-packages 判红。
+for (const entry of SLIM.platformDeadPackages ?? []) {
+  if (OVERLAY.packages[entry.name] !== undefined) {
+    console.error(`[平台死重剔除中止] ${entry.name} 已在 overlay 登记表内——它可能是真依赖。`
+      + '请把该条从 snapshot-config/slim.json 的 platformDeadPackages 删掉。')
+    process.exit(1)
+  }
+  const store = join(ENGINE_NM_STAGE, '.pnpm')
+  const encoded = entry.name.replace('/', '+')
+  const storeDirs = existsSync(store)
+    ? readdirSync(store).filter((d) => d === encoded || d.startsWith(`${encoded}@`))
+    : []
+  const targets = [
+    ...storeDirs.map((d) => join(store, d)),
+    join(store, 'node_modules', entry.name),
+    overlayPkgDir(entry.name),
+  ]
+  let removed = 0
+  for (const target of targets) {
+    if (!existsSync(target)) continue
+    wsl(`rm -rf "${wslPath(target)}"`)
+    removed += 1
+  }
+  if (removed === 0) log(`  平台死重 ${entry.name}：树内不在场（跳过）`)
+  else log(`  剔除平台死重 ${entry.name}（${entry.platform}，${removed} 处）`)
 }
 
 // ── 8a3. 权限归一化：不在本步做 ───────────────────────────────────────────
