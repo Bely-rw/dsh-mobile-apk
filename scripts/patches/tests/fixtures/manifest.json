@@ -120,6 +120,14 @@
       "files": [
         "lib/index.js"
       ]
+    },
+    "dsh-client-file-upload-0.1.7-rc.2": {
+      "source": "engine-tgz",
+      "engine": "0.1.7-rc.2",
+      "package": "@deepseek-ai/dsh-client-file-upload@0.1.7-rc.2",
+      "files": [
+        "lib/index.js"
+      ]
     }
   }
 }

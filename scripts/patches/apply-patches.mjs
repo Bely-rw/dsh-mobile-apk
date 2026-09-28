@@ -1912,6 +1912,45 @@ const IMPLS = {
       return s
     },
   },
+
+  // ── file-upload-restart-R1：Agent resolver 单槽注册在 fiber 重启时必然重复（2026-09-28 模拟器 5556 实锤，scope=engine）──
+  // 现象：在设置里换一次默认模型 → 内置插件面板 196 个里出现 1 个失败（api-session-controller），
+  // 此后新建会话/切模型恒得 typert gateway: session/control: active Service "sessionController" is unavailable（控制面整体报废）。
+  // 真因：config-editor 改写 agent-default-model 条目 config ⇒ 该 fiber 重启 ⇒ 依赖 agentDefaultModel 的
+  // session-controller 跟着重启；cordis Fiber._reload 的顺序是「先执行新实例 body、再 _unload() 释放旧 effect」，
+  // 所以新 SessionController 构造里的 ctx.effect(() => ctx.fileUploads.registerAgentResolver(...)) 执行时旧注册仍在槽里，
+  // 上游 registerAgentResolver 对已占用槽直接 throw（file-upload: Agent resolver is already registered）
+  // ⇒ 新 fiber 判 FAILED，旧 fiber 随后释放，服务永久缺席（不是 pending，启动审计也不拦）。
+  // 为什么改注册表一侧而不是 session-controller：单槽语义下「同槽覆盖」与上游意图等价，且全文只有这一个调用方；
+  // 不依赖 cordis 内部顺序，重启任意次数都成立。
+  // 不变量：仍只有一个槽（不新增第二槽）；disposer 保留身份判据（旧 fiber 的 disposer 不会清掉新注册）。
+  'file-upload-restart-R1': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-file-upload/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile file-upload resolver replace (R1)'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile file-upload resolver replace (R1)')) return s
+      const OLD = [
+        '\t\t\tif (this.agentResolver !== void 0) throw new Error("file-upload: Agent resolver is already registered");',
+        '\t\t\tthis.agentResolver = resolve;',
+      ].join('\n')
+      const NEW = [
+        '\t\t\t/* dsh-mobile file-upload resolver replace (R1): cordis runs the new plugin body before',
+        "\t\t\t * disposing the previous fiber's effects, so a restart re-registers while the old resolver",
+        '\t\t\t * is still installed. Replace in the single slot instead of refusing; the identity-guarded',
+        "\t\t\t * disposer below keeps the previous fiber's disposer from clearing this registration. */",
+        '\t\t\tthis.agentResolver = resolve;',
+      ].join('\n')
+      if (!s.includes(OLD)) {
+        throw new Error('file-upload 锚点未命中：registerAgentResolver 的 already-registered 守卫——引擎升级后请人工核对 dsh-client-file-upload 构建产物')
+      }
+      s = s.replace(OLD, NEW)
+      if (!s.includes('dsh-mobile file-upload resolver replace (R1)') || s.includes('Agent resolver is already registered')) {
+        throw new Error('file-upload 复核失败——不写回')
+      }
+      return s
+    },
+  },
 }
 
 // ── 登记表 ↔ 实现 交叉校验（漂移即拒）──
