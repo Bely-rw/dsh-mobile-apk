@@ -304,7 +304,14 @@ foreach ($abi in @('arm64', 'x86_64')) {
             if (Test-Path (Join-Path $src "lib\client.js")) {
                 $dst = Join-Path $degradeStaged $leaf
                 Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
-                robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+                if (Get-Command robocopy -ErrorAction SilentlyContinue) {
+                    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+                } else {
+                    # 非 Windows runner 无 robocopy（GitHub ubuntu-latest 实测：The term 'robocopy' is not
+                    # recognized）——发布链要在 Linux 上跑同一条链，故给跨平台等价拷贝（内容等价，含子目录）。
+                    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+                    Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+                }
                 node (Join-Path $Root "scripts\check-browser-syntax-floor.mjs") --degrade --stage $dst 2>&1
                 if ($LASTEXITCODE -ne 0) { $degradeFailDetail = "注入段浏览器语法降级失败（$leaf）" }
                 elseif ($leaf -eq 'undo-degraded') { $undoDeg = $dst }
