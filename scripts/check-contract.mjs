@@ -48,6 +48,17 @@ const skip = (msg) => {
   if (REQUIRE) issues.push('SKIP: ' + msg)
   console.log('  SKIP(#' + skipped + ')  ' + msg + (REQUIRE ? ' —— --require 档不得 SKIP' : ''))
 }
+/** 自包含树（apk 仓单人检出）里，**协调仓独有**的输入合法缺席。
+ *  此时 SKIP 不计入 --require，但必须显式打印原因并单独计数——与 check-release-gates 的
+ *  「apk 树不在场 ⇒ 显式 SKIP、绝不回落自证」同一纪律：判据只在**它能看见输入**的那一侧负责。
+ *  真实 run 36359806116 就是这条：apk 自包含树没有 docs/UPSTREAM-CONTRACT.md，
+ *  而链以 --require 跑 ⇒ 合法缺席被当成判红，整链在最后一段 §9 停下。 */
+const APK_SELF_CONTAINED = !existsSync(join(root, 'dsh-mobile-apk'))
+let softSkipped = 0
+const softSkip = (msg) => {
+  softSkipped += 1
+  console.log('  SKIP(*)  ' + msg + ' —— 自包含树合法缺席，不计入 --require（协调仓布局下必须真跑）')
+}
 
 /* --self-test：新加的每一条判据都要「故意造反例必判红」的自证（AGENTS 反证要求）。
  * 反例走临时副本（--contract / --profile），不改仓库文件——半途被杀也不会留下一棵脏树。 */
@@ -821,7 +832,10 @@ console.log('== 9. 人读契约文档与登记表同源（G-8：它会误导开�
    * 禁用行名单里留着早已启用的 ui-layout、继承面写着上游已删的 runArgv/startArgv。
    * 现在它是「只讲语义」的文档，但仍会误导 ⇒ 至少把它与登记表的可锚定字段钉死：基线字样 + 非权威源声明。 */
   const docPath = DOC_PATH
-  if (!existsSync(docPath)) skip('docs/UPSTREAM-CONTRACT.md 不在场（apk 自包含树合法缺席）—— 文档同源性未执行')
+  if (!existsSync(docPath)) {
+    if (APK_SELF_CONTAINED) softSkip('docs/UPSTREAM-CONTRACT.md 不在场（协调仓独有文档）—— 文档同源性未执行')
+    else skip('docs/UPSTREAM-CONTRACT.md 不在场 —— 文档同源性未执行（协调仓布局下必须存在）')
+  }
   else {
     const doc = readFileSync(docPath, 'utf8')
     if (!doc.includes(contract.baseline)) {
