@@ -696,6 +696,20 @@ jobs:
           # 因为 keytool -list -v 的文本既会本地化、新版 JDK 上还可能直接抛异常。
           test -f keystore/debug.keystore
 
+      - name: 单元测试门禁前置（:app:testDebugUnitTest 全量）
+        shell: bash
+        run: |
+          set -e
+          # 为什么必须在这里跑：APK 步调用的 scripts/build-apk.mjs 会执行聚合门禁集，其中之一是
+          # check-kotlin-test-count.mjs，它**按设计**在没有 gradle 结果时判红——拒绝「一个用例都没跑」
+          # 冒充通过（上游 0.14.2-fx-2 的 G.0 ⑤ 正是这条结构性脱节：CI 只跑 compileDebugKotlin、
+          # 从不跑 Kotlin 单测也从不调该计数门禁，于是「测试类被删」时 CI 仍绿）。
+          # 修法随上游合并而来时去掉了 --allow-missing，故**调用方必须先产出结果**；本地链与
+          # 发布链（release.yml）都已在 APK 步之前跑本步，来源链此前漏了它，实测必死在该门禁上。
+          # 结果目录 app/build/test-results/testDebugUnitTest 会被后续门禁就地读取并比对基线。
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
+
       - name: Build ARM64 APK
         shell: bash
         run: |

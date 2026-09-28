@@ -1128,7 +1128,16 @@
     **真因**：来源链做的是**完整 `pnpm deploy`**，而 CI 跑在 **Linux** 上 ⇒ pnpm 按**宿主平台**解析 `optionalDependencies`，把 `linux-x64` / `linux-arm64` 的原生载荷一并装进引擎树；**Android 是 bionic**，这些 glibc/musl 二进制在设备上永不加载。正常链没有这个问题：它从**设备基座**出发，基座上本就没有这些 Linux 载荷——所以「正常链有没有」是一条**已被设备验证过**的可靠判据（实测这批包在正常链快照里**一个都没有**）。
     **为什么之前没被发现**：`check-android-native-runtime-packages.mjs` 早就**看见**了它们，但定性是「跨平台部署的**外平台 payload**，不视为 Android 绑定」——**只记录不拦截**；而「快照内每个包都要有来源」这条反向面判据（`check-engine-overlay.mjs` 里有）**在来源链换门禁时没有对应实现**（见坑 199 的未闭合项），于是没有任何判据要求它们离开。**记账 ≠ 防线。**
     **修法**：`snapshot-config/slim.json` 新增 `platformDeadPackages`（21 条，逐条带平台与理由），`build-snapshot-013.mjs` 在 `engineStalePackages` 之后施加。删除面覆盖 pnpm 布局下实测在场的三处：`.pnpm/<enc>@<ver>*`（实体与大文件）、`.pnpm/node_modules/<pkg>`（提升副本）、顶层物化副本。守卫沿用 `engineStalePackages` 的形态：**命中的包若已在 overlay 登记表内即中止**（防把真依赖删掉）。
-    **判据为什么是「平台」而不是「在不在登记表」**：`@deepseek-ai/libreoffice-kit-wasm` 体积同样可观（145 MB）但它是 **WASM**——平台无关、设备上可能真能用，**必须保留**；而 codex / claude-agent-sdk / cua-driver / sharp-linux / koffi-linux / ripgrep-linux / ubjs-node / node-addon-*-linux 这些是 glibc 或 musl 的 ELF，Android 上加载不了。两者都「不在登记表」，若共用一个键就会把前者一起删掉——故分设两键、各自写明理由。
+    **判据的两次修正（本节最该带走的东西）**：本条的判据先后错过两次，都记在这里以免重蹈。
+    **第一版：按名字。**「包名里有 `linux` 就删」——错。`@openai/codex` 与 `@vscode/ripgrep-linux-*` 是 **`-musl` 目标的静态 ELF**（实测：无 `PT_INTERP`、`GLIBC_2.*` 与 `libc.so.6` 符号各 0 命中），**Android 内核就是 Linux，静态二进制能跑**；而 `claude`、`libcua_driver_sdk.so`、`libonnxruntime.so`、`libvips-cpp.so`、`koffi.node` 才是有 `INTERP=/lib/ld-linux-aarch64.so.1` / GLIBC 符号的 glibc 件，**确实死**。判据应为**实测 ELF 的 `PT_INTERP` + GLIBC 符号**，不是名字。
+    **第二版：按「与作者发布保持一致」。** 也错——**他的发布里同时含退役件与个人插件**：`dsh-attachment-formats`（PDF/Office/OCR 过渡插件，**0.13.7 用户已拍板退役**，注释原话「包体仍在基座快照内，不再装载即等于退役」）连同其 80 个依赖（mammoth/exceljs/pdfjs-dist/tesseract.js/jszip…）躺在基座里；另有 `dsh-code-diff-viewer`、`dsh-find-plugin`（他从市场装的私人插件，见 profile 的 `.package-map.json`）。**「他有我无」不构成缺口，「他有」也不构成依据。**
+    **第三版（最终）：判据是「不对称」的，两个方向不能互推。**
+    - **删掉「他的发布里也没有」的 ⇒ 安全。** 他的发布是**设备验证过的运行配置**：「没有这些也能跑」是实测结论，比任何静态分析都直接。本条剔除的平台件正属于这一类。ELF 实测（第一版）回答的是「**能不能跑**」，回答不了「**该不该有**」——`@openai/codex` 确实能跑（静态），但删它仍然安全，因为**他的发布里同样没有它而应用照跑**。
+    - **补上「他的发布里有」的 ⇒ 不成立。** 他的基座里混着**退役件**与**个人插件**（见第二版），「他有」不构成「我们该有」的依据。
+    我此前正是用后一个方向的证据去否定前一个方向，才来回翻。**结论：按「他也没有」做减法是对的（本条全 21 条照删）；按「他有」做加法是错的（那 83 个包不补）。**
+    另注：profile 的 `node_modules` 本就是**给后来安装的树外插件**准备的（上游 `profile.ts`：「the hoisted linker gives **out-of-tree plugins** a flat node_modules」；`pnpm-workspace.yaml` 里 `nodeLinker: hoisted`）——故「镜像里没带、用户后续自己装」是**设计内的路径**，不是能力缺失。
+    **权威清单仍是最终依据**：某条该不该删，先看 `profile-web.cordis.patch.yml` / `engine-overlay.json` 的装配行与 `slim.json` 的退役记录；产物对比只是线索。本键**分设两处**：`libreoffice-kit-wasm`（145 MB）体积可观但是 **WASM、平台无关**，必须保留；平台件另立 `platformDeadPackages`、逐条写明平台与理由。
+    **方法教训（本轮付了两次假警报的代价）**：拿两份产物做「他有我无」对比时，**基座的偶然内容会一直污染结论**——退役件、个人插件、安装残留都在里面。必须先查权威清单再下结论。三次对比里**只有一次是真命中**（`usr/lib/node_modules` 我们 1614 MB vs 他 189 MB）；另两次（`home/.dsh/profiles` 我们小 101 MB、83 个包「只在他们有」）**全是上面那两类**。
     **复验证据（静态）**：用真实快照清单模拟匹配——715 个 store 目录中命中 23 个，**21/21 个包全覆盖**（另两处删除面亦确认在场）。量化：将剔除 **1210.2 MB**（未压缩），快照 2017 MB → 约 807 MB（降 60%）。
     **复验证据（远程 run 36363497221 / 36363504676 实测）**：**精简完全生效**——`归档 snapshot.tar.xz (158.3 MB)`，即 **483.5 MB → 158.3 MB**，与正常链的 153 MB 同量级；快照步骤耗时 **9.8 分钟 → 约 2.3 分钟**。
     **⚠️ 同批被安全网拦下（这正是它该有的行为）**：两条 run 都在 `Build runtime snapshot` 判红 ——
@@ -1136,3 +1145,14 @@
     定位时**已经看到**这条依赖（「被依赖 1 处，来自 `@deepseek-ai/dsh-subagent-codex`」），但当时判断「它是 musl ELF、Android 上本来就 exec 不了，删与不删功能等价」——**功能判断对，声明仍在**，所以 `check-dsh-runtime-dependencies.mjs` 判红有理。注意它与此前那几个不同：`@openai/codex` 的**包名是中性的**（不像 `-linux-x64` 那样带平台后缀），只是**内容**是 Linux 二进制。
     **修法**：让检查器认识「刻意缺席」——读同一个 `slim.json` 的 `platformDeadPackages`，命中的缺依赖**不计 failure 而单独计数**（`deliberatelyAbsentCount` / `deliberatelyAbsent[]` 进报告）。三条理由：① 该二进制在设备上本来就 exec 不了，删与不删功能等价；② **正常链的设备验证快照里同样没有它**，而正常链跑得好好的；③ 清单与判据自洽——**谁把某条从 `platformDeadPackages` 删掉，这里立刻恢复判红**。「放过不等于静默」：刻意缺席单独计数列进报告，外部复核方看得到。
     **未闭合**：`@deepseek-ai/libreoffice-kit-wasm`（145 MB）**刻意保留**——它是 WASM，「正常链没有」不足以定它的死（正常链的基座是 0.12.5-fx-1 时代抓的，该包可能只是当时还不存在）。要动它必须先做一次真机文档转换验证。另：本批未做真机启动验证，`@openai/codex` 的缺席对 `dsh-subagent-codex` 子智能体的实际表现（报错形态是否可接受）须由设备确认。
+
+211. **来源链漏了聚合门禁的前置：调 `build-apk.mjs` 却不跑 Kotlin 单测，必然死在那条门禁上（2026-09-28，run 36365082160）**：
+    **现象**：平台死重剔除修好后，来源链**第一次走到 APK 步**（此前都在快照步骤就断了，正是这一点掩盖了本条），随即判红：
+    ```
+    CHECK-KOTLIN-TEST-COUNT FAILED：缺 Kotlin 单测结果 …/app/build/test-results/testDebugUnitTest
+      先跑 ./gradlew :app:testDebugUnitTest；无 gradle 的环境用 --allow-missing 显式 SKIP。
+    ```
+    **真因**：`build-apk.mjs` 是各链共用的编排器，会执行聚合门禁集，其中 `check-kotlin-test-count.mjs` **按设计**在没有 gradle 结果时判红（拒绝「一个用例都没跑」冒充通过）。上游 0.14.2-fx-2 的 G.0 ⑤ 修掉了这条结构性脱节——**去掉了 `--allow-missing`**，改为「**调用方必须先产出结果**」。本地链与发布链（`release.yml:193`）都已在 APK 步之前跑 `./gradlew :app:testDebugUnitTest`，**唯独来源链漏了这一步**。
+    **为什么此前从未暴露**：来源链的失败点一直停在更早的步骤（凭据、锁文件、市场补丁锚点、平台死重…），**从没走到 APK 步**——**一个晚出现的门禁会被早出现的失败长期遮住**。而这与坑 199 同源：**新链必须逐条满足它所调用的共用编排器的全部前置，而这件事没有任何判据在守**（`check-release-gates` 只断言「声明集合被调用」，不断言「调用的前置已满足」）。
+    **修法**：`build-apk-source.yml` 在 APK 步之前补「单元测试门禁前置（`:app:testDebugUnitTest` 全量）」步，与 `release.yml` 同做法；结果目录 `app/build/test-results/testDebugUnitTest` 由后续门禁就地读取并比对基线。
+    **复验证据**：同一次 run 里它前面的门禁（`check-snapshot-builder-output`、`check-build-parallel-cap`）均 PASS，说明链路其余部分健康；本步补上后须由下一次远程 run 验证能否走完 APK 步。
