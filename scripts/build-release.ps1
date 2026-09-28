@@ -193,7 +193,14 @@ foreach ($abi in @(@{n='arm64-v8a'; f=$armSnap}, @{n='x86_64'; f=$x86Snap})) {
   node (Join-Path $root "scripts\check-snapshot-fingerprint.mjs") --require
   if ($LASTEXITCODE -ne 0) { throw ("快照指纹对账失败（" + $abi.n + "）：tar 与声明值不一致，中止组装") }
   Push-Location (Join-Path $root "dsh-mobile-apk")
-  & $Gradle assembleDebug --offline --no-daemon --rerun-tasks 2>$null | Out-Null
+  # 0.14.2-fx-2 修（本机实测）：不得用系统 gradle + --offline 组装发布包 ——
+  # AndroidX 产物不在系统 gradle 的依赖缓存里，离线档下 arm64-v8a/x86_64 必失败：
+  #   "No cached version of androidx.webkit:webkit:1.12.1 available for offline mode"（22s 即 break）
+  # 而 build-apk-013.ps1 走项目 wrapper、不带 --offline，同一棵工作树 BUILD SUCCESSFUL。
+  # 两条链必须同一条调用口径，否则「本地发布链」只在「开发链」成功过的那台机器上偶然可用。
+  # -PversionNameSuffix 与开发链同参；--rerun-tasks 已去（产物由 gradle 缓存裁决，与开发链一致）。
+  if ($Gradle -eq "gradle") { $Gradle = ".\gradlew.bat" }
+  & $Gradle :app:assembleDebug --no-daemon -PversionNameSuffix="$Version" 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { throw ("APK build failed (" + $abi.n + ")") }
   Pop-Location
   $apk = Get-ChildItem (Join-Path $root "dsh-mobile-apk\app\build\outputs\apk\debug\app-debug.apk") | Select-Object -First 1

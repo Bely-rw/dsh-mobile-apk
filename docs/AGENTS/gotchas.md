@@ -1189,4 +1189,22 @@
     **真因**：**macOS 的 APFS 默认大小写不敏感** ⇒ 上述两组目录在本地被**合并成一个** ⇒ 落在 `LICENSES/` 下的文件被 walk 成 `licenses/…` ⇒ manifest 里的**路径字符串**与 Linux 侧不同 ⇒ 摘要不同。**文件数不变**（合并的是目录、且无文件名冲突），这正是「三项计数全等却摘要不同」的来源。
     **结论与影响**：**链是对的，本地复算是错的**。公布的归一化摘要**确实可被外部复核**，但复算者必须在**大小写敏感的文件系统**上解包——Linux 天然满足；macOS 需挂在大小写敏感的卷上（或直接以容器/Linux 环境复算）。**同一个坑在本会话里咬了两次**（最早那次链侧 vs 我侧的摘要差异也是它）。
     **建议的复算姿势**：在 Linux（或 `--case-sensitive` 卷）上 `unzip -p <APK> assets/snapshot.tar.xz | tar -xJ`，再跑 `normalize-snapshot.mjs`；本仓的 workflow 步骤「Snapshot semantic normalization digest」即为该过程的可执行版本。
+214. **两条链的 gradle 调用口径不同 ⇒ 「本地发布链」组装必失败，而开发链全绿**（2026-09-28，本机 + 5556 实测）
+    **现象**：`pwsh scripts/build-release.ps1` 走到 APK 步抛 `APK build failed (arm64-v8a)`，而**日志里没有 gradle 报错**
+    （该行 `2>$null | Out-Null` 把输出整个丢掉，只剩 exit code）。同一棵工作树、同一份快照，
+    `pwsh scripts/build-apk-013.ps1 -Suffix ""` 两个 ABI 都 BUILD SUCCESSFUL。
+    **真因**：两条链调用口径不同——
+      · 开发链：项目 wrapper、**不带** `--offline`（`.\gradlew :app:assembleDebug --no-daemon -PversionNameSuffix=…`）；
+      · 发布链：**系统 gradle**（`D:\tools\gradle-8.10.2`）+ `--offline --rerun-tasks`。
+      系统 gradle 的依赖缓存里没有本工程的 AndroidX 产物，离线档下直接判死：
+      `No cached version of androidx.webkit:webkit:1.12.1 available for offline mode`（22s 失败；core-ktx / dynamicanimation 等同因，共 7 条）。
+    **定位手段（记下来）**：把 gradle 输出丢进 `$null` 的脚本，只能得到「失败」两个字。手动复跑同一条命令并保留输出才拿到真因：
+      `cd dsh-mobile-apk; gradle assembleDebug --offline --no-daemon --rerun-tasks`。
+    **修法**：`build-release.ps1` 与开发链同口径——`$Gradle` 缺省时改用 `.\gradlew.bat`，命令改为
+      `:app:assembleDebug --no-daemon -PversionNameSuffix="$Version"`（去掉 `--offline` 与 `--rerun-tasks`）。
+    **复验**：同机 `.\gradlew.bat :app:assembleDebug --no-daemon -PversionNameSuffix=""` → BUILD SUCCESSFUL in 37s；
+      随后整条 `build-release.ps1` 组装通过（APK 双 ABI + 快照/插件/清单齐备）。
+    **同型提醒**：凡「两条链各写一份调用」的地方，都要问「是不是同一条命令、同一份缓存口径」。
+      **开发链绿 ≠ 发布链绿**——这里的差别只有一个 `--offline`。
+
 
