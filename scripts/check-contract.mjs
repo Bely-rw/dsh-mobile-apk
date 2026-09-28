@@ -48,6 +48,17 @@ const skip = (msg) => {
   if (REQUIRE) issues.push('SKIP: ' + msg)
   console.log('  SKIP(#' + skipped + ')  ' + msg + (REQUIRE ? ' —— --require 档不得 SKIP' : ''))
 }
+/** 自包含树（apk 仓单人检出）里，**协调仓独有**的输入合法缺席。
+ *  此时 SKIP 不计入 --require，但必须显式打印原因并单独计数——与 check-release-gates 的
+ *  「apk 树不在场 ⇒ 显式 SKIP、绝不回落自证」同一纪律：判据只在**它能看见输入**的那一侧负责。
+ *  真实 run 36359806116 就是这条：apk 自包含树没有 docs/UPSTREAM-CONTRACT.md，
+ *  而链以 --require 跑 ⇒ 合法缺席被当成判红，整链在最后一段 §9 停下。 */
+const APK_SELF_CONTAINED = !existsSync(join(root, 'dsh-mobile-apk'))
+let softSkipped = 0
+const softSkip = (msg) => {
+  softSkipped += 1
+  console.log('  SKIP(*)  ' + msg + ' —— 自包含树合法缺席，不计入 --require（协调仓布局下必须真跑）')
+}
 
 /* --self-test：新加的每一条判据都要「故意造反例必判红」的自证（AGENTS 反证要求）。
  * 反例走临时副本（--contract / --profile），不改仓库文件——半途被杀也不会留下一棵脏树。 */
@@ -747,7 +758,7 @@ console.log('== 8. 上游行面不变量（G-4：我们禁用的行必须还在�
        * —— 0.14.1 的 client-hmr 与 rc.1 的 hmr/dsh-hmr 换名就是这个形态。 */
       const ourDisabled = ourRows.filter(r => !r.inInsert && r.disabled)
       const ghost = ourDisabled.filter(r => !upRows.has(r.id))
-      if (ourDisabled.length === 0) fail('profile patch 解析出 0 条 disabled 顶层行——与现网形态不符（实测应为 6 条），判红不放行')
+      if (ourDisabled.length === 0) fail('profile patch 解析出 0 条 disabled 顶层行——与现网形态不符（0.14.2-fx-2 起实测为 6 条：agent-default-model 改走同 id config 覆盖后由 7 减为 6），判红不放行')
       else if (ghost.length > 0) {
         fail('profile patch 禁用了上游不存在的行（禁用即空指向，上游那条真行照常挂载）: '
           + ghost.map(r => r.id).join(', ') + ' —— 上游改名/删除时必然出现；请核对新行 id 后改 profile，别删了这条 YAML 当没事发生')
@@ -821,7 +832,10 @@ console.log('== 9. 人读契约文档与登记表同源（G-8：它会误导开�
    * 禁用行名单里留着早已启用的 ui-layout、继承面写着上游已删的 runArgv/startArgv。
    * 现在它是「只讲语义」的文档，但仍会误导 ⇒ 至少把它与登记表的可锚定字段钉死：基线字样 + 非权威源声明。 */
   const docPath = DOC_PATH
-  if (!existsSync(docPath)) skip('docs/UPSTREAM-CONTRACT.md 不在场（apk 自包含树合法缺席）—— 文档同源性未执行')
+  if (!existsSync(docPath)) {
+    if (APK_SELF_CONTAINED) softSkip('docs/UPSTREAM-CONTRACT.md 不在场（协调仓独有文档）—— 文档同源性未执行')
+    else skip('docs/UPSTREAM-CONTRACT.md 不在场 —— 文档同源性未执行（协调仓布局下必须存在）')
+  }
   else {
     const doc = readFileSync(docPath, 'utf8')
     if (!doc.includes(contract.baseline)) {

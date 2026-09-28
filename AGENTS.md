@@ -32,6 +32,8 @@ DeepSeek Harness 的**安卓壳应用**（包名 `com.dsharnessmobile.shell`）�
 # 在【协调仓根】执行（壳侧不单独构建）
 pwsh -File scripts\build-apk-013.ps1 -Suffix ""   # 双 ABI 全链，门禁失败即拒打包
 pwsh -File scripts\build-apk-013.ps1 -Fast         # dev 档：单 ABI x86_64 + preset 1（禁发布）
+# 发布包不经本地：由 GitHub Action 一键链产出（workflow_dispatch 传 version + notes）——
+# gh workflow run release -R kelai141/dsh-mobile-apk -F version=<版本> -F notes=@release/v<版本>/notes.md
 
 # 装机（<serial> 用 adb devices 查；arm64 真机必须用 arm64 产物）
 adb -s <serial> install -r -t out\v<版本>\dsh-mobile-apk-v<版本>-arm64.apk

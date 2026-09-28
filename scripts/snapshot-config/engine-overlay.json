@@ -352,6 +352,8 @@
   "vendorTop": {
     "@anthropic-ai/sdk": "0.123.0",
     "@deepseek-ai/cosmokit": "1.8.5",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/core": "2.0.0",
     "@earendil-works/pi-telemetry": "0.85.1",
     "@sec-ant/readable-stream": "0.4.1",
     "@sindresorhus/merge-streams": "4.0.0",

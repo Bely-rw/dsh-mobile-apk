@@ -51,7 +51,10 @@ const GATES = [
   // #222：所有 mobile-owned /api exact/prefix 路由必须在登记表中，并有本地 auth guard 或窄公开白名单。
   { script: 'check-api-route-auth.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
   { script: 'check-snapshot-fingerprint.mjs', ciApk: true, ciCoord: false, needsSnapshot: true },
-  { script: 'check-tool-output-schema.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
+  // G.3（0.14.2-fx-2）下沉：它的输入是 plugins/*/lib（源码面产物），**不是发布 tar** ⇒ 留在发布链上
+  // 只是把 43.3s 重复付一遍（apk CI 已真跑，见 pr-gate.yml「工具 output.schema」步）。releaseSink:false
+  // 只把它从**发布链的 --run 段**移出，声明仍在（不删门禁），由 apk CI 承担执行。
+  { script: 'check-tool-output-schema.mjs', ciApk: true, ciCoord: false, needsSnapshot: false, releaseSink: false, sink: 'apk-ci' },
   { script: 'check-protocol-v2.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
   { script: 'check-control-ops.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
   // 「会读设备屏的 op」两份清单的跨语言对等（0.14.1）：引擎 `REAL_SCREEN_CONTROL_OPS` 与壳侧
@@ -98,7 +101,9 @@ const GATES = [
   // 路径调用**（不在 GATES、不在接线断言、两条链与两仓 CI 均无引用）——7 个插件的 34 个测试文件
   // 全部没人跑，「已新增该门禁」的声明与事实不符。此处接入声明集合即同时被两条构建链与两仓 CI
   // 覆盖（check-gate-skips.mjs 会断言声明集合被两条链逐项调用）。离线可跑，只需 plugins/*/lib。
-  { script: 'check-plugin-tests.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
+  // G.3（0.14.2-fx-2）下沉：7 个插件的单测（103.1s，是全场最贵的一项）输入同样是 plugins/*/lib，
+  // 与发布 tar 无关；apk CI 已真跑（pr-gate.yml「插件单测」步）。移出发布链 --run 段，声明保留。
+  { script: 'check-plugin-tests.mjs', ciApk: true, ciCoord: false, needsSnapshot: false, releaseSink: false, sink: 'apk-ci' },
   // 冷启动预算 C1~C6（0.14.1 块F P0-2）：把口径从「LISTEN 达标」换成「首个 HTTP 响应 + 无 >2s
   // 同步块」——只判 LISTEN 会系统性假绿（设备实测 LISTEN 2981ms 达标而 compose 2795ms 挡住首个响应）。
   // 判据全部为数值算术断言 + 自带反向对照（--self-test）。
@@ -131,17 +136,51 @@ const GATES = [
   // 本门禁逐类比对基线（只许升）+ 断言无缺席 + 结果新鲜，抓「防线被删却仍然绿」。
   // ci:false 是刻意的：云端 CI 无 gradle 产物环境，故本项由本地链/发布链跑；
   // 无结果时显式 SKIP(#1) 计数（不计入绿），绝不冒充通过。
-  { script: 'check-kotlin-test-count.mjs', ciApk: false, ciCoord: false, needsSnapshot: false },
+  // G.0 ⑤ 结构性脱节 + G.3 下沉（0.14.2-fx-2）：apk CI 此前跑 testDebugUnitTest 却**从不**调本门禁，
+  // 而云端链传 --allow-missing ⇒ 「测试类被删」时 CI 仍绿。本轮把它挂到 apk CI 的 testDebugUnitTest
+  // **之后**（同 job，结果目录已就位、无 SKIP），并去掉 build-apk.mjs 的 --allow-missing。
+  // 发布链不再 --run 它（51.1s）：发布产物不含测试结果，判据在 CI 才是真检。
+  { script: 'check-kotlin-test-count.mjs', ciApk: false, ciCoord: false, needsSnapshot: false, releaseSink: false, sink: 'apk-ci' },
   // 执行地图覆盖与锚点（0.14.2 D7）：输入全在 apk 仓（app/src、plugins、EXECUTION-MAP.md），
   // 故归属 apk 侧 CI + 两条链。**此前它只存在于 apk 仓 scripts/ 且只被 apk CI 调用**：
   // 本地链与发布链的声明集里零命中 —— 即「改代码跑了 check-code-map 才算数」这条约定
   // 在两条真正出包/发版的路径上都没有执行者，全靠人记得手跑。
   // needsSnapshot=false：它读的是工作树与文档，不需要快照。
   { script: 'check-code-map.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
+  // MCP client 运行期依赖闭包（0.14.2-fx-2 H-1）：真实用户诊断包 engine.log:138 六世代全崩在
+  // `Cannot find package '@modelcontextprotocol/client'`——它**不在我们装配的行面上**（用户自己挂的
+  // entry），故 check-engine-overlay 的正向闭包结构性看不见它。判据 = 宿主包运行期依赖的**闭包**
+  // 在快照内全部可解析；上游再换包名/加依赖即判红。输入在快照面 ⇒ needsSnapshot=true。
+  { script: 'check-mcp-client-deps.mjs', ciApk: false, ciCoord: false, needsSnapshot: true },
 ]
 const CI_COORD_GATES = GATES.filter((g) => g.ciCoord).map((g) => g.script)
 const CI_APK_GATES = GATES.filter((g) => g.ciApk).map((g) => g.script)
 const ALL_GATES = GATES.map((g) => g.script)
+// ── G.3（0.14.2-fx-2）发布路径最小充分集 ──────────────────────────────────────
+// 用户原话：「优化所有构建链的校验链路削减无必要环节避免浪费性能资源（现在的校验比命还长，
+// 打包都用不了那么久）」。G.0 实测：发布链 --run 的冷跑合计 322.2s，其中若干条门禁的**输入根本不是
+// 发布 tar**（plugins/*/lib、Kotlin 测试结果），把它们的耗时重复付在发布路径上并不增加任何判别力
+// ——它们的真检点在 CI（那里才有对应输入）。
+//
+// 下沉规则（**不删门禁**，只改「谁来跑」）：
+//   · releaseSink !== false ⇒ 发布链 --run 段执行（默认）；
+//   · releaseSink === false ⇒ 从发布链 --run 段移出，**必须在 sink 字段写明接管方**，
+//     且下方断言会核验该接管方真的调用了它（否则就是「移出去就没人跑」= 静默降级防线）。
+// 声明集合本身不变（33 项）：check-gate-skips 仍逐项要求两条构建链调用，故「移出发布段」不等于「移出防线」。
+const RELEASE_GATES = GATES.filter((g) => g.releaseSink !== false).map((g) => g.script)
+const RELEASE_EXCLUDED = GATES.filter((g) => g.releaseSink === false)
+/**
+ * sink 类型表（下沉门的接管方在哪、是否依赖 apk 树）。
+ *   apkSide=true  ⇒ 路径相对 **apk 仓树根**解析（协调仓布局下可能整树缺席 ⇒ 降级 SKIP）
+ *   needsApkTree  ⇒ 该 sink 的证据只存在于 apk 仓，apk 树缺席时不得判红、也不得回落取证
+ */
+const SINK_KINDS = {
+  'apk-ci': { rel: join('.github', 'workflows', 'pr-gate.yml'), apkSide: true, needsApkTree: true },
+  'coord-ci': { rel: join('.github', 'workflows', 'pr-gate.yml'), apkSide: false, needsApkTree: false },
+  'cloud-chain': { rel: join('scripts', 'build-apk.mjs'), apkSide: true, needsApkTree: true },
+  'local-chain': { rel: join('scripts', 'build-apk-013.ps1'), apkSide: false, needsApkTree: false },
+}
+
 /** 来源审计链（`.github/workflows/build-apk-source.yml`）的**专有**门禁。
  *  它们**刻意不进 GATES**：`ALL_GATES = GATES.map(...)`，一旦进册就会要求本地链与云端链
  *  也调用它们，而那两条链不跑来源链（口径是「只跑在拥有其输入的那一侧」，第三条链同理）。
@@ -159,8 +198,11 @@ if (argv.includes('--list')) {
   for (const g of GATES) {
     // 真检档标注：让「怎么真验」有唯一入口，不靠人记（F 门禁的真数据路径见文首注释与详档 §5.1）。
     const note = g.script === 'check-boot-budget.mjs' ? '  [真检需 --require-real + 设备产物；见详档 §5.1]' : ''
-    console.log(g.script.padEnd(34) + (g.ci ? 'CI+构建' : '仅构建/发布') + (g.needsSnapshot ? ' 需要快照' : '') + note)
+    // G.3：下沉门在清单里显式标出「不进发布 --run 段」及其接管方，避免「看着在清单里其实没人跑」。
+    const sink = g.releaseSink === false ? '  [下沉->' + g.sink + '；不进发布 --run]' : ''
+    console.log(g.script.padEnd(34) + (g.ci ? 'CI+构建' : '仅构建/发布') + (g.needsSnapshot ? ' 需要快照' : '') + note + sink)
   }
+  console.log('-- 发布链 --run 段实际执行: ' + RELEASE_GATES.length + ' / 声明 ' + GATES.length + ' 项；下沉 ' + RELEASE_EXCLUDED.length + ' 项')
   process.exit(0)
 }
 
@@ -201,15 +243,42 @@ const POSITIONS = [
 const coordLayout = existsSync(join(ROOT, 'dsh-mobile-apk'))
 /** apk 自包含布局判定：只有 apk 仓有 app/src/main/AndroidManifest.xml（协调仓没有）。 */
 const apkSelfContained = existsSync(join(ROOT, 'app', 'src', 'main', 'AndroidManifest.xml'))
+/**
+ * apk 仓树根（显式解析，**不经过 resolveRel 的回落候选**）。
+ *
+ * 为什么必须显式：`resolveRel('dsh-mobile-apk/.github/...')` 在协调仓布局下会回落到
+ * `.github/workflows/pr-gate.yml`（**协调仓自己的** workflow）——用它去满足 apk 侧集合是**自我循环**，
+ * 断言会恒真。apk 侧证据只能来自 apk 仓。
+ *   · apk 自包含布局（ROOT 就是 apk 仓）      ⇒ apk 树根 = ROOT；
+ *   · 协调仓布局                            ⇒ apk 树根 = <root>/dsh-mobile-apk（CI 里常整个缺席）。
+ * `--apk-tree <dir>` 供「两方向实测」把对端指到受控位置（不存在 ⇒ 验降级；指向改过的副本 ⇒ 验判别力）。
+ */
+const apkTreeArg = argOf('apk-tree')
+const APK_TREE = apkSelfContained ? ROOT : (apkTreeArg ? resolve(apkTreeArg) : join(ROOT, 'dsh-mobile-apk'))
+/** apk 树是否在场：以 apk 仓自己的 pr-gate workflow 为锚（协调仓布局缺席时为 false）。 */
+const apkTreePresent = existsSync(join(APK_TREE, '.github', 'workflows', 'pr-gate.yml'))
+/**
+ * 布局降级 SKIP 计数器（静态档）。
+ *
+ * 为什么要有它：协调仓是**独立布局**，`dsh-mobile-apk/` 是独立 git 仓且在协调仓里被 gitignore
+ * ⇒ 协调仓 CI 的检出里**根本没有 apk 树**。凡「需要 apk 树才能核验」的断言，在该布局下都不能硬判红，
+ * 必须**显式 SKIP 并计数**（可见、不冒充绿）；且**不得**回落到协调仓自己的同名文件去「找到」证据
+ * ——那会让断言恒真、失去判别力（CI 实测：PR #68 因为漏了这条降级而必红）。
+ */
+let staticSkipTotal = 0
+const skipStatic = (what, why) => {
+  staticSkipTotal += 1
+  console.log('SKIP(#' + staticSkipTotal + ')  ' + what + '：' + why)
+}
 for (const pos of POSITIONS) {
   if (pos.onlyWithCoordLayout && !coordLayout) {
-    console.log('SKIP(#1) ' + pos.id + ' 门禁集：本布局无协调仓侧 workflow（apk 自包含树）；跨仓面由链上守')
+    skipStatic(pos.id + ' 门禁集', '本布局无协调仓侧 workflow（apk 自包含树）；跨仓面由链上守')
     continue
   }
-  if (pos.needsApkTree && !apkSelfContained && !existsSync(join(ROOT, 'dsh-mobile-apk', '.github', 'workflows', 'pr-gate.yml'))) {
+  if (pos.needsApkTree && !apkTreePresent) {
     // 协调仓布局且 apk 树不在场：`.github/workflows/pr-gate.yml` 会解析到**本仓自己的** workflow，
     // 拿它去满足 ciApk 集合是自我循环 ⇒ 显式 SKIP 并计数（apk 侧由 apk 仓 CI 自检，链上另有全量）。
-    console.log('SKIP(#1) ' + pos.id + ' 门禁集：协调仓布局下 apk 树不在场（自包含 CI）')
+    skipStatic(pos.id + ' 门禁集', '协调仓布局下 apk 树不在场（自包含 CI）')
     continue
   }
   const text = readOrFail(pos.file)
@@ -287,6 +356,47 @@ for (const f of ['scripts/build-release.ps1', 'scripts/build-apk-013.ps1']) {
     broken.join(' | '))
 }
 
+// ── 3a-2. 下沉门的接管方断言（G.3，0.14.2-fx-2）─────────────────────────────
+// 移出发布链 --run 段的门禁**必须**在其声明的 sink 里被真实调用，否则就是「防线静默消失」。
+// 这是下沉动作的安全绳：任何 releaseSink:false 项若没人接管，本断言立刻判红。
+//
+// 【协调仓布局降级（CI 实修，PR #68 事故）】本断言第一版漏了布局降级：协调仓是**独立布局**，
+// `dsh-mobile-apk/` 是独立 git 仓且在协调仓被 gitignore ⇒ 协调仓 CI 检出里没有 apk 树，而
+// apk-ci / cloud-chain 两类 sink 的证据**只在 apk 仓里**。第一版直接硬判红（CI 三条 FAIL）。
+// 正确纪律与上面 `ci-apk` 位置断言完全一致：
+//   · apk 树不在场 ⇒ **显式 SKIP 并计数**（可见、不冒充绿）；
+//   · **绝不**回落到协调仓自己的同名文件去「找到」调用点——那是自我循环，断言会恒真、失去判别力
+//     （协调仓的 workflow 满足不了「apk 侧 CI 接管」这个命题）。
+// apk 树在场时（本地 / apk 自包含布局 / apk 仓 CI）断言**保持全判别力**，会真的判红。
+{
+  for (const g of RELEASE_EXCLUDED) {
+    if (!g.sink || !SINK_KINDS[g.sink]) {
+      check('下沉门有合法接管方: ' + g.script, false, 'sink 字段缺失或未知: ' + String(g.sink))
+      continue
+    }
+    const kind = SINK_KINDS[g.sink]
+    // 需要 apk 树的 sink：apk 树不在场 ⇒ 降级 SKIP（不得回落、不得判红）。
+    if (kind.needsApkTree && !apkTreePresent) {
+      skipStatic('下沉门接管方断言: ' + g.script + ' @ ' + g.sink,
+        '协调仓布局下 apk 树不在场（' + rel(APK_TREE) + ' 无 apk 仓）——该 sink 的证据只在 apk 仓里；'
+        + '不在协调仓内回落取证（自我循环），由 apk 仓 CI/链自检')
+      continue
+    }
+    // 解析 sink 文件：apk 侧一类**一律从 APK_TREE 出发**（不经过 resolveRel 的跨布局回落）。
+    const sinkPath = kind.apkSide ? join(APK_TREE, kind.rel) : join(ROOT, kind.rel)
+    if (!existsSync(sinkPath)) {
+      // 契约要求在场的文件却缺席 ⇒ 判红（这不是布局降级，是真缺口）。
+      check('下沉门接管方文件在场: ' + g.script + ' @ ' + g.sink, false,
+        '缺文件: ' + rel(sinkPath) + '（apkTreePresent=' + apkTreePresent + '）')
+      continue
+    }
+    const text = readFileSync(sinkPath, 'utf8')
+    // 接管方必须真的点名这条门禁（CI 里是 `node scripts/check-x.mjs`；链里是 gate('check-x.mjs')）
+    check('下沉门被接管方调用: ' + g.script + ' @ ' + g.sink, text.includes(g.script),
+      '在 ' + rel(sinkPath) + ' 中找不到 ' + g.script + ' —— 移出发布链却无人接管 = 防线静默消失')
+  }
+}
+
 // ── 3b. 两份编排器门禁集差集 = 0（0.13.8-b ST-06 / F-ENV-04 ④）────────────────
 // 本地链（PowerShell）与云端链（node）必须调用同一组门禁：任一链少一道 = 该路径缺防线。
 const parseGateSetFromPs1 = (text) => new Set(
@@ -333,7 +443,10 @@ const abis = ['arm64', 'x86_64'].filter((abi) => {
   if (snapshotDir) return existsSync(join(resolve(snapshotDir), 'snapshot-' + abi + '.tar.xz'))
   return existsSync(join(ROOT, '.deploy-tmp', 'snapshot-013', abi, 'snapshot.tar.xz'))
 })
-console.log('发布门禁集：' + ALL_GATES.join(' → '))
+console.log('发布门禁集（--run 段 ' + RELEASE_GATES.length + ' 项；声明 ' + GATES.length + ' 项，下沉 ' + RELEASE_EXCLUDED.length + ' 项）：' + RELEASE_GATES.join(' → '))
+for (const g of RELEASE_EXCLUDED) {
+  console.log('下沉(不进发布 --run)  ' + g.script + ' -> ' + g.sink + '（输入非发布产物；由接管方真检，见 3a-2 断言）')
+}
 console.log('快照面：' + (abis.length > 0 ? abis.join(', ') : '（无：snapshot-fingerprint/runtime-assets 将按 --require 失败）'))
 let ran = 0
 // SKIP 合计（ST-31 / ST-16）：逐门禁捕获输出并解析 SKIP=n；发布链（--require）要求合计 = 0。
@@ -352,7 +465,7 @@ const runGate = (argvFor, label) => {
   }
 }
 const snapshotTar = (abi) => join(resolve(snapshotDir), 'snapshot-' + abi + '.tar.xz')
-for (const gate of ALL_GATES) {
+for (const gate of RELEASE_GATES) {
   const argvFor = [join('scripts', gate)]
   // 严格档（发布链 --require）：凡支持 --require 的门禁一律传，SKIP 即失败（ST-31：发布链 SKIP=0）。
   // check-tool-output-schema 自 0.14.1 W1 起支持 --require：宿主缺 peer 依赖（净检出无 node_modules 的
@@ -465,4 +578,7 @@ if (STRICT && overBudget.length > 0) {
 }
 // （原「发布链要求 SKIP=0」的总量检查已由上面的**具名声明**取代：ST-31/ST-16 的意图是「不得以 SKIP 结案」，
 //  具名申报同样满足——未声明或超额的 SKIP 一律判红，已声明的必须写明理由与上限。）
-console.log('CHECK-RELEASE-GATES --run PASSED（已执行 ' + ran + '/' + ALL_GATES.length + ' 项，SKIP=' + skipTotal + '）')
+// G.3：报「本次 --run 段实际执行数 / 该段应有的项数」，并显式列出下沉项——
+// 用 ALL_GATES.length 作分母会把已下沉的门禁算成「没执行」，读日志的人会误判成漏跑。
+console.log('CHECK-RELEASE-GATES --run PASSED（已执行 ' + ran + '/' + RELEASE_GATES.length + ' 项（发布段），SKIP=' + skipTotal
+  + '；另有 ' + RELEASE_EXCLUDED.length + ' 项已下沉、不在本段：' + RELEASE_EXCLUDED.map((g) => g.script + '->' + g.sink).join(', ') + '）')

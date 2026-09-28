@@ -41,6 +41,17 @@ class EngineManager(private val context: Context, private val pickToken: String?
   /** Consecutive healthy probe ticks since the last update swap (update-v2 confirmation state). */
   private var updateHealthTicks = 0
 
+  /**
+   * M.1（apk #272）：最近一次 startEngine 判定出的「引擎可用性」四态。
+   *
+   * 为什么要有它：旧实现只回一个布尔（且端口可连就静默 true），界面与日志都无从表达
+   * 「3080 被非本引擎占用」这类状态。把它存下来后，引导页与诊断能如实说清是哪一种。
+   * 初值 [EngineProbe.EngineAvailability.DOWN]（还没判过 ≠ 已有引擎）。
+   */
+  @Volatile
+  var lastAvailability: EngineProbe.EngineAvailability = EngineProbe.EngineAvailability.DOWN
+    private set
+
   val engineReady: Boolean get() = nodeBin.exists()
 
   /**
@@ -186,6 +197,16 @@ class EngineManager(private val context: Context, private val pickToken: String?
       snapshotSettingsBackup()
 
       onStage("正在完成运行时更新…")
+      // issue #271 ⑤：**事务自己**清理上一轮的失败残渣（不依赖 30 分钟年龄门槛）。
+      // 上一轮已结束 ⇒ 它留下的 *.failed-* 确定不再被任何进行中事务引用；不清就会与本次事务
+      // 争空间，形成「失败→残渣→空间紧→更易失败」的自我强化。
+      val clearedResidue = SnapshotTransaction.clearFailedResidue(filesDir)
+      if (clearedResidue.isNotEmpty()) {
+        LogCollector.log(TAG, "failed snapshot residue cleared before swap: " + clearedResidue.joinToString(", "))
+      }
+      SnapshotTransaction.lastFailedResidueFailure?.let {
+        Log.w(TAG, "failed snapshot residue could not be cleared: " + it)
+      }
       SnapshotTransaction.writeMarker(
         filesDir,
         SnapshotTransaction.Marker(SnapshotTransaction.Phase.STAGED, fingerprint, startedAt),
@@ -217,6 +238,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
       // 真因（`FileSystemException: ... Directory not empty` + 栈）**完全没有落盘**，排障者
       // 只能靠 logcat 反查——正是用户反馈一「App 启动失败时几乎不留任何诊断日志」的同形复发。
       lastRefreshFailure = t
+      // issue #271 ④：把**失败归类**（错误码）挂出来，供 boot 侧给「可直接照做」的文案，
+      // 而不是让用户看到一句无指向的「运行时更新失败」+ 90s 超时。
+      lastRefreshFailureCode = (t as? SnapshotFsException)?.code ?: "snapshot-refresh-failed"
       try {
         val marker = SnapshotTransaction.readMarker(filesDir)
         if (marker != null) {
@@ -246,6 +270,23 @@ class EngineManager(private val context: Context, private val pickToken: String?
    */
   @Volatile
   var lastRefreshFailure: Throwable? = null
+
+  /**
+   * 最近一次刷新失败的**稳定错误码**（issue #271 ④）。
+   *
+   * 为什么要有码而不只有异常：`SnapshotFsException.code` 是可归因的判据
+   * （`snapshot-delete-residue` / `snapshot-move-blocked` / `snapshot-foreign-owner`），
+   * boot 侧据此给不同文案；没有码时回落 `snapshot-refresh-failed`（表示真因未归类）。
+   */
+  @Volatile
+  var lastRefreshFailureCode: String? = null
+
+  /**
+   * 最近一次**拒绝启动**的可归因原因（issue #271 ④）：非空即表示上一次 `startEngine` 是被
+   * 前置条件挡下的（而不是 spawn 失败），boot 侧据此能给出「不用再等 90s」的文案。
+   */
+  @Volatile
+  var lastStartRefusal: String? = null
 
   /**
    * 最近一次「启动恢复未收敛」的明细（D-3：回滚失败时 marker 保留，下次启动重试）。
@@ -314,6 +355,11 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   private fun applyRecovery(recovery: SnapshotTransaction.Recovery) {
+    // 收敛即复位守卫：除 ROLLBACK_FAILED（仍未收敛，必须保留供上报）外，其余结局都算收敛。
+    // 放在 when 之前而不是塞进各分支，是为了**不改动既有分支结构**（各分支的日志与副作用保持原样）。
+    if (SnapshotRecoveryNotice.recoveryConverged(recovery.outcome == SnapshotTransaction.Outcome.ROLLBACK_FAILED)) {
+      clearStaleRecoveryFailure()
+    }
     when (recovery.outcome) {
       SnapshotTransaction.Outcome.NONE -> return
       SnapshotTransaction.Outcome.DISCARDED_STAGE -> {
@@ -337,6 +383,22 @@ class EngineManager(private val context: Context, private val pickToken: String?
         LogCollector.log(TAG, "snapshot recovery incomplete (retry on next start): " + detail)
         pendingRecoveryFailure = detail
       }
+    }
+  }
+
+  /**
+   * 0.14.2-fx-2（lead 指出的既有缺陷）：恢复**收敛即复位** `pendingRecoveryFailure`。
+   *
+   * 缺陷形态：`pendingRecoveryFailure` 原先全仓只有一处赋值（ROLLBACK_FAILED）、**从不清空** ⇒
+   * 一旦历史上拒绝过一次，之后每次启动（含事务早已收敛的新启动）都会重新命中这条陈旧明细：
+   * 诊断面被污染（排障者以为当前树还没收敛），新加的「恢复期拒绝」提示还会退化成**常驻假告警**。
+   *
+   * 只保留 ROLLBACK_FAILED（真未收敛、仍需上报），其余结局一律视为已收敛。
+   */
+  private fun clearStaleRecoveryFailure() {
+    if (pendingRecoveryFailure != null) {
+      Log.i(TAG, "snapshot recovery converged; clearing stale pendingRecoveryFailure")
+      pendingRecoveryFailure = null
     }
   }
 
@@ -382,20 +444,20 @@ class EngineManager(private val context: Context, private val pickToken: String?
     }
   }
 
-  /** A stage that lacks the engine entry points must never be activated. */
+  /**
+   * A stage that lacks the engine entry points **or its runtime libraries** must never be activated.
+   *
+   * task-79（Bug A）：旧实现只查 3 项 ⇒ `usr/lib` 动态库全缺也判「完整」⇒ 引擎被反复拉起、
+   * 每次都在链接期 CANNOT LINK 而死。现把动态库面并入判据（只加合取项），并**逐项打印缺失名**
+   * （旧日志只报 3 个布尔，排障者看不出缺的是哪个库，这本身是排障缺口）。
+   */
   private fun stagedRuntimeComplete(stage: File): Boolean {
-    val node = File(stage, "usr/bin/node")
-    val bin = File(stage, "usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
-    val profile = File(stage, "home/.dsh/profiles/web")
-    val complete = SnapshotFs.exists(node) && SnapshotFs.exists(bin) && SnapshotFs.exists(profile)
-    if (!complete) {
-      Log.e(
-        TAG,
-        "staged runtime incomplete: node=" + SnapshotFs.exists(node) +
-          " bin=" + SnapshotFs.exists(bin) + " profile=" + SnapshotFs.exists(profile),
-      )
-    }
-    return complete
+    val missing = RuntimeTree.missingEntries(
+      root = File(stage, "usr"),
+      profileDir = File(stage, "home/.dsh/profiles/web"),
+    )
+    if (missing.isNotEmpty()) Log.e(TAG, "staged runtime incomplete: missing=" + missing.joinToString(", "))
+    return missing.isEmpty()
   }
 
   /**
@@ -405,10 +467,29 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 会以「引擎能起但插件缺」的形态静默劣化。issue 现场的真正特征是 live 完整、缺的只是提交文件。
    */
   fun liveRuntimeComplete(): Boolean {
-    val node = File(usrDir, "bin/node")
-    val bin = File(usrDir, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
-    val profile = File(homeDir, ".dsh/profiles/web")
-    return SnapshotFs.exists(node) && SnapshotFs.exists(bin) && SnapshotFs.exists(profile)
+    val missing = RuntimeTree.missingEntries(
+      root = usrDir,
+      profileDir = File(homeDir, ".dsh/profiles/web"),
+    )
+    // 逐项打印：真机现场只有「3 个布尔」时，排障者无从知道缺的是 libz.so.1 还是别的。
+    if (missing.isNotEmpty()) Log.e(TAG, "live runtime incomplete: missing=" + missing.joinToString(", "))
+    return missing.isEmpty()
+  }
+
+  /**
+   * task-79（Bug A）：读取「运行时树损坏」标记的时间戳（无标记返回 null）。
+   *
+   * 标记由 EngineStartFlow 在判定动态链接失败时写入、由启动成功路径清除。
+   * 这里是它**唯一的读取方**（诊断包 info.txt 的 `runtime_tree_damage` 行）——
+   * 没有读取方的话它就是死账本：事后既无法证明它被写过，也进不了诊断包。
+   *
+   * @returns 标记内的时间戳文本；无标记或不可读时 null。
+   */
+  private fun runtimeTreeDamageMarker(context: Context): String? = try {
+    val f = File(context.filesDir, RuntimeTree.DAMAGE_MARKER)
+    if (f.isFile) f.readText().trim().takeIf { it.isNotEmpty() } else null
+  } catch (_: Throwable) {
+    null
   }
 
   /** 刷新失败账本（单行 `<fingerprint>\t<N>`；成功即删）。 */
@@ -990,6 +1071,25 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val preload = File(usrDir, "lib/libtermux-exec-ld-preload.so")
     if (!preload.exists()) {
       Log.e(TAG, "engine start failed: termux-exec preload missing at " + preload.absolutePath)
+      lastStartRefusal = "termux-exec 预载库缺失（" + preload.absolutePath + "）"
+      return false
+    }
+    // ── issue #271 ④：刷新失败后的**半搬态**不得再走 spawn ─────────────────────────────
+    //
+    // 现场形态：快照事务在 replaceEntry 里失败后，live 的 usr 已被搬进 .snapshot-previous、
+    // staged 没搬进来 ⇒ node 不在。此后每一次 boot / 看门狗重启都照旧 spawn，子进程必然
+    // 立即死亡（issue 里引擎日志末行就是 `exec …/files/usr/bin/node: No such file or directory`），
+    // 而 boot 只看到「进程在 90s 预算内死亡、Web 端口未就绪」——用户侧就是「反复重启 + 一堆
+    // 没有指向的报错」。
+    //
+    // 判据复用既有的 [liveRuntimeComplete]（降级闸门用的就是它，口径单一）：live 不完整时
+    // **明确拒绝启动并给出可归因的原因**，让失败停在「运行时快照刷新失败」这一层，
+    // 而不是放大成 90s 超时 + 反复重启。
+    if (!liveRuntimeComplete()) {
+      lastStartRefusal = "运行时快照不完整（live 树缺 node/bin.js/profile）——上一次快照刷新失败留下的半搬态；" +
+        "请重试刷新或清理应用数据后重装；本次不拉起引擎（避免 90s 超时与反复重启）"
+      Log.e(TAG, "engine start refused: live runtime incomplete — " + lastStartRefusal)
+      LogCollector.log(TAG, "engine start refused (live runtime incomplete)")
       return false
     }
     val now = System.currentTimeMillis()
@@ -999,18 +1099,43 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // If it has exited, a caller may retry immediately; deferring on a timestamp
     // alone turns a real early crash into a 90-second outage.
     val withinCooldown = now - EngineManager.lastStartAttemptAt < START_COOLDOWN_MS
-    val engineReachable = EngineProbe.portReachable(1_000)
+    // M.1（apk #272）：把「有东西在听」与「这是我们的引擎」分开。
+    //
+    // 旧实现只看 `portReachable()` ⇒ 任何占用 3080 的非本引擎进程都会被当成「已有引擎可用」，
+    // 于是**静默 return true**：不启动、不报错，用户永久进不去且界面无任何可辨提示。
+    // 现在改成四态判定（见 EngineProbe.classifyEngineAvailability）：只有确证是**我们自己的**
+    // 引擎（托管子进程存活 / 200-303 / 401 且有本代 token 行佐证）才允许早退；
+    // PORT_FOREIGN 必须照常走启动路径（它前面还有 killExistingEngine 清残留）。
+    val httpCode = runCatching { EngineProbe.check(1_000).optInt("code", -1) }.getOrDefault(-1)
     val managedProcessAlive = engineProcess?.isAlive == true
-    if (!force && (engineReachable || managedProcessAlive)) {
+    // 本代 token 行：engine.log 由 redirectOutput 每次启动**截断重写**，故它就是当前代次的日志；
+    // 有 token 行说明「眼下这一代引擎确实起来过」，用于把 401 从「匿名 401 的任意服务」里区分出来。
+    val logHasTokenLine = runCatching { EngineAuth.tokenFromLog(context) != null }.getOrDefault(false)
+    val availability = EngineProbe.classifyEngineAvailability(
+      httpCode = httpCode,
+      managedAlive = managedProcessAlive,
+      logHasTokenLine = logHasTokenLine,
+      portReachable = EngineProbe.portReachable(1_000),
+    )
+    lastAvailability = availability
+    val engineUsable = availability == EngineProbe.EngineAvailability.OUR_PROCESS ||
+      availability == EngineProbe.EngineAvailability.OUR_HTTP
+    if (!force && engineUsable) {
       // 0.13.8 #175：DEGRADED_HTTP 阶梯触发时，「端口可连」不再是健康证据——半死引擎
-      // 必须允许重启（看门狗/重试路径不带 force 也能走到这里）。
+      // 必须允许重启（看门狗/重试路径不带 force 也能走到这里）。这条语义**保持不变**。
       if (WatchdogV2.degradedHttpTripped()) {
         LogCollector.log(TAG, "engine start allowed despite reachable port: DEGRADED_HTTP ladder tripped (half-dead engine)")
       } else {
         STARTING.set(false)
-        LogCollector.log(TAG, "engine start skipped (existing engine reachable or alive)")
+        LogCollector.log(TAG, "engine start skipped (existing engine usable: " + availability + ")")
         return true
       }
+    }
+    if (!force && availability == EngineProbe.EngineAvailability.PORT_FOREIGN) {
+      // 不再静默：这是「3080 被别的进程占着」——我们要照常启动（下面 killExistingEngine 会清
+      // 我们自己的残留），但如果那个占用者不是我们的进程，EADDRINUSE 会让启动失败并留下真因为据。
+      LogCollector.log(TAG, "engine port reachable but not ours (PORT_FOREIGN); proceeding to start — a foreign listener on 3080 will surface as a bind failure")
+      Log.w(TAG, "port 3080 is reachable but is not our engine (no managed process, no token line); starting anyway")
     }
     if (withinCooldown) {
       LogCollector.log(TAG, "engine start retrying after the tracked child exited during cooldown")
@@ -1101,6 +1226,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
   private fun startWithArgs(args: Array<String>, env: Map<String, String>): Process {
     val log = File(context.filesDir, "engine.log")
     rotateEngineLog(log)
+    // M.1（#272）缺陷 c：把「本代起点」交给 EngineAuth，供 token 归属校验使用。
+    // 位置必须在 rotateEngineLog **之后**、spawn **之前**：rotate 之后旧代已滚到 .1，
+    // 此刻起产生的日志才属于本代；而 tokenFromLog 用 mtime >= 本时刻 来拒绝旧代。
+    runCatching { EngineAuth.markGenerationStart(System.currentTimeMillis()) }
     // P-AC-04（§7.2 启动分段插桩）：t_boot_start 的壳侧起点（落壳侧自有文件
     // files/boot-segments.log）。这次标记即本世代的起点；监听段由 watchEngineListen() 观察
     // （与启动路径解耦），engine.log 本体壳侧一个字都不写。
@@ -1265,6 +1394,11 @@ class EngineManager(private val context: Context, private val pickToken: String?
       .append(" / Android ").append(android.os.Build.VERSION.SDK_INT).append('\n')
     sb.append("abi: ").append(android.os.Build.SUPPORTED_ABIS.joinToString(",")).append('\n')
     engineExitInfo()?.let { sb.append("engine_exit: ").append(it).append('\n') }
+    // task-79（Bug A）：运行时树损坏标记的**读取方**。
+    // 为什么必须有人读它：`engine.log` 每次 spawn 被 redirectOutput 截断，所以「我们曾判定树损坏并触发
+    // 重抽取」这件事只能落在壳侧标记里；没有读取方的话它就是死账本——事后既无法证明它被写过，
+    // 也进不了诊断包。这里把它带进 info.txt（存在才有该行），于是失败现场自带这一条事实。
+    runtimeTreeDamageMarker(context)?.let { sb.append("runtime_tree_damage: ").append(it).append('\n') }
     // 0.14.1 块C §2.4：WebView 版本与语法下限判据进诊断包。
     // 为什么也进诊断包（而不只进 boot-diag.log）：老设备白屏时页面跑不起来，用户必须能**自助**取到
     // 「我的 WebView 版本够不够」这一个结论，而不必先跑到页面上看。
@@ -1314,6 +1448,19 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 改动逐条进开发日志；每版本只跑一次（幂等标记），失败不阻塞启动。
    */
   private fun repairProfilePatch() {
+    // 两条**独立**的自愈，各自有自己的幂等标记：
+    //  · 退役行 disabled 残留（apk #214）：标记 .profile-patch-repair-<version>；
+    //  · 旧「单点」写法归一（0.14.2-fx-2，见 normalizeLegacyAgentDefaultModel）：标记 .profile-patch-normalize-<version>。
+    //
+    // **为什么必须独立标记**：本函数原先的早退（marker.exists()）语义是「本版本已修退役行」。
+    // 若归一复用同一标记，则**已经装过同版本**的设备永远补不上这次新修复 —— 实测踩到：
+    // 两台设备在装上含归一的包后，`merge` 因指纹已 fresh 而不跑、本函数因标记已存在而早退，
+    // 于是 live patch 冷启动两次 md5 都不变（归一从未执行）。
+    //
+    // 更一般的教训（既有注释里已写过一次，见本文件下方 #214 段落）：
+    // 「这类设备不一定再触发快照刷新（指纹未变则 merge 不跑），所以自愈必须在引擎读 profile
+    //   之前做一次，不能只依赖 refreshSnapshot」—— 新增修复同样必须走这条通道。
+    normalizeLegacySinglePointPatch()
     val marker = File(context.filesDir, ".profile-patch-repair-" + BuildConfig.VERSION_NAME)
     if (marker.exists()) return
     var failed = false
@@ -1375,6 +1522,80 @@ class EngineManager(private val context: Context, private val pickToken: String?
       }
     } catch (t: Throwable) {
       Log.w(TAG, "profile patch repair failed (non-fatal)", t)
+    }
+  }
+
+  /**
+   * 旧「单点」写法归一（0.14.2-fx-2）的**启动前置**通道。
+   *
+   * 为什么不能只挂在 [FactoryProfilePatch.merge]：那条链只在**快照刷新**时跑
+   * （`if (snapshotFresh()) return true` 早退）—— 指纹已 fresh 的设备永远拿不到修复。
+   * 实测：两台设备装上含归一的包后，冷启动两次 live patch md5 均不变。
+   *
+   * 安全面：沿用本函数既有的三件套（`.pre-<version>.bak` 备份 / 原子写 / 解析校验），
+   * 不新增第二条落盘路径。
+   *
+   * 幂等：**独立**标记 `.profile-patch-normalize-<version>`（不复用退役行那个标记）。
+   * 失败不写标记 ⇒ 下次启动重试；异常一律不阻塞启动。
+   */
+  private fun normalizeLegacySinglePointPatch() {
+    val marker = File(context.filesDir, ".profile-patch-normalize-" + BuildConfig.VERSION_NAME)
+    if (marker.exists()) return
+    var failed = false
+    var normalized = 0
+    try {
+      val profilesRoot = File(File(homeDir, ".dsh"), "profiles")
+      val targets = (profilesRoot.listFiles() ?: emptyArray())
+        .sortedBy { it.name }
+        .filter { isFactoryOwnedProfile(it) }
+        .map { File(it, "cordis.patch.yml") }
+        .filter { it.isFile }
+      for (target in targets) {
+        val live = try { target.readText() } catch (_: Throwable) { failed = true; continue }
+        if (FactoryProfilePatch.legacyMobileConfigLines(live).isEmpty()) continue // 不满足形态 ⇒ 不动
+        val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(live)
+        if (result.text == live) continue // 条件不满足 ⇒ 零改动
+        // 结构化校验（Lead 四条）：id 集合、上游无 disabled、用户 config 逐行保留、可解析。
+        val why = FactoryProfilePatch.verifyNormalization(live, result.text)
+        if (why != null) {
+          Log.w(TAG, "profile patch normalize skipped (verify failed): " + target.absolutePath + " -> " + why)
+          failed = true
+          continue
+        }
+        val backup = File(target.parentFile, target.name + ".pre-" + BuildConfig.VERSION_NAME + ".bak")
+        if (!backup.exists()) {
+          try { backup.writeText(live) } catch (_: Throwable) {}
+        }
+        val tmp = File(target.parentFile, target.name + ".normalize.tmp")
+        try {
+          tmp.writeText(result.text)
+          if (!tmp.renameTo(target)) {
+            target.writeText(result.text)
+            SnapshotFs.deletePath(tmp)
+          }
+        } catch (t: Throwable) {
+          failed = true
+          SnapshotFs.deletePath(tmp)
+          Log.w(TAG, "profile patch normalize write failed (retried next boot): " + target.absolutePath, t)
+          continue
+        }
+        normalized++
+        LogCollector.log(
+          TAG,
+          "profile patch normalized (" + (target.parentFile?.name ?: "?") + "): " +
+            result.changes.joinToString(" | ") + " ; backup=" + backup.name,
+        )
+      }
+      if (failed) {
+        LogCollector.log(TAG, "profile patch normalize deferred (partial failure; retried next start)")
+      } else {
+        marker.writeText("normalized=" + normalized + " targets=" + targets.size + " at " + System.currentTimeMillis() + "\n")
+        if (normalized > 0) {
+          LogCollector.log(TAG, "profile patch normalize (0.14.2-fx-2): " + normalized + " profile(s) migrated; marker=" + marker.name)
+        }
+      }
+    } catch (t: Throwable) {
+      Log.w(TAG, "profile patch normalize failed (non-fatal)", t)
     }
   }
 

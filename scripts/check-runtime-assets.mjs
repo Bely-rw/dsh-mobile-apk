@@ -103,6 +103,33 @@ const BEHAVIOR_TESTS = [
   { asset: 'fs-local-index.js', test: 'fs-local-link-f8.test.mjs' },
 ]
 
+// ── 判据 0（快照无关）：资产必须覆盖它对应文件在 registry 里的**全部** engine 补丁 marker ──────
+// 为什么需要这条（0.14.2 实测）：下面的逐字节判据要**快照在场**才有意义，而快照可能是补丁加入
+// 之前构建的旧产物 ⇒ 资产与旧快照「同源」（都缺新补丁）⇒ 逐字节判绿，而真机上该补丁等于没修。
+// 实锤：B（fs-local-digest-guard-B）加入后，assets/patched/fs-local-index.js 仍是只有 F8 的 43405 B，
+// 与当时快照逐字节一致 ⇒ 本门禁不响；引擎每次启动仍把 B 覆盖掉。
+// 这条判据只看「资产文本里有没有该文件全部 engine 补丁的 marker」，与快照无关 ⇒ 任何往某个目标
+// 文件新增补丁的人，只要忘了同步资产，这里立刻判红（不需要别人先重建快照来触发）。
+{
+  const missing = []
+  for (const asset of assets) {
+    const src = sourcesFor(asset)
+    if (src.length === 0) continue
+    const text = readFileSync(join(ASSETS, asset), 'utf8')
+    for (const patch of src) {
+      if (typeof patch.marker !== 'string' || patch.marker.length === 0) continue
+      if (!text.includes(patch.marker)) missing.push({ asset, id: patch.id, marker: patch.marker })
+    }
+  }
+  if (missing.length > 0) {
+    fail('运行时资产缺少同源补丁 marker（该补丁在设备上会被本资产整份覆盖 ⇒ 等于没修）：\n'
+      + missing.map((m) => '  ' + m.asset + '：缺 ' + m.id + ' 的 marker ' + JSON.stringify(m.marker)).join('\n')
+      + '\n  修复：从出厂态 fixture 按 registry 顺序施加该文件的全部 engine 补丁，用产物覆盖 assets/patched/<asset>'
+      + '\n  （资产须由补丁链生成，禁止手改；生成后不带参数复核）')
+  }
+  console.log('PASS  资产覆盖同源补丁全部 marker（' + assets.length + ' 个资产，快照无关判据）')
+}
+
 let checked = 0
 // ST-31：资产级 SKIP 必须与缺件 SKIP 一起**计数**（历史上这三处静默 SKIP 让「快照/资产不同源」
 // 在发布链上以 exit 0 结案——发布链要求 SKIP=0，靠 --require 把每一处 SKIP 变成失败）。
@@ -130,7 +157,25 @@ for (const asset of assets) {
   }
   const assetBuf = readFileSync(join(ASSETS, asset))
   checked++
+  // 方向感知（0.14.2）：资产与快照不同源有两种相反成因，修法相反，绝不能一律用 --write 回写。
+  //   ① 快照缺补丁（快照是补丁加入**之前**构建的旧产物）：资产是对的，回写会把补丁从资产里抹掉
+  //      → 必须**重建快照**；--write 在此**拒绝**执行。
+  //   ② 资产缺补丁：快照是对的，--write 从快照回写资产是正确的修法。
+  // 实锤：B 加入后快照仍旧（只有 F8），旧 --write 会静默把 B 从资产里删掉——比不修更坏。
+  const assetText = assetBuf.toString('utf8')
+  const snapText = snapBuf.toString('utf8')
+  const markers = src.map((x) => x.marker).filter((m) => typeof m === 'string' && m.length > 0)
+  const snapMissing = markers.filter((m) => !snapText.includes(m))
+  const assetMissing = markers.filter((m) => !assetText.includes(m))
   if (!snapBuf.equals(assetBuf)) {
+    if (snapMissing.length > 0 && assetMissing.length === 0) {
+      fail('快照是**陈旧**产物：它缺少该文件已登记的 engine 补丁，而运行时资产已含补齐\n'
+        + '  资产（正确，勿覆盖）= ' + asset + '（' + assetBuf.length + ' B，sha ' + sha256(assetBuf).slice(0, 12) + '…）\n'
+        + '  快照（陈旧）      = ' + snapBuf.length + ' B，sha ' + sha256(snapBuf).slice(0, 12) + '…\n'
+        + '  快照缺的 marker：' + snapMissing.map((m) => JSON.stringify(m)).join(', ') + '\n'
+        + '  **禁止用 --write 回写**（那会把补丁从资产里抹掉，比不修更坏）。正确修法：重建快照\n'
+        + '  （node scripts/build-snapshot-013.mjs <abi>），使快照与资产同源。')
+    }
     if (WRITE) {
       writeFileSync(join(ASSETS, asset), snapBuf)
       console.log(`REGEN ${asset} ← ${target}（${assetBuf.length} B → ${snapBuf.length} B，sha ${sha256(snapBuf).slice(0, 12)}…）`)

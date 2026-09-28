@@ -816,6 +816,15 @@ class SnapshotTransactionTest {
           - id: android-manage
             name: '@dsh-android/dsh-android-manage'
     """.trimIndent() + "\n"
+
+    /**
+     * 替身记录的链接目标（真实用例里是 `.pnpm/real-dep` 这类相对路径）。
+     *
+     * 必须放在**外层类的 companion object**：`RecordingLinks` 是 nested class，
+     * 看不到外层测试类的 instance 成员（`private val` 编译期即 `Unresolved reference`）。
+     * companion 的成员对 nested class 可见，故这里是唯一正确的位置。
+     */
+    private const val LINK_TARGET_TEXT = ".pnpm/real-dep"
   }
 
   // ── 0.14.1 审查 D-3 / §7.7.5：回滚失败**不得无条件清 marker** ──────────────────────
@@ -1134,6 +1143,843 @@ class SnapshotTransactionTest {
       )
       assertTrue("组里还剩一个子条目 ⇒ 组包装行必须保留", text.contains("- insert:"))
       assertTrue("无关顶层条目原样保留", text.contains("id: keep-me"))
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  // ── M.2 A（issue #273 ①）：回滚不得丢符号链接、不得把半份备份当 live ──────────────
+  //
+  // 旧实现在 copyRecursivelyStrict 里对链接直接 `return`（注释：「链接属运行时残渣」）。
+  // 该假定是错的：pnpm 的 node_modules 结构大量依赖链接（现网实测 501 个），而 profiles
+  // 回滚的唯一数据源就是这份备份 ⇒ 备份里没有链接，回滚后结构崩掉、模块解析失败。
+  // 更坏的是没有任何一层会发现：备份「合法但残缺」。
+
+  /** 工厂态写入一个带符号链接的 profiles 树（pnpm 形态的最小复现）。 */
+  private fun writeProfilesWithLinks(root: File, marker: String) {
+    File(root, "home/.dsh/profiles/web").mkdirs()
+    File(root, "home/.dsh/profiles/web/cordis.yml").writeText(marker)
+    val nm = File(root, "home/.dsh/profiles/web/node_modules")
+    nm.mkdirs()
+    File(nm, ".pnpm").mkdirs()
+    File(nm, ".pnpm/real-dep").mkdirs()
+    File(nm, ".pnpm/real-dep/index.js").writeText("module.exports = 1\n")
+    // pnpm 的经典形态：顶层条目是指向 .pnpm 的符号链接
+    try {
+      Files.createSymbolicLink(
+        File(nm, "dep").toPath(),
+        java.nio.file.Paths.get(".pnpm/real-dep"),
+      )
+    } catch (_: Throwable) {
+      // 个别环境不允许建链；用例自行跳过链接断言（见下方 linksAvailable 守卫）。
+    }
+  }
+
+  @Test
+  fun backupKeepsSymbolicLinksAndRollbackRestoresThem() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      writeProfilesWithLinks(live, "live-marker")
+      val link = File(live, "home/.dsh/profiles/web/node_modules/dep")
+      // 本机（Windows，无建链权限）无法构造符号链接 ⇒ 本用例的核心判据不可构造。
+      // **必须用 Assume 报 SKIP，绝不能 `return`** —— `return` 会让它显示为 PASS，
+      // 那就是「判据存在但无判别力」的假绿（本轮实测：撤掉 A 的修法后本用例照样绿，
+      // 真因正是这里静默返回）。SKIP 会如实进入报告，并在有建链权限的环境（Linux/CI/设备）真正执行。
+      org.junit.Assume.assumeTrue(
+        "本机无符号链接创建权限（需 Linux/CI/设备或管理员权限）",
+        SnapshotFs.isSymbolicLink(link),
+      )
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-link",
+        startedAt = 1L,
+      )
+
+      // 备份必须**含链接**（旧实现在这里恒为 0 ⇒ 判红）。
+      val previousProfiles = File(filesDir, ".snapshot-previous/home/.dsh/profiles")
+      val backupStats = SnapshotFs.treeStats(previousProfiles)
+      assertTrue(
+        "备份必须保留符号链接（issue #273 ①：旧实现跳过链接，回滚必丢）",
+        backupStats.links >= 1,
+      )
+      assertTrue(
+        "备份里的链接必须真的能解析为链接（不是被复制成了普通文件）",
+        SnapshotFs.isSymbolicLink(File(previousProfiles, "web/node_modules/dep")),
+      )
+
+      // 回滚后 live 的链接必须回来。
+      val rollback = SnapshotTransaction.rollback(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        marker = SnapshotTransaction.readMarker(filesDir)!!,
+      )
+      assertTrue("回滚必须成功: " + rollback.failures, rollback.ok)
+      assertTrue(
+        "回滚后 live 的符号链接必须被重建（issue #273 ① 的第二半）",
+        SnapshotFs.isSymbolicLink(File(live, "home/.dsh/profiles/web/node_modules/dep")),
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 反证（A）：残缺备份**必须**被拒绝，绝不 move 回 live。
+   * 构造一份「合法但空」的 previous —— 正是半份备份/未完成 copying 残渣的形态。
+   */
+  @Test
+  fun rollbackRefusesAnEmptyBackupInsteadOfWipingLive() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      File(live, "home/.dsh/profiles/web/keep-me").writeText("user data")
+
+      // 手造一份**空的** previous + 一个声称搬过 profiles 的 marker。
+      val previous = SnapshotTransaction.previousRoot(filesDir)
+      previous.mkdirs()
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(SnapshotTransaction.Phase.SWAPPING, "fp", 1L, listOf("home/.dsh/profiles")),
+      )
+
+      val before = File(live, "home/.dsh/profiles/web/keep-me").readText()
+      val rollback = SnapshotTransaction.rollback(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        marker = SnapshotTransaction.readMarker(filesDir)!!,
+      )
+
+      assertFalse("空备份必须被拒绝（否则等于用空目录覆盖用户数据）", rollback.ok)
+      assertTrue(
+        "拒绝理由必须点名备份残缺: " + rollback.failures,
+        rollback.failures.any { it.contains("回滚被拒") },
+      )
+      assertEquals(
+        "live 必须原封不动（拒绝回滚 ≠ 破坏 live）",
+        before,
+        File(live, "home/.dsh/profiles/web/keep-me").readText(),
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  // ── M.2 B（issue #273 ②）：writeMarker 原子性 + 失败中止事务 ─────────────────────
+
+  /**
+   * 反证（B）：marker 写失败**必须抛**，不得静默继续。
+   *
+   * 构造法：把 marker 的目标路径变成一个**目录**（rename 与直写都不可能成功），
+   * 模拟「写不进 journal」的现场。旧实现会把异常咽掉、让调用方带着「可能没有 journal」
+   * 的状态继续动树 —— 那是最危险的一种继续。
+   */
+  @Test
+  fun writeMarkerFailureAbortsInsteadOfContinuingWithoutJournal() {
+    val filesDir = tempDir()
+    try {
+      // 目标 marker 路径占成目录：rename 到它、直写它都会失败。
+      SnapshotTransaction.markerFile(filesDir).mkdirs()
+      var threw = false
+      try {
+        SnapshotTransaction.writeMarker(
+          filesDir,
+          SnapshotTransaction.Marker(SnapshotTransaction.Phase.SWAPPING, "fp", 1L),
+        )
+      } catch (e: Throwable) {
+        threw = true
+        assertTrue(
+          "失败必须结构化（code=snapshot-marker-write），便于日志/诊断归因: " + e,
+          e is SnapshotFsException && e.code == CODE_MARKER_WRITE,
+        )
+      }
+      assertTrue("marker 写失败必须抛（旧实现静默继续，事务再无 journal）", threw)
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 正证（B）：正常写入**不得**经过「先删目标」的窗口 —— 判据是写入后 marker 立即可读，
+   * 且 tmp 不残留。旧实现的 deletePath 窗口无法在单线程 JVM 里「同步」被抓到，
+   * 因此这里钉住**可观察的等价契约**：写入后没有 tmp 残留、内容完整可读。
+   */
+  @Test
+  fun writeMarkerLeavesNoTemporaryResidueAndIsImmediatelyReadable() {
+    val filesDir = tempDir()
+    try {
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(SnapshotTransaction.Phase.SWAPPING, "fp-x", 7L, listOf("usr")),
+      )
+      val marker = SnapshotTransaction.readMarker(filesDir)
+      assertEquals(SnapshotTransaction.Phase.SWAPPING, marker?.phase)
+      assertEquals("fp-x", marker?.fingerprint)
+      assertEquals(listOf("usr"), marker?.moved)
+      assertFalse(
+        "不得残留 tmp（旧实现的先删后写路径会留下它）",
+        SnapshotFs.exists(File(filesDir, ".snapshot-transaction.tmp")),
+      )
+      // 覆盖写：第二次仍必须原子成功（rename 覆盖既有目标）。
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(SnapshotTransaction.Phase.SWAPPED, "fp-y", 8L, listOf("usr")),
+      )
+      assertEquals(SnapshotTransaction.Phase.SWAPPED, SnapshotTransaction.readMarker(filesDir)?.phase)
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  // ── M.3 C（issue #274 ②）：用户面清单必须原子写 + 写后可解析 ─────────────────────
+  //
+  // 旧实现 `live.writeText(...)` 直接截断目标再写：写到一半被杀 / 磁盘满 ⇒ live 上留下
+  // **半个 JSON**。引擎读它就是解析失败 —— 比「没更新」坏得多。marker 与指纹早已走
+  // tmp+rename，只有这两处是例外。
+
+  /**
+   * 正证（C）：package.json 合并后必须仍是**合法 JSON**，且不留 tmp 残留。
+   * 这条同时锁住「合并逻辑产出的结构」与「写入路径不破坏结构」。
+   */
+  @Test
+  fun mergedPackageJsonStaysParseableAndLeavesNoTempFiles() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      File(live, "home/.dsh/profiles/web/package.json").writeText(
+        """{"dependencies":{"@user/pin":"1.0.0"},"dsh":{"profile":{"bundles":["@user/custom"]}}}""",
+      )
+      File(stage, "home/.dsh/profiles/web/package.json").writeText(
+        """{"dependencies":{"@factory/new":"2.0.0"},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base"]}}}""",
+      )
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-json",
+        startedAt = 1L,
+      )
+
+      val merged = File(live, "home/.dsh/profiles/web/package.json")
+      // 可解析性：坏 JSON 会在这里抛（就是「半个 JSON」的判据）。
+      val root = org.json.JSONObject(merged.readText())
+      val deps = root.getJSONObject("dependencies")
+      assertTrue("用户 pin 必须幸存", deps.has("@user/pin"))
+      assertTrue("工厂新增依赖必须补入", deps.has("@factory/new"))
+      val bundles = root.getJSONObject("dsh").getJSONObject("profile").getJSONArray("bundles")
+      val list = (0 until bundles.length()).map { bundles.getString(it) }
+      assertTrue("用户 bundle 幸存", list.contains("@user/custom"))
+      assertTrue("工厂 bundle 补入", list.contains("@deepseek-ai/dsh-base"))
+      assertFalse(
+        "不得残留 tmp 文件（原子写的临时文件必须已被 rename 消费）",
+        merged.parentFile!!.listFiles()!!.any { it.name.startsWith(".package.json.tmp-") },
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /** 正证（C）：cordis.patch.yml 合并后必须非空（空 patch = 静默丢掉全部装配条目）。 */
+  @Test
+  fun mergedPatchYamlIsNonEmptyAndKeepsBothSides() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      File(live, "home/.dsh/profiles/web/cordis.patch.yml").writeText(
+        "- id: user-row\n  disabled: true\n",
+      )
+      File(stage, "home/.dsh/profiles/web/cordis.patch.yml").writeText(
+        "- id: user-row\n- id: factory-row\n  disabled: true\n",
+      )
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-yaml",
+        startedAt = 1L,
+      )
+
+      val merged = File(live, "home/.dsh/profiles/web/cordis.patch.yml")
+      val text = merged.readText()
+      assertTrue("合并结果必须非空", text.isNotBlank())
+      assertTrue("用户行幸存", text.contains("user-row"))
+      assertTrue("工厂行补入", text.contains("factory-row"))
+      assertFalse(
+        "不得残留 tmp 文件",
+        merged.parentFile!!.listFiles()!!.any { it.name.startsWith(".cordis.patch.yml.tmp-") },
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  // ── M.3 D（issue #274 ③）：工厂件覆盖用户改动必须**可发现** ─────────────────────
+
+  /**
+   * 反证（D）：用户改过的 node_modules 内工厂件被覆盖时，必须留下同目录 `.pre-*` 副本。
+   *
+   * 覆盖语义本身**不变**（node_modules 工厂件做字段级合并会造成「旧清单 + 新文件」，
+   * 0.14.0 P0 实锤过）—— 缺的只是「被抹掉的东西能找回来」。
+   */
+  @Test
+  fun factoryOverwritePreservesTheUserVersionInAPreFile() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      // node_modules 子树内的工厂件（**不是** profile 根清单 ⇒ 走整体覆盖分支）
+      val rel = "home/.dsh/profiles/web/node_modules/@dsh-android/dsh-x/cordis.yml"
+      File(live, rel).parentFile!!.mkdirs()
+      File(stage, rel).parentFile!!.mkdirs()
+      File(live, rel).writeText("user-patched: true\n")
+      File(stage, rel).writeText("factory: true\n")
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-preserve",
+        startedAt = 1L,
+      )
+
+      val target = File(live, rel)
+      assertEquals("工厂件必须整体覆盖（语义不变）", "factory: true\n", target.readText())
+      val pre = target.parentFile!!.listFiles()!!.filter { it.name.startsWith(".pre-cordis.yml-") }
+      assertTrue(
+        "被覆盖的用户版本必须另存为可发现的 .pre-* 副本（issue #274 ③）",
+        pre.isNotEmpty(),
+      )
+      assertEquals(
+        "另存的必须是**用户那个版本**，不是工厂件",
+        "user-patched: true\n",
+        pre.first().readText(),
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /** 正证（D）：内容与工厂**相同**时不留 .pre-*（否则每次刷新都堆一份纯噪声副本）。 */
+  @Test
+  fun factoryOverwriteOfIdenticalContentLeavesNoBackup() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      val rel = "home/.dsh/profiles/web/node_modules/@dsh-android/dsh-x/cordis.yml"
+      File(live, rel).parentFile!!.mkdirs()
+      File(stage, rel).parentFile!!.mkdirs()
+      File(live, rel).writeText("same: true\n")
+      File(stage, rel).writeText("same: true\n")
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-same",
+        startedAt = 1L,
+      )
+
+      val pre = File(live, rel).parentFile!!.listFiles()!!.filter { it.name.startsWith(".pre-") }
+      assertTrue("内容相同不得留副本（纯噪声）", pre.isEmpty())
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  // ── M.3 E（issue #274 ④）：空间预检必须带 need/available MB 且**改在动树之前** ────
+
+  /**
+   * 反证（E）：预检拒绝时**live 必须未被改动**，且异常携带可展示的 need MB。
+   * 注入 spaceCheck 是既有惯例（同 delete/move/ownerProbe），生产面不留测试缝。
+   */
+  @Test
+  fun spaceRefusalHappensBeforeAnyTreeIsTouchedAndCarriesUserFacingNumbers() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      File(live, "home/.dsh/profiles/web/untouched").writeText("user")
+
+      var threw: SnapshotTransaction.InsufficientSpaceException? = null
+      try {
+        SnapshotTransaction.swap(
+          filesDir = filesDir,
+          stagedRoot = stage,
+          usrDir = File(live, "usr"),
+          homeDir = File(live, "home"),
+          preservedNames = preserved,
+          fingerprint = "fp-space",
+          startedAt = 1L,
+          spaceCheck = { required ->
+            "存储空间不足：运行时更新需要约 " + (required / (1024 * 1024)) + " MB，当前仅 3 MB。"
+          },
+        )
+      } catch (e: SnapshotTransaction.InsufficientSpaceException) {
+        threw = e
+      }
+      assertTrue("空间不足必须抛 InsufficientSpaceException（不是泛化的刷新失败）", threw != null)
+      assertTrue("异常必须携带 requiredBytes（供用户面显示）", (threw?.requiredBytes ?: 0L) > 0L)
+      assertTrue("文案必须含 MB 数字: " + threw?.message, (threw?.message ?: "").contains("MB"))
+      assertEquals(
+        "预检必须在动树之前：live 未被改动",
+        "old-node",
+        File(live, "usr/bin/node").readText(),
+      )
+      assertTrue("live 用户数据必须原样", File(live, "home/.dsh/profiles/web/untouched").exists())
+      assertFalse(
+        "不得留下任何 previous 残渣（动树之前就该拒绝）",
+        SnapshotFs.exists(SnapshotTransaction.previousRoot(filesDir)),
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+
+  // ── M.2 A（issue #273 ①）可注入判别力：链接三动作 ────────────────────────────────
+  //
+  // 本机 Windows 无 SeCreateSymbolicLinkPrivilege ⇒ 真建链接的 e2e 只能 SKIP。
+  // 按本仓既有范式（swap 的 move/delete/ownerProbe/spaceCheck），把「判链接 / 读目标 / 建链接」
+  // 抽成可注入原语后，本机即可行为对照地判红。**反证靠传参，不就地改生产源码。**
+
+  /** 记录型链接替身：记下每一条被当作链接处理的条目及其目标。 */
+  private class RecordingLinks(
+    private val links: Set<String>,
+    private val failOnCreate: Boolean = false,
+    private val failOnRead: Boolean = false,
+    /** 只让这些目标路径的 createLink 失败（其余成功）——用于「应建 2 / 实建 1」的精确构造。 */
+    private val failCreateFor: Set<String> = emptySet(),
+  ) : SnapshotTransaction.LinkPrimitives {
+    val created = LinkedHashMap<String, String>()
+    val readTargets = LinkedHashMap<String, String>()
+
+    override fun isLink(file: File): Boolean = file.absolutePath in links
+
+    override fun linkTargetOf(file: File): java.nio.file.Path {
+      if (failOnRead) throw java.io.IOException("synthetic read-link failure")
+      readTargets[file.absolutePath] = LINK_TARGET_TEXT
+      return java.nio.file.Paths.get(LINK_TARGET_TEXT)
+    }
+
+    override fun createLink(dest: File, target: java.nio.file.Path) {
+      if (failOnCreate || dest.absolutePath in failCreateFor) {
+        throw java.io.IOException("synthetic create-link failure")
+      }
+      created[dest.absolutePath] = target.toString()
+      // 本机建不了真链接：落一个**占位条目**，让备份树的条目数与源齐平，
+      // 否则 verifyBackupComplete 会把「对账不齐」判成失败（那会掩盖本用例要验的语义）。
+      dest.parentFile?.mkdirs()
+      dest.writeText("") // 0 字节：与源侧空条目字节数齐平，避免对账误报
+    }
+  }
+
+
+  /** 造一棵带「链接」的 profiles 树；返回被替身认作链接的那个条目路径。 */
+  private fun writeProfilesWithFakeLink(root: File): String {
+    File(root, "home/.dsh/profiles/web").mkdirs()
+    File(root, "home/.dsh/profiles/web/cordis.yml").writeText("marker")
+    val nm = File(root, "home/.dsh/profiles/web/node_modules")
+    nm.mkdirs()
+    // 替身把 `dep` 认作链接；真实文件系统上它只是个**空文件**（本机没有建链权限）。
+    // 用空文件而非目录：verifyBackupComplete 会对账字节数，空文件的字节数是确定的 0。
+    File(nm, "dep").writeText("")
+    return File(nm, "dep").absolutePath
+  }
+
+  /**
+   * 正例（A，可注入）：源里的链接必须被 [SnapshotTransaction.LinkPrimitives.createLink]
+   * 重建，且目标名与源**逐字相同**；不得退化成按普通文件拷贝。
+   */
+  @Test
+  fun strictCopyRebuildsLinksThroughTheInjectableSeam() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      val linkPath = writeProfilesWithFakeLink(live)
+      val links = RecordingLinks(links = setOf(linkPath))
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-seam",
+        startedAt = 1L,
+        links = links,
+      )
+
+      assertTrue(
+        "链接必须被 createLink 重建（旧实现直接 return，这里恒为空）: " + links.created,
+        links.created.isNotEmpty(),
+      )
+      val createdTarget = links.created.values.single()
+      // 断言守的是「**同一个目标**」——没被解析成绝对路径、没被改名；**不是**同一个字面串。
+      // 原因：Windows 的 `Path.toString()` 用反斜杠（`.pnpm\real-dep`），而源是 POSIX 形态的
+      // `.pnpm/real-dep`。Android 上源是真正的 POSIX 符号链接，分隔符只会是 `/`；
+      // 这里按 **Path 语义**比较，避免在非 Android 平台上误报（本轮实测：该断言曾在 Windows 判红）。
+      assertEquals(
+        "重建的链接目标必须是同一个目标（不得解析成绝对路径或改成别的名字）",
+        java.nio.file.Paths.get(LINK_TARGET_TEXT),
+        java.nio.file.Paths.get(createdTarget),
+      )
+      assertFalse(
+        "重建的链接目标不得被解析成绝对路径: " + createdTarget,
+        java.nio.file.Paths.get(createdTarget).isAbsolute,
+      )
+      assertTrue(
+        "重建的落点必须在备份树内部（.snapshot-previous/...）: " + links.created.keys,
+        links.created.keys.single().contains(".snapshot-previous"),
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 反例（A，可注入）：若把判据换成「一律当普通文件」（= 旧行为），本用例必须判红。
+   * 传一个**永不认链接**的替身即等价于旧实现。
+   */
+  @Test
+  fun noLinkPrimitiveCallMeansTheOldBehaviourAndFailsThisContract() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      writeProfilesWithFakeLink(live)
+      // 空集合 = 一个链接都不认 = 旧实现「跳过链接」的等价物
+      val links = RecordingLinks(links = emptySet())
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp-old",
+        startedAt = 1L,
+        links = links,
+      )
+
+      assertEquals(
+        "旧行为（不认链接）下 createLink 恒不被调用 —— 这正是缺陷的形态",
+        0,
+        links.created.size,
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 反例（A，可注入）：`createLink` 抛 IOException 时，严格拷贝**必须向上冒错**，
+   * 不得静默跳过（静默跳过正是本缺陷的成因，也是 CP-B 那类「静默造出假绿」的同型面）。
+   */
+  @Test
+  fun linkCreateFailurePropagatesInsteadOfBeingSilentlySkipped() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      val linkPath = writeProfilesWithFakeLink(live)
+      val links = RecordingLinks(links = setOf(linkPath), failOnCreate = true)
+
+      var thrown: Throwable? = null
+      try {
+        SnapshotTransaction.swap(
+          filesDir = filesDir,
+          stagedRoot = stage,
+          usrDir = File(live, "usr"),
+          homeDir = File(live, "home"),
+          preservedNames = preserved,
+          fingerprint = "fp-fail",
+          startedAt = 1L,
+          links = links,
+        )
+      } catch (t: Throwable) {
+        thrown = t
+      }
+      assertTrue(
+        "建链接失败必须向上冒错（静默跳过会让备份合法地残缺，正是 #273 的成因）",
+        thrown != null,
+      )
+      // 真因必须可诊断：异常链里应能找到那条合成失败。
+      val chain = generateSequence(thrown) { it.cause }.toList()
+      assertTrue(
+        "真因必须保留在异常链里（不得被补偿动作掩盖）: " + chain.map { it.javaClass.simpleName },
+        chain.any { it.message?.contains("synthetic create-link failure") == true },
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 安全面（issue #273 ① 追问的 (ii)）：建链接抛错时，
+   *  (a) live/profiles 子树必须**逐条目未变**（不得扩大破坏面）；
+   *  (b) 未完成的备份 .copying 不得被当成可用回滚点。
+   *
+   * 背景：`usr` 的替换**早于** profiles 合并（swap L470 < L492），故抛错时事务已进入
+   * 「必须靠回滚收场」的状态；但 profiles 子树有结构性保证（拷贝目标是 .copying 临时名、
+   * 且 profiles 直到 L701 才进 journal）。本条把这个保证钉成断言。
+   */
+  @Test
+  fun linkCreateFailureLeavesLiveProfilesUntouchedAndNoUsableBackup() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      val linkPath = writeProfilesWithFakeLink(live)
+      // 抛错前给 profiles 加一个用户文件，并记录逐条目快照。
+      val profiles = File(live, "home/.dsh/profiles")
+      File(profiles, "web/user-keep.txt").writeText("must survive")
+      val beforeStats = SnapshotFs.treeStats(profiles)
+      fun snapshot(): Map<String, String> = profiles.walkTopDown()
+        .filter { SnapshotFs.exists(it) }
+        .associate { it.absolutePath to (if (it.isFile) it.readText() else "<dir>") }
+      val before = snapshot()
+
+      val links = RecordingLinks(links = setOf(linkPath), failOnCreate = true)
+      var thrown: Throwable? = null
+      try {
+        SnapshotTransaction.swap(
+          filesDir = filesDir,
+          stagedRoot = stage,
+          usrDir = File(live, "usr"),
+          homeDir = File(live, "home"),
+          preservedNames = preserved,
+          fingerprint = "fp-safe",
+          startedAt = 1L,
+          links = links,
+        )
+      } catch (x: Throwable) {
+        thrown = x
+      }
+      assertTrue("建链接失败必须抛（fail-loud 在建备份面）", thrown != null)
+
+      // (a) live/profiles 逐条目未变。
+      val afterStats = SnapshotFs.treeStats(profiles)
+      assertEquals("抛错后 live/profiles 条目数不得变", beforeStats.entries, afterStats.entries)
+      assertEquals("抛错后 live/profiles 链接数不得变", beforeStats.links, afterStats.links)
+      assertEquals("抛错后 live/profiles 字节数不得变", beforeStats.bytes, afterStats.bytes)
+      assertEquals("抛错后 live/profiles 逐条目内容不得变", before, snapshot())
+
+      // (b) 未完成的备份不得被当成可用回滚点：marker（若已写）不得声称 profiles。
+      val marker = SnapshotTransaction.readMarker(filesDir)
+      if (marker != null) {
+        assertFalse(
+          "抛错早于记账 ⇒ marker 不得声称 profiles: " + marker.moved,
+          marker.moved.any { it.contains("profiles") },
+        )
+      }
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 反证（B 的「可见」验收定义）：回滚收尾期的链接重建是 **fail-soft 但绝不 silent**。
+   *
+   * **手工构造 previous/staged/live，不走 swap 整链** —— 避免「替身认的树不是 relink 遍历的树」
+   * 那类构造性假绿（本用例第一版正是那样：替身认 live 树，而 relink 遍历 staged 树 ⇒ 永不命中）。
+   *
+   * 关键构造（全部在 Windows 上可复现，无需真实符号链接权限）：
+   *  · previous/home/.dsh/profiles/keep.txt —— 备份本体（非空，且**不含** node_modules，
+   *    以绕开 verifyPreviousForRollback 对「node_modules 零链接」的拒绝）；
+   *  · staged/home/.dsh/profiles/web —— 替身认作「链接」的条目；
+   *  · live 侧此时没有 web（备份里本来就没有）⇒ `SnapshotFs.exists(target)` 为假
+   *    ⇒ 必须记 expected + shortfall（而不是被 `if (exists(target)) return` 提前跳过）。
+   *
+   * 断言四条（**全部无条件**，不再用 `if (shortfalls.isNotEmpty())` 包裹 ——
+   * 那种写法在空集时整段跳过，等于给假绿发免死金牌）：
+   *  (i) live 已由 previous 恢复的内容逐条目不变（soft 没扩大破坏面）；
+   *  (ii) 应建 > 实建 的信息**回到调用方**；
+   *  (iii) 短缺点名到**条目路径** + 同时出现在 notes（用户可见面）；
+   *  (iv) 这次回滚**不被当成干净成功**，但 ok 仍为 true（不制造重试风暴）。
+   */
+  @Test
+  fun relinkShortfallIsSoftButNeverSilent() {
+    val filesDir = tempDir()
+    try {
+      val previous = SnapshotTransaction.previousRoot(filesDir)
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      val usrDir = File(filesDir, "live/usr").apply { mkdirs() }
+      val homeDir = File(filesDir, "live/home").apply { mkdirs() }
+
+      // previous：非空 profiles，且**不含** web（这样 live 恢复后没有 web ⇒ relink 必须计 expected）。
+      val backupProfiles = File(previous, "home/.dsh/profiles")
+      backupProfiles.mkdirs()
+      File(backupProfiles, "keep.txt").writeText("restored-from-backup")
+
+      // staged：relink 遍历的**源**树，替身在这里命中。
+      val stagedProfiles = File(stage, "home/.dsh/profiles")
+      stagedProfiles.mkdirs()
+      val stagedLink = File(stagedProfiles, "web")
+      stagedLink.mkdirs()
+
+      // live 侧先放一份「将被覆盖」的 profiles，验证它确实被 previous 恢复。
+      val liveProfiles = File(homeDir, ".dsh/profiles")
+      liveProfiles.mkdirs()
+      File(liveProfiles, "stale.txt").writeText("should be replaced by backup")
+
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(
+          SnapshotTransaction.Phase.SWAPPING,
+          "fp-soft",
+          1L,
+          listOf("home/.dsh/profiles"),
+        ),
+      )
+
+      // 替身认 stagedLink；createLink 必抛 ⇒ relink 必须记 shortfall 而非抛出。
+      val links = RecordingLinks(links = setOf(stagedLink.absolutePath), failOnCreate = true)
+      val rollback = SnapshotTransaction.rollback(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = usrDir,
+        homeDir = homeDir,
+        marker = SnapshotTransaction.readMarker(filesDir)!!,
+        links = links,
+      )
+
+      // (i) 备份内容必须已恢复，且残留的 live 旧文件必须已被换掉。
+      assertEquals(
+        "previous 的内容必须被恢复出来（soft 的语义是「已恢复」）",
+        "restored-from-backup",
+        File(liveProfiles, "keep.txt").readText(),
+      )
+      assertFalse(
+        "live 的旧内容必须已被备份替换（回滚确实发生了）",
+        File(liveProfiles, "stale.txt").exists(),
+      )
+
+      // (iv) 不冒充干净成功，也不报成致命失败（避免 issue #271 的重试风暴）。
+      assertTrue("回滚结构恢复应成功（ok=true）: " + rollback.failures, rollback.ok)
+      assertFalse("有链接未重建时不得报成干净成功", rollback.isCleanSuccess)
+
+      // (ii) 缺失必须回到调用方 —— **无条件**断言：替身若没命中，这里必须判红。
+      assertTrue(
+        "应建而未建的链接必须回到调用方（替身未命中时本断言判红，不得静默通过）: "
+          + rollback.relinkShortfalls,
+        rollback.relinkShortfalls.isNotEmpty(),
+      )
+      // (iii) 点名到条目路径 + 同时出现在用户可见面（notes）。
+      assertTrue(
+        "短缺点名必须到条目路径（不能只是一个数字）: " + rollback.relinkShortfalls,
+        // shortfall 记的是**目标**（live 侧）路径——那是「应该建在哪」，排障要用它。
+        rollback.relinkShortfalls.any { it.contains(File(liveProfiles, "web").absolutePath) },
+      )
+      assertTrue(
+        "短缺点必须带失败原因: " + rollback.relinkShortfalls,
+        rollback.relinkShortfalls.any { it.contains("createSymbolicLink") },
+      )
+      assertTrue(
+        "缺失必须同时出现在 notes（用户可见面）: " + rollback.notes,
+        rollback.notes.any { it.contains("未重建") },
+      )
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  /**
+   * 纯判据单测（不依赖 swap/rollback 整链）：`relinkFromStaged` 的「应建 vs 实建」语义。
+   *
+   * 为什么必须独立一条：整链用例（relinkShortfallIsSoftButNeverSilent）会被体检/记账/回滚等
+   * 多重前置影响；本用例**只**构造「源树 2 条链接、其中 1 条建失败」，直接断言计数与点名。
+   *
+   * 访问方式：`relinkFromStaged` 是 `private`（生产面本轮已冻结，不改可见性），故用反射调用。
+   * 反射是为了**不为了测试去动生产面的可见性**；若后续你允许改 `internal`，这条可去掉反射。
+   */
+  @Test
+  fun relinkOutcomeCountsExpectedVersusRestoredPerEntry() {
+    val filesDir = tempDir()
+    try {
+      val staged = File(filesDir, "staged/home/.dsh/profiles").apply { mkdirs() }
+      val live = File(filesDir, "live/home/.dsh/profiles").apply { mkdirs() }
+      // 源树三条：两条「链接」（替身认）、一条普通文件（不得计入 expected）。
+      val linkA = File(staged, "a").apply { mkdirs() }
+      val linkB = File(staged, "b").apply { mkdirs() }
+      File(staged, "plain.txt").writeText("not-a-link")
+      // live 侧已有 a（不需要重建，故不进 expected），缺 b。
+      File(live, "a").mkdirs()
+
+      val links = RecordingLinks(
+        links = setOf(linkA.absolutePath, linkB.absolutePath),
+        failCreateFor = setOf(File(live, "b").absolutePath),
+      )
+      val method = SnapshotTransaction::class.java.getDeclaredMethod(
+        "relinkFromStaged", File::class.java, File::class.java, SnapshotTransaction.LinkPrimitives::class.java,
+      ).apply { isAccessible = true }
+      val outcome = method.invoke(SnapshotTransaction, staged, live, links) as SnapshotTransaction.RelinkOutcome
+
+      assertEquals("应建数 = live 缺的那一条（已存在的 a 不计）", 1, outcome.expected)
+      assertEquals("实建数 = 0（b 的 createLink 必抛）", 0, outcome.restored)
+      assertEquals("缺失恰好一条", 1, outcome.shortfalls.size)
+      assertTrue(
+        "短缺点名到目标路径: " + outcome.shortfalls,
+        outcome.shortfalls.single().contains(File(live, "b").absolutePath),
+      )
+      assertTrue(
+        "短缺点名到失败原因: " + outcome.shortfalls,
+        outcome.shortfalls.single().contains("createSymbolicLink"),
+      )
+      assertFalse("有缺失时 complete 必须为 false", outcome.complete)
+
+      // 反向对照：换一个「都建成功」的替身，expected=1 / restored=1 / complete=true。
+      val okLinks = RecordingLinks(links = setOf(linkA.absolutePath, linkB.absolutePath))
+      val okOutcome = method.invoke(SnapshotTransaction, staged, live, okLinks) as SnapshotTransaction.RelinkOutcome
+      assertEquals("成功的应建数", 1, okOutcome.expected)
+      assertEquals("成功的实建数", 1, okOutcome.restored)
+      assertTrue("无缺失时 complete 必须为 true", okOutcome.complete)
     } finally {
       SnapshotFs.deletePath(filesDir)
     }

@@ -115,6 +115,9 @@ class MainActivity : ComponentActivity() {
   /** 本次会话是否已经为通知权限弹过一次（S1-11：不重复弹、且只在真需要时弹）。 */
   private var notifPermissionAsked = false
 
+  /** M.1（#272）：已为本代页面做过多少次 401 自愈重载（见 [onEngineAuthRejected]）。 */
+  private var engineAuthReloadAttempts = 0
+
   companion object {
     private const val TAG = "dsh-shell"
 
@@ -127,6 +130,14 @@ class MainActivity : ComponentActivity() {
      * 应用的哪类通知；现在名称/说明走 strings.xml（见 ds_notify_channel_name/desc）。
      */
     private const val NOTIF_CHANNEL_ID = "dsh"
+
+    /**
+     * M.1（apk #272）：引擎页面被 401/403 拒绝后，最多自愈重载几次就退回原生引导页。
+     *
+     * 为什么有上限：cookie 永远换不出来时（例如签名密钥被清）无限重载 = 页面反复闪，
+     * 用户既看不懂也无从脱身。3 次足够覆盖「token 行刚到、cookie 尚未就绪」的正常竞态。
+     */
+    private const val ENGINE_AUTH_RELOAD_MAX = 3
 
     /**
      * §2.3（0.14.1 块C）：主 WebView 背景色（中性深灰）。未设时为默认白，白屏与「正常空页」
@@ -712,6 +723,14 @@ class MainActivity : ComponentActivity() {
         } catch (t: Throwable) {
           Log.w(TAG, "http error diag failed: " + (t.message ?: t.javaClass.simpleName))
         }
+        // M.1（apk #272）缺陷 b：401/403 不是「页面坏了」，是「引擎在、但当前 cookie 不被接受」。
+        // 旧实现只落一条诊断就结束 ⇒ 用户停在一个 401 文案页，而壳侧自愈链（handleUnauthorized →
+        // refresh → reload）**从未被触发**（EngineProbe 把 401 当健康，这条回调也没有动作）。
+        // 现在：重新认证 + 重载一次；重试到上限仍失败就**退回原生引导页**——
+        // 那是「不依赖 401 判定」的手动自救出口（引导页的按钮始终可点，用户不会被困在网页里）。
+        if (errorResponse.statusCode == 401 || errorResponse.statusCode == 403) {
+          onEngineAuthRejected(request.url.toString())
+        }
       }
 
       /**
@@ -798,6 +817,9 @@ class MainActivity : ComponentActivity() {
         // P0-1：冷启动时点的通知，落点要等这一帧之后页面才有会话视图（文档级就绪 ≠ 会话列表就绪，
         // 故页面侧的回执为 false 时会给出可见提示，而不是静默失败）。
         if (isEngineSource(url)) deliverNotifyRoute()
+        // 0.14.2-fx-2 缺口：恢复期「拒绝回滚」的提示要在**页面就绪后**注入（引导页会被 showWeb 盖掉）。
+        // 挂在这里的两个理由：① 文档级就绪；② 页面**重载**后补注不丢（进程内存里留着文案）。
+        if (isEngineSource(url)) deliverRecoveryNotice()
       }
     }
     // WebView 下载：会话日志导出与其余引擎源下载统一走 DownloadSaver（app 内
@@ -1034,6 +1056,62 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  /**
+   * M.1（apk #272）缺陷 b 的自愈入口：引擎页面被 401/403 拒绝时重新认证并重载。
+   *
+   * 为什么要「有上限 + 退回引导页」：无限重载会在 cookie 永远换不出来时变成死循环
+   * （用户只看到页面反复闪）。到上限后退回**原生引导页**，那里有可点的按钮（打开控制台 /
+   * 安全模式启动），是「不依赖 401 判定」的手动出口——即使用户的 401 判定链本身坏了，
+   * 他也不会被困在一个没有出路的网页里。
+   *
+   * @param url 被拒的引擎页面 URL（只用于日志）。
+   */
+  private fun onEngineAuthRejected(url: String) {
+    val attempt = engineAuthReloadAttempts + 1
+    engineAuthReloadAttempts = attempt
+    LogCollector.log(TAG, "engine page rejected auth (attempt " + attempt + "): " + url)
+    if (attempt > ENGINE_AUTH_RELOAD_MAX) {
+      // 退回原生引导页：这是「手动自救出口」。文案如实说明发生了什么、能做什么。
+      // 同时把「修复指令 + 报错原文」放进剪贴板（与安全模式按钮同一交付口径），
+      // 因为这条路径的用户同样需要一段可直接粘贴给模型的东西——否则他只有一块卡住的屏。
+      val prompt = buildSafeModePrompt(
+        stage = "engine-auth-401",
+        detail = "引擎页面被 401/403 拒绝，自愈重载 " + ENGINE_AUTH_RELOAD_MAX + " 次后仍未恢复（cookie 无法换出）。",
+        logTail = runCatching { PluginMounts.readEngineLogTail(this, 4_000) }.getOrDefault(""),
+        safeModeActive = false,
+      )
+      SafeMode.copyToClipboard(this, prompt)
+      runOnUiThread {
+        try {
+          if (!isFinishing && !isDestroyed) {
+            showGuide()
+            applyGuidePhase(
+              GuidePhase.Error,
+              getString(R.string.ds_auth_stuck_title),
+              getString(R.string.ds_auth_stuck_hint),
+            )
+          }
+        } catch (t: Throwable) {
+          Log.w(TAG, "auth fallback to guide failed: " + (t.message ?: t.javaClass.simpleName))
+        }
+      }
+      return
+    }
+    Thread {
+      // refresh 内含同步 HTTP（最长 8s）且持 EngineAuth 锁——绝不在主线程调用。
+      val cookie = try { EngineAuth.handleUnauthorized(this) } catch (_: Throwable) { null }
+      if (cookie == null) return@Thread
+      try {
+        android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie)
+      } catch (_: Throwable) {
+        return@Thread
+      }
+      runOnUiThread {
+        try { if (!isFinishing && !isDestroyed) webView.reload() } catch (_: Throwable) {}
+      }
+    }.apply { isDaemon = true; name = "engine-auth-selfheal" }.start()
+  }
+
   /** 0.13.3：textZoom 桥与持久化退役（D6）——上游 ui-theme fontSize 原生覆盖字体调节。 */
 
   /**
@@ -1118,6 +1196,56 @@ class MainActivity : ComponentActivity() {
     } catch (_: Exception) {
       // 页面未就绪：onPageFinished 会再推一次。
     }
+  }
+
+  /**
+   * 注入「运行时更新被拒绝」提示到引擎 WebUI（0.14.2-fx-2 缺口）。
+   *
+   * 为什么不是引导页：恢复期拒绝**不阻断启动**（引擎可能照常起），随后 `showWeb()` 会把
+   * 引导页 `GONE` ⇒ 写在引导页上的提示会被立刻隐藏（等于没修）。所以注入到页面 DOM。
+   *
+   * 三条语义（与 `SnapshotRecoveryNotice.deliver` 同一套判据）：
+   *   · 一次性**跨轮次**：文件标记在**注入成功后**才删 ⇒ 以后的启动不再唠叨；注入失败则不删，下次补发。
+   *   · 本轮**持续**：文案留在进程内存，`onPageFinished`（含用户刷新/页面重载）后重新注入。
+   *   · 注入失败只记 trace，不抛、不阻塞页面。
+   */
+  private fun deliverRecoveryNotice() {
+    if (!::webView.isInitialized) return
+    // 本轮已注入过：直接重注内存里的文案（页面重载场景），不再碰文件标记。
+    val remembered = SnapshotRecoveryNotice.inProcessText
+    if (remembered != null) {
+      injectRecoveryNotice(remembered)
+      return
+    }
+    val raw = SnapshotRecoveryNotice.pending(filesDir)
+    SnapshotRecoveryNotice.deliver(
+      pending = raw,
+      inject = { text ->
+        val (title, body) = SnapshotRecoveryNotice.splitMarker(text)
+        injectRecoveryNoticeSync(title, body)
+      },
+      consumeOnSuccess = { SnapshotRecoveryNotice.consume(filesDir) },
+    )
+  }
+
+  /** 同步注入（evaluateJavascript 本身是异步的；这里返回「已派发」，回调里补记 trace）。 */
+  private fun injectRecoveryNoticeSync(title: String, body: String): Boolean = try {
+    webView.evaluateJavascript(SnapshotRecoveryNotice.injectionScript(title, body), null)
+    true
+  } catch (t: Throwable) {
+    Log.w(TAG, "recovery notice injection failed: " + t.javaClass.simpleName)
+    false
+  }
+
+  /**
+   * 用内存文案重注（页面重载后不丢）。
+   *
+   * 内存里存的是**标记原文**（`标题\n正文`），所以这里同样走 splitMarker ——
+   * 否则重载后标题行会被当成正文再显示一遍（叠字）。
+   */
+  private fun injectRecoveryNotice(text: String) {
+    val (title, body) = SnapshotRecoveryNotice.splitMarker(text)
+    injectRecoveryNoticeSync(title, body)
   }
 
   /**

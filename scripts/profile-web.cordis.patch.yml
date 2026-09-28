@@ -102,14 +102,26 @@
 # deepseek-official：壳 shellEnv() 已注入 DEEPSEEK_API_KEY（files/deepseek-key.txt 私有文件），
 # 零额外配置、国内可达、开箱即用。opencode-go 仍在「添加自定义供应商」列表中可选。
 # 设置界面 agent-default-model 段为用户级（UI 保存会覆盖此默认）。
+#
+# 写法（0.14.2-fx-2 修正，2026-09-28）：**就地按上游 id 覆盖 config**，不再 disable + 换 id insert。
+# 机制依据：cordis-plugin-include 的 applyEntryPatches 对无 insert 的 patch 走「按 id 找既有 entry
+# 并逐字段覆盖」（vendor/include/src/index.ts:109-123）⇒ config 可直接打在既有行上。注意 config 是
+# **整体替换不是深合并**（实测 {a,b} 打 {b} 只剩 {b}），所以 provider 与 model 两个键都要给全。
+#
+# 为什么改（现象→原因→影响面）：旧写法禁掉上游 agent-default-model 再用新 id `agent-default-model-mobile`
+# 重新 insert 同一个包，只为塞一份 config。后果是**引入了一个服务供给单点**：session-controller 的 inject
+# 依赖里有 agentDefaultModel，一旦这条自定义 id 的 entry 未激活（pending），session-controller 就跟着
+# pending ⇒ boot 仍报成功（它不在上游 requiredStartupEntryIds 的 7 个 id 内）但 ctx.sessionController 缺席，
+# 任何 session/selectModel 派发都得到 `active Service "sessionController" is unavailable`。
+# 已知且有意的行为变更：live entry id 由 `agent-default-model-mobile` 变回上游的 `agent-default-model`。
+# settings 的 namespace **就是 entry.options.id**（packages/settings/settings/src/index.ts:315/326/382），
+# 因此**旧 `agent-default-model-mobile` namespace 里存过的「默认模型」值会读不到**，回落为本行 pin 的
+# deepseek-official / deepseek-v4-flash。影响面：仅限在设置界面显式改过默认模型的用户，且只影响「默认模型」
+# 一项（不涉及其它 settings 段）；改回设置界面重选一次即可。这是为消除单点而接受的代价。
 - id: agent-default-model
-  disabled: true
-- insert:
-    - id: agent-default-model-mobile
-      name: '@deepseek-ai/dsh-agent-default-model'
-      config:
-        provider: deepseek-official
-        model: deepseek-v4-flash
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
 
 # Android directory-picker composition (2026-08-16 fix):
 # the bundle's directory-picker-auto resolves to browse on Android (platform !== linux) and registers
@@ -176,12 +188,26 @@
 #
 # 修法：把 nodeExecutable 钉成快照内 node 的绝对路径（与上方 shell-termux 的 bashPath 同口径、
 # 同一份快照），从此这条链路**完全不读 process.execPath**。
+#
+# 【0.14.2 追加】上面这条「钉成 bin/node 绝对路径」只解决了 execPath 被污染，**没有解决 env**：
+# PTC 给子进程传的是显式过滤后的 env（ptc-runtime-node 的 STARTUP_ENVIRONMENT_NAMES 只放
+# PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP），LD_LIBRARY_PATH 不在其中 ⇒ 子进程里的 node 找不到
+# libz.so.1 等 DT_NEEDED（Permissive 模拟器报 CANNOT LINK；Enforcing 真机则 app 域 exec app-data ELF
+# 直接被拒 ⇒ EACCES，即用户截图的 code run failed）。
+# 故 nodeExecutable 改指**快照内的 wrapper 脚本** usr/libexec/dsh-node（由 build-snapshot-013.mjs 7c1 生成）：
+#   #!/system/bin/sh
+#   export LD_LIBRARY_PATH=<prefix>/lib
+#   exec /system/bin/linker64 <prefix>/bin/node "$@"
+# 脚本非 ELF ⇒ 内核走 shebang 读它，不触发 app-data ELF exec；LD_LIBRARY_PATH 由 wrapper 自己 export，
+# 不依赖被 tombstone 的继承；linker64 只**读取** node 而非 exec，绕开 execute_no_trans。
+# 设备实测（16416，同 env 只差是否走 wrapper）：直连 node → CANNOT LINK libz.so.1；wrapper → CHILD-OK。
+# 逆转条件：上游把 LD_LIBRARY_PATH（或等价的动态链接器搜索路径）纳入 PTC 子进程 env 白名单后，本行可改回 bin/node。
 # 与 marketplace 补丁 B 是同一族修法（那里的 execPath:process.execPath 也曾被 linker64 回退污染，
 # 导致 bad ELF magic）——同一环境事实，第二次咬人。
 # 逆转条件：上游 NodePtcRuntime 自己解析执行世界里的 node（不再缺省取 process.execPath）后，本行可撤。
 - id: ptc-runtime
   config:
-    nodeExecutable: /data/data/com.dsharnessmobile.shell/files/usr/bin/node
+    nodeExecutable: /data/data/com.dsharnessmobile.shell/files/usr/libexec/dsh-node
 
 # Office→PDF（0.14.2 追版决策，2026-09-25 实测）——**显式禁用上游 web-app bundle 的 office-to-pdf 行**。
 # rc.1 新增该行（0.1.5 的 web-app bundle 里 office 零命中），它运行时依赖

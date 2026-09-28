@@ -177,6 +177,10 @@ if (peer) {
     'scripts/ci-verify-snapshot.py',
     'scripts/build-snapshot-013.mjs',
     'scripts/lib/shell.mjs',
+    // G.3（0.14.2-fx-2）：产物面「同一 tar 只解一次」的共享缓存模块。它与 shell.mjs 同属构建/门禁共用
+    // 基础设施，两条链（本地 + 云端自包含）都会 import 它 ⇒ 必须逐字节同版；单边演进 = 一侧仍按
+    // 「各自解一遍」跑而另一侧复用缓存，同一份快照在两个仓得出不同耗时/不同清理行为（幽灵面）。
+    'scripts/lib/tar-extract-cache.mjs',
     // 0.14.1：软链自净化模块（快照归档前归一化旧 Termux 前缀软链）同样双仓同源。
     // build-snapshot-013.mjs 已在镜像面，其依赖模块若不入册就会出现「构建脚本同源、依赖单边演进」
     // —— 云端自包含构建跑旧净化逻辑，产物照样带 111/113 条设备必然丢弃的软链。
@@ -266,6 +270,9 @@ if (peer) {
     'scripts/check-combo-cache.mjs',
     // 云端链与 CI 都跑它（build-apk.mjs GATE_SCRIPTS），此前不在镜像面 = 单边演进可绕过（ST-17 顺路收口）
     'scripts/check-engine-overlay.mjs',
+    // H-1（0.14.2-fx-2）：MCP client 依赖闭包门禁。云端自包含链会跑 apk 仓副本——
+    // 单边演进 = 云端跑旧判据（或对端缺文件）而本地链判绿，与 ST-17 同型。
+    'scripts/check-mcp-client-deps.mjs',
     'scripts/check-build-chain-abort.mjs',
     'scripts/release-plugin-src-gaps.json',
     'scripts/gen-protocol-v2-fixture.mjs',

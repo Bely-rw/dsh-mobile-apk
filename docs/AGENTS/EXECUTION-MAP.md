@@ -43,9 +43,11 @@ flowchart TD
 ### 阶段 0：首次部署（装机后第一次启动，一次性）
 
 - 快照就绪判据是**指纹比对**：`app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt:81`（`snapshotFresh`）拿 `filesDir/.snapshot-fingerprint` 与 `assets/snapshot.sha256` 比；
-- 不新鲜 → `EngineManager.kt:99`（`refreshSnapshot`）：解压到暂存（`EngineManager.kt:434` `extractSnapshotTo`）→ **事务交换**（`app/src/main/java/com/dsharnessmobile/shell/SnapshotTransaction.kt:256` `swap`，marker 三阶段 `STAGED/SWAPPING/SWAPPED` 见 `SnapshotTransaction.kt:53`）→ 指纹提交；中途被杀由下次启动的 `EngineManager.kt:238`（`recoverInterruptedRefresh`）前滚/回滚/丢弃；
-- 交换内还要合并用户面：`SnapshotTransaction.kt:439`（`mergeProfiles`）、`SnapshotTransaction.kt:385`（`reconcileRemovedProfilePlugins`，已摘除插件的存量迁移）；残渣按年龄回收 `SnapshotTransaction.kt:190`（`reclaimResidue`）；
-- 引擎首启：`EngineManager.kt:810`（`startEngine`）；运行时补丁在 `EngineManager.kt:756`（`applyRuntimePatches`）。
+- 不新鲜 → `EngineManager.kt:99`（`refreshSnapshot`）：解压到暂存（`EngineManager.kt:537` `extractSnapshotTo`）→ **事务交换**（`app/src/main/java/com/dsharnessmobile/shell/SnapshotTransaction.kt:355` `swap`，marker 三阶段 `STAGED/SWAPPING/SWAPPED` 见 `SnapshotTransaction.kt:53`）→ 指纹提交；中途被杀由下次启动的 `EngineManager.kt:294`（`recoverInterruptedRefresh`）前滚/回滚/丢弃；
+- 交换内还要合并用户面：`SnapshotTransaction.kt:626`（`mergeProfiles`）、`SnapshotTransaction.kt:546`（`reconcileRemovedProfilePlugins`，已摘除插件的存量迁移）；残渣按年龄回收 `SnapshotTransaction.kt:196`（`reclaimResidue`）；
+  **0.14.2-fx-2 缺陷 I（apk #271）在交换前新增了两道闸门**：`SnapshotTransaction.kt:313`（`requireDeletableResidue` 可写性预检，点名非应用属主残留）与 `SnapshotTransaction.kt:242`（`clearFailedResidue` 无年龄门槛地清上一轮 `*.failed-*`）；`SnapshotFs.kt:177`（`move`）自保——目标非空先 `SnapshotFs.kt:83`（`deletePathStrict`）删净、删不净即抛（`snapshot-delete-residue` / `snapshot-move-blocked`）；
+- **0.14.2-fx-2 缺陷 D（安全模式）**：启动失败页主按钮变「安全模式启动」→ `GuidePageRenderer.kt` 的 `enterSafeMode()`；状态机与剪贴板 prompt 在 `SafeMode.kt`（唯一写面：`auto/safe-mode.json` + `safe-mode-backup-*.yml`）；控制台命令解析在 `SafeConsole.kt`（纯函数，命中即不落 bash，接线 `ConsoleActivity.kt`）。
+- 引擎首启：`EngineManager.kt:1010`（`startEngine`），**半搬态闸门** `EngineManager.kt:1037`（`!liveRuntimeComplete()` 即拒绝启动并记 `lastStartRefusal`，判据 `EngineManager.kt:437`；刷新失败码 `EngineManager.kt:271` `lastRefreshFailureCode`，避免用户只看到 90s 超时 + 反复重启）；运行时补丁在 `EngineManager.kt:954`（`applyRuntimePatches`）。
 
 ### 阶段 1：每次冷启动（秒级到三十秒）
 
@@ -143,7 +145,7 @@ sequenceDiagram
 | 高 | K10 | `NotifySuppressQueue` 是纯进程内 `@Volatile List`，而解释偏移已被推进 | `app/src/main/java/com/dsharnessmobile/shell/NotifySuppressQueue.kt:83`、`app/src/main/java/com/dsharnessmobile/shell/NotifyStore.kt:246` | 进程在抑制窗口被杀，该通知**永久丢失**（无补投路径） | 未修 |
 | 高 | K05 | 壳侧范围门比引擎侧宽 3 个 op（`state`/`webSnapshot`/`webAction`） | `app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt:678` | 默认 `virtual-only` 范围下相关 op 必然误拒 | 未修 |
 | 高 | K02 | `LogCollector.writeBootDiag/writeBootFail` 出口不过 `EngineAuth.redact` | `app/src/main/java/com/dsharnessmobile/shell/LogCollector.kt:458-480` | 启动诊断与失败日志可能带 token 落盘 | 未修（评审 I-5/H-12 点名） |
-| 高 | K03 | 自动回滚目标取自**崩溃那次启动自己建的**快照（快照在建/挂载阶段就写，早于健康判定），于是「回滚成功」而状态没变好；跨版本还会把上一次安装的配置写回 | `app/src/main/java/com/dsharnessmobile/shell/UndoGate.kt:240`、`:194`、`vendor/dsh-undo-savepoint/lib/index.js:2198`（快照创建点） | 坏插件仍被挂载、引擎仍起不来而 `undo-gate.log` 报 `executed ok`；升级后若新版本从未健康启动，回滚会把新版本的补丁/挂载项静默删掉（新 APK + 旧配置） | 已修（2026-09-21：known-good 由壳侧探活健康定义 + 安装指纹护栏；设备验收 PASS=9） |
+| 高 | K03 | 自动回滚目标取自**崩溃那次启动自己建的**快照（快照在建/挂载阶段就写，早于健康判定），于是「回滚成功」而状态没变好；跨版本还会把上一次安装的配置写回 | `app/src/main/java/com/dsharnessmobile/shell/UndoGate.kt:240`、`:194`、`vendor/dsh-undo-savepoint/lib/core.mjs:1180`（快照创建点；0.4.9 起实现由 index.js 拆到 core.mjs，原 index.js:2198 锚点已随追版失效） | 坏插件仍被挂载、引擎仍起不来而 `undo-gate.log` 报 `executed ok`；升级后若新版本从未健康启动，回滚会把新版本的补丁/挂载项静默删掉（新 APK + 旧配置） | 已修（2026-09-21：known-good 由壳侧探活健康定义 + 安装指纹护栏；设备验收 PASS=9） |
 | 高 | K03 | 整份配置回滚会**静默吞掉用户在最后一次健康启动之后装的插件**（挂载清单是一整份文件） | `app/src/main/java/com/dsharnessmobile/shell/PluginMounts.kt:41`、`UndoGate.kt:279` | 用一个坏插件换掉用户全部插件的装配状态 | **已改（2026-09-21 用户拍板）**：清单式——硬清单随版本并集（强制保留）+ 软清单记「当前清单被证明可用」；能点名则**只拔那一块**（其余条目与注释逐字节不动），点不出名且清单变过则拒绝回滚 |
 | 高 | K03 | 刷新失败路径不判 `rollback` 返回值即清 marker；残留 `previous` 会被下次失败路径当回滚源 | `app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt:196-198` | 回滚结果被掩盖，坏树可能被「回滚」成更坏状态 | 未修（D-3 实效性缺口） |
 | 高 | K03 | 在线更新的 `usr` 换位是非事务两步 `renameTo`，不写指纹也不写 marker | `app/src/main/java/com/dsharnessmobile/shell/UpdateManager.kt:69-80` | 中途中断即半新半旧且无恢复源；指纹口径不同还会让下次启动重解压 | 未修 |
@@ -779,6 +781,8 @@ flowchart TD
   - `shellEnv()`（EngineManager.kt:1400-1478）是引擎/控制台/日志三处子进程环境的唯一来源：PATH、LD_LIBRARY_PATH、HOME、DSH_HOME、TMPDIR、LD_PRELOAD、TERMUX_EXEC__*、OPENSSL_CONF、DSH_PICK_TOKEN、NODE_COMPILE_CACHE、UV_THREADPOOL_SIZE、npm_config_store_dir。
   - 交叉读写：`WatchdogV2.consecutiveFailures/consecutiveDegradedHttp` 由看门狗写，被 EngineStartFlow.kt:349、EngineService.kt:134 读；`EngineManager.lastRefreshFailure` 被 EngineStartFlow.kt:485 读；`pendingRecoveryFailure` 由 EngineManager.kt:312 写。
   - `EngineProbe.ENGINE_URL`（EngineProbe.kt:26）被 MainActivity.kt:819/822 的 loadUrl 与 EngineAuth.AUTHORITY（EngineAuth.kt:48）共用，cookie 名 = sha256(authority)。
+  - **运行时树完整性判据**（0.14.2-fx-2 缺陷 A）：`RuntimeTree.missingEntries(liveRuntimeComplete/stagedRuntimeComplete)` 是「引擎能不能起」的前置判据；动态库缺失名单依据 `readelf -d usr/bin/node` 的实测 DT_NEEDED（8 条非 bionic 库）。
+    与降级闸门的握手是**单向**的：`SnapshotRefreshPolicy.shouldDegrade` 首行 `if (!liveComplete) return false` ⇒ 残缺树自动拒绝降级启动。
   - `ControlCarrier.ensureStarted` / `NotifyStore.start` / `NotifyBridge.start` 随 EngineService.onCreate 起停（EngineService.kt:40-43）。
   - `LiveProbe.kt` 是状态页 TTL 探测原语，与本块引擎生命周期无运行时交集：生产侧零调用点（`grep -rn "LiveProbe\|tcpProbe" app/src/main` 只剩定义行），仅 AdbLiveProbeTest 使用。
 - **关键坐标**：
@@ -789,9 +793,20 @@ flowchart TD
   - `EngineService.kt:107-188`（ensureEngine + 5s tick；planTick :123、UNDO :143、RESTART :160）
   - `WatchdogV2.kt:109-167`（planTick；前置副作用 :124-127、启动窗推迟 :146、undo 先于熔断 :158-163、RESTART :167）
   - `EngineProbe.kt:38`（check，200/401/303 = running）与 `:80`（portReachable，Proxy.NO_PROXY）
+  - `RuntimeTree.kt:127`（missingEntries：基础 3 项 + 8 条动态库 + 链接目标在树内）与 `:175`（snapshotLinkFailure：`CANNOT LINK` / `library not found` 两种形态）
+  - `RuntimeTree.kt:45`（REQUIRED_LIBS，8 条实测 DT_NEEDED）/`:100`（absoluteTargetInsideTree：绝对链接须在本树内，并兼容 /data/user/0 与 /data/data 双拼写）/`:196`（DAMAGE_MARKER）
+  - `EngineStartFlow.kt:687`（判死当拍调 `maybeSelfHealDamagedRuntimeTree`）/`:708`（启动成功清标记）/`:882`（自愈实现：预算内删指纹+清账本）/`:629`（401 ⇒ 触发重新认证，M.1 缺陷 b）
+  - `SnapshotRecoveryNotice.kt:46`（forRejection：拒绝明细 -> 可见文案，纯函数）/:`163`（injectionScript：注入脚本，pointer-events:none + 不自动隐藏）/`:231`（deliver：注入成功才删标记）/`:216`（recoveryConverged：收敛即复位判据）
+  - `MainActivity.kt:1212`（deliverRecoveryNotice：onPageFinished 后注入 WebUI；页面重载用内存文案重注）与 `EngineStartFlow.kt:934`（reportRecoveryRejectionIfAny）
+  - `EngineManager.kt:398`（clearStaleRecoveryFailure：收敛即清 pendingRecoveryFailure——修既有「从不复位」缺陷）
+  - `EngineManager.kt:467`（`runtimeTreeDamageMarker` 标记的唯一读取方）/`:1380`（写进诊断包 info.txt 的 `runtime_tree_damage` 行）
+  - `EngineProbe.kt:102`（`classifyAuthState`：401 ⇒ REQUIRED）与 `classifyEngineAvailability`（四态判定，见 K02 耦合段）
+  - `GuideChrome.kt:394`（第三枚次级按钮 reauthButton，另起一行避窄屏截断）与 `GuidePageRenderer.kt:360`（`onReauthEngine`：强制刷新 cookie + 重启引擎 + 重载）
+  - `EngineManager.kt:433`（stagedRuntimeComplete）/`:448`（liveRuntimeComplete）：两条判据都改为 `RuntimeTree.missingEntries(...).isEmpty()` 并**逐项打印缺失名**
   - `LogCollector.kt:246/363/378`（markBootStart / markFirstHttp / markListen）与 `:458/:521`（boot-diag / boot-fail 落盘）
 - **不变量**：
-  1. `usr/bin/node` 与 `usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js` 必须在场（engineReady:44、stagedRuntimeComplete:360）；`usr/lib/libtermux-exec-ld-preload.so` 缺失时 `startEngine` 直接返回 false（:820-824）。违反症状：引导页「引擎启动失败」+ boot-fail.log `stage=engine-start-false`。
+  1. `usr/bin/node` 与 `usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js` 必须在场（engineReady:44、stagedRuntimeComplete:433）；**且 `usr/lib` 下 8 条 DT_NEEDED 动态库必须在场**（`RuntimeTree.REQUIRED_LIBS`）——旧判据只查 3 项，故 `usr/lib` 全缺也判「完整」，引擎每次都在链接期 `CANNOT LINK` 而死且看门狗反复拉起（0.14.2-fx-2 缺陷 A）。
+     `usr/lib/libtermux-exec-ld-preload.so` 缺失时 `startEngine` 直接返回 false（:820-824）。违反症状：引导页「引擎启动失败」+ boot-fail.log `stage=engine-start-false`。
   2. LD_PRELOAD + `TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE=force` 必须注入（:1449-1451）；否则 Android 15+ 上 app 数据目录 ELF 不可 exec，任何子进程失败。
   3. 同一时刻只允许一个引擎进程占 3080；rebind 前必须确认端口已释放，否则 EADDRINUSE 循环（:1323-1327 会显式记一条）。
   4. 快照刷新期间（snapshotRefreshing=true）禁止拉起引擎（:813）；违反即引擎跑在半解压树上（坑 37 三重实锤）。
@@ -865,7 +880,7 @@ flowchart TD
   - 指纹文件 `.snapshot-fingerprint`：`EngineManager.fingerprintFile()`(:74) 写、`snapshotFresh()`(:81-86) 读、`UpdateManager`(:97) 也写 —— 三处共用一个文件是两条更新链的接缝。
   - 用户面集合：`SnapshotUserData.preservedNames`(:30-34) 由 `EngineManager` 传入 `swap`；`home` 顶层走 seed-if-absent(:331-337)；profiles 根两个清单走 `mergePackageJson`(:598) / `FactoryProfilePatch.merge`(:655-658)。
   - 退役插件迁移：`REMOVED_PROFILE_PLUGINS`(SnapshotTransaction.kt:43-46) 的「挂载 id + 包名」是 `reconcileRemovedProfilePlugins`(:385) 的唯一输入 —— 新增摘除必须在此登记，否则老设备摘不掉。
-  - 退役 disabled 行：`FactoryProfilePatch.RETIRED_DISABLED_ROW_IDS`(FactoryProfilePatch.kt:41) 同时被 `EngineManager.repairProfilePatch`(:1159) 与 `FactoryProfilePatch.merge`(:88) 读。
+  - 退役 disabled 行：`FactoryProfilePatch.RETIRED_DISABLED_ROW_IDS`(FactoryProfilePatch.kt:65) 同时被 `EngineManager.repairProfilePatch`(:1159) 与 `FactoryProfilePatch.merge`(:88) 读。
   - 在线更新状态文件：`.update-pending` / `.update-pending-at` / `usr-old` / `update-stage` / `update.tar.xz` 由 `UpdateManager` 写、`EngineManager.onEngineProbe`(:1344) 读收口；`DEFAULT_MANIFEST_URL`(:154)、`EMULATOR_HOST`(:157)、`validateManifestUrl`(:168) 是入口准入面。
   - 下载落盘：`DownloadSaver` 依赖 `EngineProbe.ENGINE_URL`（`isEngineSource`，DownloadSaver.kt:17）、`EngineAuth.attach`(:101)、`dshDataDir/exports`；`UpdateChecker` 依赖 `BuildConfig.VERSION_NAME`(:115) 与 `Documents/dshdata/updates`(:38)。
 - **关键坐标**：
@@ -876,7 +891,9 @@ flowchart TD
   - `app/src/main/java/com/dsharnessmobile/shell/SnapshotFs.kt`（`deletePath`）— 逐项容错 + `newDirectoryStream` 枚举（P0-B：避开 API 34 的 `Stream.toList`）；0.14.1 D1 起容错面为 `Exception` + `LinkageError`（重抛 `VirtualMachineError`），判定在顶层 `isTolerableDeletionFailure`
   - `app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt:196` — 刷新失败路径：回滚结果未判 + 无条件清 marker（D-3 逃逸点）
   - `app/src/main/java/com/dsharnessmobile/shell/UpdateManager.kt:34` — 未配置可信发布源即拒绝（S-10 fail-closed）
-  - `app/src/main/java/com/dsharnessmobile/shell/FactoryProfilePatch.kt:79` — 工厂 disabled 语义纠正入口
+  - `app/src/main/java/com/dsharnessmobile/shell/FactoryProfilePatch.kt:149`（`merge`）— 工厂 disabled 语义纠正入口；
+    入口内**先**跑 `normalizeLegacyAgentDefaultModel`(:261) 归一旧「单点」写法（`agent-default-model` disabled + 同包换 id insert）
+    为「就地按上游 id 覆盖 config」，保住用户 config 逐字不变。启动期另有一次 `repairRetiredDisabledRows`(:338)。
 - **不变量**：
   1. marker 是恢复唯一权威：任何条目被触碰前必须先写进 journal；`clearMarker` 只允许在「已收敛」时发生（STAGED 丢弃、前滚、**成功**回滚、finish）。违反 → 半成品树被当成正常树，症状是「插件注册了但不真实可用」。
   2. 用户数据从不被 move/copy/delete：`preservedNames` 命中即原地保留；`home` 顶层 seed-if-absent；profiles 根的两个清单是用户面（只做并集/按 id 增补）。
@@ -2459,7 +2476,11 @@ app/src/main/java/com/dsharnessmobile/shell/MainActivity.kt
 app/src/main/java/com/dsharnessmobile/shell/UserCopy.kt
 app/src/main/java/com/dsharnessmobile/shell/EngineStartFlow.kt
 app/src/main/java/com/dsharnessmobile/shell/GuideChrome.kt
+app/src/main/java/com/dsharnessmobile/shell/SnapshotRecoveryNotice.kt
+app/src/main/java/com/dsharnessmobile/shell/RuntimeTree.kt
 app/src/main/java/com/dsharnessmobile/shell/GuidePageRenderer.kt
+app/src/main/java/com/dsharnessmobile/shell/SafeMode.kt
+app/src/main/java/com/dsharnessmobile/shell/SafeConsole.kt
 app/src/main/java/com/dsharnessmobile/shell/WebUiChrome.kt
 app/src/main/java/com/dsharnessmobile/shell/ConsoleActivity.kt
 app/src/main/java/com/dsharnessmobile/shell/ConsoleSession.kt
@@ -2608,6 +2629,7 @@ scripts/patches/apply-patches.mjs
 scripts/patches/registry.json
 scripts/patches/README.md
 scripts/patches/data/compat-map.json
+scripts/patches/data/undo-safe-align-snippet.mjs
 glob:scripts/patches/tests/*.test.mjs
 glob:scripts/patches/tests/fixtures/**
 glob:scripts/snapshot-config/*

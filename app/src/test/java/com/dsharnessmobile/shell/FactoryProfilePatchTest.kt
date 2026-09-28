@@ -471,10 +471,14 @@ class FactoryProfilePatchTest {
    * 真实工厂件（本仓镜像 `scripts/profile-web.cordis.patch.yml`）的**逐字节自一致**：
    * 零改动必须零重写。这是 D10 重写「块级 → 条目级」后最容易回归的性质——全文重建一旦漏字节，
    * 每次快照刷新都会无谓重写 patch（并可能把 CRLF/LF 与尾行吃掉）。
-   * 同时锁定工厂件的结构事实（22 个顶层条目；唯一多子条目组 = shell-termux + host-web-compat），
+   * 同时锁定工厂件的结构事实（21 个顶层条目；唯一多子条目组 = shell-termux + host-web-compat），
    * 该事实是 P-1/P-2 触发的唯一靶子；工厂变了这里必须先红。
    * 条目数自 20 增至 22 是 0.14.2-fx-1 的产品改动：新增 `ptc-runtime` 行把 PTC 代码执行的
    * `nodeExecutable` 钉死——linker64 回落会把 process.execPath 污染成 linker64，堆参数被当成程序路径。
+   * 22 减为 21 是 0.14.2-fx-2（task-80）的产品改动：`agent-default-model` 不再走
+   * 「disable 上游行 + 换 `agent-default-model-mobile` 新 id insert」两条顶层块，改为**同 id 就地
+   * 覆盖 config**（一条顶层块）⇒ 顶层条目数少一条。旧写法使 session-controller 的
+   * `agentDefaultModel` 供给依赖一条自定义 id 的条目，它 pending 即整个 session 面静默消失。
    */
   @Test
   fun realFactoryFileSelfMergeIsByteIdentical() {
@@ -489,7 +493,7 @@ class FactoryProfilePatchTest {
     assertTrue("零改动时不得有改动说明", result.changes.isEmpty())
 
     val blocks = FactoryProfilePatch.topLevelBlocks(text)
-    assertEquals("顶层条目数（工厂件结构改变时同步本断言）", 22, blocks.size)
+    assertEquals("顶层条目数（工厂件结构改变时同步本断言）", 21, blocks.size)
     val groups = blocks.map { FactoryProfilePatch.blockIds(it) }.filter { it.size > 1 }
     assertEquals("唯一多子条目组 = shell-termux + host-web-compat", 1, groups.size)
     assertEquals(listOf("shell-termux", "host-web-compat"), groups.single())
@@ -498,7 +502,7 @@ class FactoryProfilePatchTest {
   /**
    * D10 的**真实形态**反证：拿仓库里的权威工厂件，人为抹掉 @BQ@host-web-compat@BQ@ 这一条
    * （设备上真实发生过的「同一组里少一个插件」形态），merge 必须把它补回**同一个** insert 组，
-   * 且其余 20 个顶层条目一字不动。
+   * 且其余 20 个顶层条目（21 - 1 = shell-termux 所在组）一字不动。
    *
    * 旧实现在这里 @BQ@changes=0@BQ@ 且零日志：工厂件里 @BQ@shell-termux@BQ@ 已让该块被判定「存在」。
    */
@@ -520,7 +524,7 @@ class FactoryProfilePatchTest {
 
     assertTrue("D10：缺失的组内兄弟必须被补回", result.text.contains("id: host-web-compat"))
     assertTrue("补回的是同一个组（shell-termux 仍是组首）", result.text.contains("id: shell-termux"))
-    assertEquals("顶层条目数不变（补进组内，不是追加成新块）", 22, FactoryProfilePatch.topLevelBlocks(result.text).size)
+    assertEquals("顶层条目数不变（补进组内，不是追加成新块）", 21, FactoryProfilePatch.topLevelBlocks(result.text).size)
     val group = FactoryProfilePatch.topLevelBlocks(result.text)
       .first { FactoryProfilePatch.blockIds(it).contains("shell-termux") }
     assertEquals(listOf("shell-termux", "host-web-compat"), FactoryProfilePatch.blockIds(group))
@@ -529,5 +533,210 @@ class FactoryProfilePatchTest {
     // 再次合并必须稳定（幂等），否则每次快照刷新都会重写 patch。
     val second = FactoryProfilePatch.merge(result.text, factory)
     assertEquals("补齐后必须稳定", result.text, second.text)
+  }
+
+  // ── 0.14.2-fx-2 迁移：旧「单点」写法归一（issue: 升级设备上 task-80 A 修法失效）──
+  //
+  // 真实现场来自 emulator-5554（已升级设备，live patch 17934 B）—— 形态逐字取自设备。
+
+  /** 设备实测的旧形态（含用户值 xiaomimimo / mimo-v2.5）。 */
+  private val legacySinglePointLive = """
+    # 设置界面 agent-default-model 段为用户级（UI 保存会覆盖此默认）。
+    - id: agent-default-model
+      disabled: true
+    - insert:
+        - id: agent-default-model-mobile
+          name: '@deepseek-ai/dsh-agent-default-model'
+          config:
+            provider: xiaomimimo
+            model: mimo-v2.5
+    - insert:
+        - id: shell-termux
+          name: '@dsh-android/dsh-shell-termux'
+  """.trimIndent() + "\n"
+
+  /** 新形态（工厂件；就地覆盖 config，不再 disable / 不再换 id）。 */
+  private val newShapeFactory = """
+    - id: agent-default-model
+      config:
+        provider: deepseek-official
+        model: deepseek-v4-flash
+    - insert:
+        - id: shell-termux
+          name: '@dsh-android/dsh-shell-termux'
+  """.trimIndent() + "\n"
+
+  /** 正例（判据本体）：旧形态必须迁成新形态，且**用户值一字不差保留**。 */
+  @Test
+  fun legacySinglePointIsNormalizedKeepingTheUserValueVerbatim() {
+    val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(legacySinglePointLive)
+
+    assertFalse("旧自定义 id 必须消失（单点消失）", result.text.contains("agent-default-model-mobile"))
+    val upstream = FactoryProfilePatch.topLevelBlocks(result.text)
+      .first { FactoryProfilePatch.blockIds(it).contains("agent-default-model") }
+    assertEquals("上游行不得再被 disable", null, FactoryProfilePatch.disabledValue(upstream))
+    assertTrue("用户 provider 必须逐字保留", result.text.contains("provider: xiaomimimo"))
+    assertTrue("用户 model 必须逐字保留", result.text.contains("model: mimo-v2.5"))
+    assertFalse("不得保留工厂 pin 的 provider", result.text.contains("provider: deepseek-official"))
+    assertTrue("无关的工厂/用户块不得受影响", result.text.contains("shell-termux"))
+    assertTrue("必须留下可追溯说明", result.changes.any { it.contains("归一") })
+  }
+
+  /** 反例 A：把触发条件放宽成「见到 -mobile 就删」⇒ 必须判红（窄条件是判据本体）。 */
+  @Test
+  fun aBareMobileIdWithoutOurNameMustNotBeTouched() {
+    // 用户自装的同名 id（name 不是我们的包）—— 不得动。
+    val userOwned = """
+      - id: agent-default-model
+        disabled: true
+      - insert:
+          - id: agent-default-model-mobile
+            name: 'some-user-package'
+            config:
+              provider: user-choice
+    """.trimIndent() + "\n"
+    val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(userOwned)
+    assertEquals("name 不匹配时一律不动（宁可少迁，不可错迁）", userOwned, result.text)
+    assertTrue("不该有改动", result.changes.isEmpty())
+  }
+
+  /** 反例 B：上游行**未** disabled ⇒ 不满足触发条件 ⇒ 不动。 */
+  @Test
+  fun alreadyNormalizedShapeIsLeftAlone() {
+    val alreadyNew = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(alreadyNew)
+    assertEquals("已归一形态不得被再改", alreadyNew, result.text)
+    assertTrue(result.changes.isEmpty())
+  }
+
+  /** 反例 C：完全无关的 patch 不得被改动。 */
+  @Test
+  fun unrelatedPatchIsUntouched() {
+    val unrelated = "- id: my-row\n  disabled: true\n"
+    val result = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(unrelated)
+    assertEquals("无关 patch 一字不动", unrelated, result.text)
+    assertTrue(result.changes.isEmpty())
+  }
+
+  /** 幂等：二次运行零改写。 */
+  @Test
+  fun normalizationIsIdempotent() {
+    val first = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(legacySinglePointLive)
+    val second = FactoryProfilePatch.normalizeLegacyAgentDefaultModel(first.text)
+    assertEquals("第二次不得再改一字", first.text, second.text)
+    assertTrue("第二次必须无改动可言", second.changes.isEmpty())
+  }
+
+  /** 端到端：经 merge() 后旧形态也必须消失（迁移挂在 merge 入口）。 */
+  @Test
+  fun mergeAlsoNormalizesTheLegacySinglePoint() {
+    val result = FactoryProfilePatch.merge(legacySinglePointLive, newShapeFactory)
+    assertFalse("经 merge 也不得残留旧 id", result.text.contains("agent-default-model-mobile"))
+    assertTrue("用户值仍须保留", result.text.contains("provider: xiaomimimo"))
+    assertFalse("上游行不得仍被 disable", result.text.contains("disabled: true\n  config:\n    provider: xiaomimimo"))
+    // 幂等：二次 merge 零改写
+    val second = FactoryProfilePatch.merge(result.text, newShapeFactory)
+    assertEquals("二次 merge 不得再改", result.text, second.text)
+  }
+
+  // ── 结构校验的判别力（Lead 追加的两条反证）───────────────────────────────
+  //
+  // 校验若只是「看着对」的摆设，这两条用来钉它：删掉校验 / 漏搬一个键，都必须判红。
+
+  /** 校验的正例：合法归一结果必须通过四条判据。 */
+  @Test
+  fun verifyNormalizationAcceptsAWellFormedResult() {
+    val after = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    assertEquals(
+      "合法结果必须通过校验",
+      null,
+      FactoryProfilePatch.verifyNormalization(legacySinglePointLive, after),
+    )
+  }
+
+  /**
+   * 反证（Lead 追加 ①）：**只搬 provider、漏掉 model** ⇒ 必须判红。
+   * 证明 (c)「用户 config 逐行保留」是判据本体，不是摆设。
+   */
+  @Test
+  fun verifyNormalizationRejectsAResultThatDroppedOneConfigKey() {
+    val lostModel = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, lostModel)
+    assertTrue("漏搬 model 必须被判红，实得: " + why, why != null)
+  }
+
+  /**
+   * 反证（Lead 追加 ②）：**归一结果里 -mobile 没删掉** ⇒ id 集合不符 ⇒ 判红。
+   * 等价于「删掉校验」时会被放过的坏结果之一。
+   */
+  @Test
+  fun verifyNormalizationRejectsAResultThatKeptTheLegacyId() {
+    val keptMobile = """
+      - id: agent-default-model
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: agent-default-model-mobile
+            name: '@deepseek-ai/dsh-agent-default-model'
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, keptMobile)
+    assertTrue("残留 -mobile 必须被判红，实得: " + why, why != null)
+  }
+
+  /** 反证：上游 id 仍带 disabled: true ⇒ 判红。 */
+  @Test
+  fun verifyNormalizationRejectsAResultThatLeftTheDisableInPlace() {
+    val stillDisabled = """
+      - id: agent-default-model
+        disabled: true
+        config:
+          provider: xiaomimimo
+          model: mimo-v2.5
+      - insert:
+          - id: shell-termux
+            name: '@dsh-android/dsh-shell-termux'
+    """.trimIndent() + "\n"
+    val why = FactoryProfilePatch.verifyNormalization(legacySinglePointLive, stillDisabled)
+    assertTrue("残留 disabled 必须被判红，实得: " + why, why != null)
+  }
+
+  /** 校验取值与归一实际搬的是同一份（同一 helper）——防「校验与实现漂移」。 */
+  @Test
+  fun legacyMobileConfigLinesIsTheSharedSourceOfTruth() {
+    val lines = FactoryProfilePatch.legacyMobileConfigLines(legacySinglePointLive)
+    assertTrue("必须取到 config 键行", lines.any { it.trim() == "config:" })
+    assertTrue("必须含用户 provider", lines.any { it.contains("provider: xiaomimimo") })
+    assertTrue("必须含用户 model", lines.any { it.contains("model: mimo-v2.5") })
+    assertTrue(
+      "不满足形态时返回空（用于「不动」判定）",
+      FactoryProfilePatch.legacyMobileConfigLines("- id: unrelated\n").isEmpty(),
+    )
   }
 }

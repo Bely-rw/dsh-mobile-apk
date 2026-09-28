@@ -322,8 +322,12 @@ for (const entry of OVERLAY.keepUnpublished ?? []) {
     const out = execSync(`node "${join(ROOT, 'scripts', 'tests', script)}" ${flag} "${target}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     const pass = /(?:^|\n)ℹ pass (\d+)/.exec(out)?.[1] ?? '0'
     const fail = /(?:^|\n)ℹ fail (\d+)/.exec(out)?.[1] ?? '0'
-    if (Number(fail) > 0 || out.includes('[skip]')) {
-      console.error(`[引擎树补丁行为回归失败] ${label}: pass=${pass} fail=${fail}${out.includes('[skip]') ? '（目标文件不在场）' : ''}`)
+    // G.0b 假绿修复（0.14.2-fx-2）：旧判据 `Number(fail)>0 || out.includes('[skip]')` 是真空判据——
+    // 脚本若不产出 `ℹ pass/ℹ fail` 汇总行（或产出 0 行），两个分支**同时为假**，于是「一行断言都没跑」
+    // 也照样放行（实测 coord 版 boot-pending 正是这样：pass=0 fail=0 ⇒ vacuous PASS）。
+    // 收紧为 `pass>0`：必须有**真实通过**的断言才放行；fail>0 与 [skip] 仍判红。
+    if (Number(pass) <= 0 || Number(fail) > 0 || out.includes('[skip]')) {
+      console.error(`[引擎树补丁行为回归失败] ${label}: pass=${pass} fail=${fail}${Number(pass) <= 0 ? '（未产出任何通过断言——真空判据）' : ''}${out.includes('[skip]') ? '（目标文件不在场）' : ''}`)
       process.exit(1)
     }
     log(`引擎树补丁行为回归 ${label}: pass=${pass} fail=${fail}`)
@@ -737,6 +741,47 @@ try {
 } catch (e) {
   // 不静默：市场安装是本里程碑验收项，装配失败必须可见（build-apk 门禁会因此拒绝打包）
   console.error(`  [pnpm 装配失败] ${e?.stack ?? String(e)}`)
+}
+
+// ── 7c1. PTC node wrapper（0.14.2 缺陷 C：`code run` 的 spawn EACCES / CANNOT LINK）──────────
+// 现象：模型在 PTC（`code run`）里连 `return 1 + 1;` 都失败，报
+//   code run failed (worker-exit): Node process exited before completing
+// 真因：PTC 给子进程传的是**显式过滤后的 env**——ptc-runtime-node 的 STARTUP_ENVIRONMENT_NAMES
+// 只放 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP 六个名字，其余一律 tombstone（置 undefined），
+// 于是 LD_LIBRARY_PATH 不在子进程环境里。后果分两层：
+//   ① Enforcing 真机（Android 16）：app 域 exec app-data ELF 被 SELinux 拒（execute_no_trans）⇒ EACCES；
+//   ② Permissive 模拟器（本机）：放行后暴露下一层 ⇒ `CANNOT LINK … library "libz.so.1" not found`
+//      （node 的 DT_NEEDED 含 libz/libcares/libsqlite3/libcrypto/libssl/libicu*/libc++_shared，全靠 LD_LIBRARY_PATH）。
+// 设备实测（16416 V2284A，同 env 只差「是否走 wrapper」，一正一反成对）：
+//   env -i PATH=… <node> -e 1                      → CANNOT LINK EXECUTABLE … "libz.so.1" not found
+//   env -i PATH=… <wrapper> -e 1                   → CHILD-OK
+// 修法（C1）：让 node 经由一个**快照内的 wrapper 脚本**启动。
+//   ① 脚本非 ELF，内核走 shebang 用 /system/bin/sh 读它，**不触发 app-data ELF exec**；
+//   ② wrapper 自己 export LD_LIBRARY_PATH，**不依赖被子进程 env 继承**（那正是被 tombstone 的东西）；
+//   ③ `/system/bin/linker64 <app-data node>` 正是壳侧引擎自己在用的形态（EngineManager.kt:1126），
+//      该文件只被 linker **读取**而非 exec，绕开 execute_no_trans。
+// 与 7d git wrapper / 7e pnpm shim 同一种「构建期写可执行 shim」机制；落点在 usr/libexec（不进 PATH，
+// 避免被当成通用命令；由 profile 的 nodeExecutable 绝对路径直接引用）。
+// 边界（如实登记）：真机 Enforcing 上的 EACCES 字面**未复现**（本机是 Permissive 模拟器）；
+// 上游 pnpm/git 那条「引号包裹路径」的写法在本文件里保持一致。
+const PTC_NODE_WRAPPER_REL = 'libexec/dsh-node'
+try {
+  const wrapperDir = join(U, 'libexec')
+  mkdirSync(wrapperDir, { recursive: true })
+  // 设备路径烧写（同 git wrapper / pnpm shim）：执行目标必须是设备端路径，绝不可用本地 stage 路径。
+  writeFileSync(
+    join(U, PTC_NODE_WRAPPER_REL),
+    '#!/system/bin/sh\n'
+      + '# dsh-mobile: PTC node launcher (C1) - app-data ELF cannot be exec\'d under untrusted_app,\n'
+      + '# so hand it to the system linker with the snapshot library path exported here.\n'
+      + 'export LD_LIBRARY_PATH="' + NEW_PREFIX + '/lib"\n'
+      + 'exec /system/bin/linker64 "' + NEW_PREFIX + '/bin/node" "$@"\n',
+    { mode: 0o755 },
+  )
+  log('PTC node wrapper 就位: usr/' + PTC_NODE_WRAPPER_REL + ' -> linker64 + bin/node（LD_LIBRARY_PATH 在 wrapper 内 export）')
+} catch (e) {
+  // 不静默：PTC 是本里程碑验收项（`code run` 是模型的主要执行手段），装配失败必须可见。
+  console.error('  [PTC wrapper 装配失败] ' + (e?.stack ?? String(e)))
 }
 
 // ── 7c2. @napi-rs/canvas 进出厂依赖（0.13.1，issue apk#96-Bug3/#103）──

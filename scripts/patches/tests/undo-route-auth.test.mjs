@@ -4,7 +4,7 @@
 // the snapshot build, imports the patched artifact, and dispatches requests through its actual
 // registered /api/undo prefix handler. This catches both transform breakage and the exact-before-
 // longest-prefix routing condition that bypasses client-connection's /api handler.
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -73,7 +73,22 @@ const pendingEffects = []
 try {
   const target = join(scratch, targetRel)
   mkdirSync(dirname(target), { recursive: true })
-  writeFileSync(target, readFileSync(source, 'utf8').replace(/\r\n/g, '\n'))
+  // 0.4.9 起 index.js 把实现拆到 core.mjs/zip.mjs/i18n.mjs（且 core.mjs 再 import i18n.mjs 与 i18n/*.json）。
+  // 只拷 index.js 会让 import 期 ERR_MODULE_NOT_FOUND（实测：Cannot find module .../lib/core.mjs）。
+  // 这里整目录拷贝 lib/，并对文本文件统一归一为 LF（补丁锚点与结构断言都按 LF 写；
+  // 若不归一，index.js 会被本循环以 CRLF 覆盖上面那行，结构断言随即失配——实测踩到）。
+  const libDir = join(repoRoot, 'vendor', 'dsh-undo-savepoint', 'lib')
+  for (const name of readdirSync(libDir, { recursive: true })) {
+    const srcPath = join(libDir, name)
+    if (!statSync(srcPath).isFile()) continue
+    const destPath = join(scratch, 'dsh-undo-savepoint', 'lib', name)
+    mkdirSync(dirname(destPath), { recursive: true })
+    if (/\.(mjs|js|json)$/.test(name)) {
+      writeFileSync(destPath, readFileSync(srcPath, 'utf8').replace(/\r\n/g, '\n'))
+    } else {
+      writeFileSync(destPath, readFileSync(srcPath))
+    }
+  }
 
   const applied = spawnSync(process.execPath,
     [patchRunner, scratch, '--apply', '--scope', 'vendor', '--only', 'undo-api-auth-U1'],

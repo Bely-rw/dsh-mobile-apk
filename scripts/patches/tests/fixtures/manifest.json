@@ -112,6 +112,14 @@
       "files": [
         "dist/api/openai-completions.js"
       ]
+    },
+    "dsh-ptc-runtime-node-0.1.7-rc.2": {
+      "source": "engine-tgz",
+      "engine": "0.1.7-rc.2",
+      "package": "@deepseek-ai/dsh-ptc-runtime-node@0.1.7-rc.2",
+      "files": [
+        "lib/index.js"
+      ]
     }
   }
 }

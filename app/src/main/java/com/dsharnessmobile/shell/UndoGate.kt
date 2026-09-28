@@ -39,8 +39,78 @@ object UndoGate {
    * Records the first confirmed-dead observation, then grants exactly one caller
    * the right to execute after [WATCH_MS]. A healthy probe disarms the wait.
    */
-  fun onProbeFailure(context: Context, consecutiveFailures: Int): Boolean {
+  /**
+   * 回滚的门槛证据（issue #274 ①）。三项都是「这次失败**不该**用回滚来救」的形态：
+   *  - 日志里有 `EADDRINUSE`：端口被别的进程占着（我们起不来，重启无意义）；
+   *  - 端口**不归本进程**（[portOwnedByApp] == false）：同上，重启我们不解决问题；
+   *  - **[slowOnly]**：探活只是**略超**预算（长 turn / 慢磁盘），不是引擎坏了。
+   * 三者任一命中 ⇒ 本拍**不 arm 也不 execute**（不碰用户配置、不强杀引擎）。
+   *
+   * @param logTail 引擎日志尾部（没有则空串）
+   * @param portOwnedByApp 端口是否归本应用持有；null = 未知（不因测量失败而否决）
+   * @param slowOnly 本次探活是否只是「略超预算」
+   */
+  data class RollbackEvidence(
+    val logTail: String = "",
+    val portOwnedByApp: Boolean? = null,
+    val slowOnly: Boolean = false,
+  ) {
+    companion object {
+      /** 无证据（既有调用点/测试的默认值）：不否决。 */
+      val NONE = RollbackEvidence()
+    }
+  }
+
+  /**
+   * 纯判据：本拍是否应当**放弃**回滚（返回拒绝理由；null = 可以用回滚）。
+   *
+   * 为什么单独抽成纯函数：这是「自动回滚到底该不该跑」的**第二道门**，必须能被 JVM 逐条反证。
+   * 注意它与 [decide] 的分工——[decide] 管「拍数/重试窗/观察窗」这类**计数语义**（既有坑 153 依赖它），
+   * 本函数管「这次失败**是不是该用回滚救**」这类**证据语义**。两者都在 [onProbeFailure] 里生效；
+   * 但把它们分开，既保住了坑 153 的既有语义（半死引擎仍能走到 [decide] 的 EXECUTE），
+   * 又让「探活超时误触发回滚」这一条有独立、可反证的判据。
+   */
+  internal fun rollbackEvidenceRefusal(evidence: RollbackEvidence): String? {
+    if (evidence.logTail.contains("EADDRINUSE")) {
+      return "回滚被否决：引擎日志显示 EADDRINUSE（端口被别的进程占着），重启/回滚都不解决问题"
+    }
+    if (evidence.portOwnedByApp == false) {
+      return "回滚被否决：监听端口的不是本进程（端口被他进程占用），重启我们不解决问题"
+    }
+    if (evidence.slowOnly) {
+      return "回滚被否决：本次探活只是略超预算（长 turn / 慢磁盘），不是引擎故障——不碰用户配置、不强杀引擎"
+    }
+    return null
+  }
+
+  /**
+   * Records the first confirmed observation, then grants one caller the right to
+   * execute after [WATCH_MS]. A healthy probe disarms the wait.
+   *
+   * 【issue #274 ①】在计数闸门之前先过**证据闸门**（[rollbackEvidenceRefusal]）。
+   * 真因：探活在 HTTP 超 2.5s 预算时给 DEGRADED_HTTP（实测出现过 3061ms），长 turn / 慢磁盘
+   * 足以让它连续 6 拍（30s）⇒ 直接回滚用户配置 + 强杀活引擎。一次慢响应不该有这种权限。
+   * 证据闸门否决时**既不 arm 也不 execute**，并落一行可诊断叙述。
+   *
+   * @param evidence 设备侧证据（默认无证据 = 不否决；既有调用点因此不受影响）。
+   */
+  fun onProbeFailure(
+    context: Context,
+    consecutiveFailures: Int,
+    evidence: RollbackEvidence = RollbackEvidence.NONE,
+  ): Boolean {
     val now = System.currentTimeMillis()
+    val refusal = rollbackEvidenceRefusal(evidence)
+    if (refusal != null) {
+      // 只在到过触发阈值时落叙述，避免每 5s 一拍刷爆观测文件。
+      if (consecutiveFailures >= TRIGGER_CONSEC_FAILURES && !evidenceNoted) {
+        evidenceNoted = true
+        record(context, "evidence-veto failures=" + consecutiveFailures + " reason=" + refusal)
+        Log.i(TAG, refusal)
+      }
+      return false
+    }
+    evidenceNoted = false
     return when (decide(consecutiveFailures, now, lastUndoAt(context), armedAt(context))) {
       GateDecision.IDLE -> false
       GateDecision.SUPPRESS -> {
@@ -128,6 +198,9 @@ object UndoGate {
 
   /** 本进程是否已记过「被重试窗口抑制」（每纪元只记一次）。 */
   @Volatile private var suppressNoted = false
+
+  /** 证据否决的叙述只落一次（与 [suppressNoted] 同款：避免每 5s 一拍刷爆观测文件）。 */
+  @Volatile private var evidenceNoted = false
 
   /**
    * 落一条闸门观测（best-effort，绝不抛）。**不经 DevLogPrefs 闸门**——它必须在默认配置下可见。

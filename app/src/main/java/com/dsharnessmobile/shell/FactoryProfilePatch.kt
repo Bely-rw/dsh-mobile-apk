@@ -64,6 +64,25 @@ internal object FactoryProfilePatch {
    */
   internal val RETIRED_DISABLED_ROW_IDS = setOf("ui-layout")
 
+  /**
+   * 旧「单点」写法的两个 id（0.14.2-fx-2 归一迁移，见 [normalizeLegacyAgentDefaultModel]）。
+   *
+   * 旧写法：`- id: agent-default-model / disabled: true` **加上** `- insert: - id: agent-default-model-mobile`
+   * （同一个包重新 insert 一次，只为塞 config）。该写法引入**服务供给单点**：
+   * session-controller 的 inject 依赖里有 agentDefaultModel，自定义 id 的 entry 一旦未激活（pending），
+   * session-controller 就跟着 pending ⇒ boot 仍报成功但 `ctx.sessionController` 缺席，
+   * 任何 session/selectModel 派发都得到 `active Service "sessionController" is unavailable`。
+   * 新写法：**就地按上游 id 覆盖 config**（`vendor/include/src/index.ts:109-123` 的 applyEntryPatches），
+   * 不再 disable、不再换 id。
+   */
+  internal const val LEGACY_UPSTREAM_ID = "agent-default-model"
+
+  /** 旧写法引入的自定义 id（迁走后必须从 live 消失）。 */
+  internal const val LEGACY_MOBILE_ID = "agent-default-model-mobile"
+
+  /** 旧写法 insert 的那个包名（用于把块与「用户自装同名 id」区分开）。 */
+  internal const val LEGACY_MOBILE_NAME = "@deepseek-ai/dsh-agent-default-model"
+
   /** 纠正结果：[text] 为纠正后全文，[changes] 为人类可读的改动说明（写日志/诊断）。 */
   internal class Result(val text: String, val changes: List<String>)
 
@@ -137,6 +156,19 @@ internal object FactoryProfilePatch {
       return Result(factoryText, if (factoryText.isBlank()) emptyList() else listOf("live 为空：落工厂件"))
     }
     val changes = ArrayList<String>()
+    // ⓪ 归一旧「单点」写法（必须先于 reconcile/append：它是条目 id 层面的重构，
+    //    后两步都建立在「条目集已正确」这一前提上）。
+    val normalized = normalizeLegacyAgentDefaultModel(liveText)
+    val live = normalized.text
+    changes += normalized.changes
+    // 归一的**结构化校验**（Lead 要求：放宽必须是有结构的收窄，不是削弱校验）。
+    // 失败即抛：绝不把一个未校验的归一结果交给后续 reconcile/append，更不落盘。
+    if (normalized.changes.isNotEmpty()) {
+      val why = verifyNormalization(liveText, live)
+      if (why != null) {
+        throw IllegalStateException("归一校验失败（拒绝落盘）: " + why)
+      }
+    }
     val factoryBlocks = parseBlocks(factoryText)
     val factoryDisabled = LinkedHashMap<String, Boolean>()
     val factoryEntryIds = LinkedHashSet<String>()
@@ -148,7 +180,7 @@ internal object FactoryProfilePatch {
       }
     }
 
-    val liveBlocks = parseBlocks(liveText)
+    val liveBlocks = parseBlocks(live)
     // 追加闸门取**live 文件原有的条目 id**（不是纠正之后的在场集）：退役行整条删除后
     // `present` 会变空，若拿它当闸门，#167 的「补齐工厂缺失条目」会被整体跳过（实测回归）。
     val liveEntryIds = LinkedHashSet<String>()
@@ -202,7 +234,7 @@ internal object FactoryProfilePatch {
       }
     }
 
-    val sb = StringBuilder(liveText.length + 256)
+    val sb = StringBuilder(live.length + 256)
     for (text in resolved) sb.append(text)
     var out = sb.toString()
     if (tail.isNotEmpty()) {
@@ -210,6 +242,152 @@ internal object FactoryProfilePatch {
       out += separator + tail
     }
     return Result(out, changes)
+  }
+
+  /**
+   * 归一旧「单点」写法为「就地覆盖 config」（0.14.2-fx-2 迁移）。
+   *
+   * **为什么需要它**（实测）：[merge] 的工厂权威只覆盖「工厂对同 id 有显式 disabled」与
+   * 「retired 行」两种情形。旧写法里
+   *   ① `agent-default-model` 的 `disabled: true` —— 新工厂件**不再有** disabled（改成 config 覆盖）
+   *      ⇒ `factoryDisabled` 不含它 ⇒ 不纠正；
+   *   ② `agent-default-model-mobile` —— 新工厂件里**不存在**该 id ⇒ 属 live 独有条目 ⇒ 按设计保留。
+   * 于是**已升级设备**（正是报障用户）永远停在旧形态，单点依旧存在。
+   * 干净安装不受影响（live 为空 ⇒ 直接落工厂件）。
+   *
+   * **触发条件（刻意收窄 —— 宁可少迁，不可错迁）**：同时满足
+   *   ① live 有顶层 `- id: agent-default-model` 且其条目级 `disabled: true`；
+   *   ② live 有 `- insert:` 组，组内含 `- id: agent-default-model-mobile` 且 `name:` =
+   *      [LEGACY_MOBILE_NAME]（用 name 把「我们引入的那个块」与「用户自装的同名 id」区分开）。
+   * 任一不满足 ⇒ **原样返回**（零改动）。
+   *
+   * **归一语义**：把 `-mobile` 块的 `config:` **整段原样搬到**同 id `agent-default-model` 上
+   * （覆盖工厂 pin，**用户值一字不差保留**）、去掉该行的 `disabled: true`、删除 `-mobile` 子条目。
+   *
+   * **幂等**：归一后的形态不再满足触发条件 ⇒ 二次运行零改写。
+   */
+  internal fun normalizeLegacyAgentDefaultModel(liveText: String): Result {
+    if (liveText.isEmpty()) return Result(liveText, emptyList())
+    val blocks = parseBlocks(liveText)
+    // ① 顶层 agent-default-model 必须存在且 disabled: true。
+    var upstreamIndex = -1
+    var upstreamEntry: Entry? = null
+    for ((index, block) in blocks.withIndex()) {
+      val entry = block.entries.firstOrNull { it.id == LEGACY_UPSTREAM_ID && !block.isInsert } ?: continue
+      upstreamIndex = index
+      upstreamEntry = entry
+      break
+    }
+    val upstream = upstreamEntry ?: return Result(liveText, emptyList())
+    val upstreamFragment = lineRange(blocks[upstreamIndex].lines, upstream.startLine, upstream.endLine)
+    if (disabledAtIndent(upstreamFragment, upstream.indent.length + 2) != true) {
+      return Result(liveText, emptyList())
+    }
+    // ② insert 组里必须有 id = -mobile 且 name = 我们的包。
+    var mobileBlockIndex = -1
+    var mobileEntry: Entry? = null
+    for ((index, block) in blocks.withIndex()) {
+      if (!block.isInsert) continue
+      val entry = block.entries.firstOrNull { it.id == LEGACY_MOBILE_ID } ?: continue
+      val fragment = lineRange(block.lines, entry.startLine, entry.endLine)
+      if (!fragment.contains(LEGACY_MOBILE_NAME)) continue
+      mobileBlockIndex = index
+      mobileEntry = entry
+      break
+    }
+    val mobile = mobileEntry ?: return Result(liveText, emptyList())
+    val mobileFragment = lineRange(blocks[mobileBlockIndex].lines, mobile.startLine, mobile.endLine)
+    // 取出 -mobile 的 config 段（含其子键），整段原样保留 —— 用户值不得被改写。
+    val configLines = extractConfigLines(mobileFragment)
+    if (configLines.isEmpty()) return Result(liveText, emptyList())
+    val changes = ArrayList<String>()
+    // ③ 把 config 打到上游 id 上并去掉 disabled: true。
+    // 缩进对齐：**必须按 config 键自身的缩进做基准**才对。
+    // 曾写错过：`upstreamKeyIndent + line.removePrefix(upstreamKeyIndent)` 是**恒等变换**
+    // （先去掉同一个前缀再加回来），config 会留在原缩进上、成为上游 id 的更深层级。
+    // 正确做法：去掉 config 段的**源**缩进，换成上游条目的键缩进。
+    val upstreamKeyIndent = upstream.indent + "  "
+    val configKeyIndent = leadingSpaces(configLines.first())
+    val newUpstream = configLines.joinToString("\n") { line ->
+      if (line.isEmpty()) line else upstreamKeyIndent + line.removePrefix(configKeyIndent)
+    }
+    var upstreamOut = extractNonDisabledBody(upstreamFragment)
+    // 去掉原 config（若有）后追加新 config —— 上游行原本只有 disabled，通常无 config。
+    upstreamOut = upstreamOut.trimEnd('\n') + "\n" + newUpstream + "\n"
+    changes += "归一旧单点写法: " + LEGACY_UPSTREAM_ID + " 就地覆盖 config 并去掉 disabled（用户值保留）"
+    // ④ 删除 -mobile 子条目；其所在 insert 组若因此变空则整组删除。
+    var mobileOut = ""
+    val mobileGroupRemainder = dropEntry(blocks[mobileBlockIndex], mobile)
+    if (mobileGroupRemainder.isNullOrBlank()) {
+      changes += "删除旧单点 insert 组（只含 " + LEGACY_MOBILE_ID + "）"
+      mobileOut = ""
+    } else {
+      changes += "删除旧单点条目: " + LEGACY_MOBILE_ID
+      mobileOut = mobileGroupRemainder
+    }
+    // ⑤ 按块重组全文（逐块替换，未动块原文保真）。
+    val sb = StringBuilder(liveText.length + 128)
+    for ((index, block) in blocks.withIndex()) {
+      when (index) {
+        upstreamIndex -> sb.append(upstreamOut)
+        mobileBlockIndex -> sb.append(mobileOut)
+        else -> sb.append(block.text)
+      }
+    }
+    return Result(sb.toString(), changes)
+  }
+
+  /**
+   * 归一的**结构化校验**（Lead 要求：放宽必须是有结构的收窄，不是削弱校验）。
+   *
+   * 四条判据（任一不成立即拒绝落盘）：
+   *  (a) id 集合 == 原集合 - {[LEGACY_MOBILE_ID]} —— 除它之外**一个都没少、也没多**；
+   *  (b) [LEGACY_UPSTREAM_ID] 仍在场，且**不带**条目级 `disabled: true`；
+   *  (c) 原 `-mobile` 块 config 的**每一行文本**都能在归一后的上游 config 里找到
+   *      —— 这是「用户值逐字保留」的**机械判据**（少搬一键必判红，而不是靠人看）；
+   *  (d) 归一后全文仍可解析（[topLevelBlocks] 能枚举出块且非空）。
+   *
+   * @return 拒绝理由（null = 通过）。
+   */
+  internal fun verifyNormalization(before: String, after: String): String? {
+    if (after.isBlank()) return "归一结果为空"
+    val beforeIds = LinkedHashSet<String>()
+    for (block in parseBlocks(before)) for (entry in block.entries) beforeIds += entry.id
+    val afterIds = LinkedHashSet<String>()
+    for (block in parseBlocks(after)) for (entry in block.entries) afterIds += entry.id
+    // (a) 只允许少一个 id，且必须是 -mobile。
+    val expected = LinkedHashSet(beforeIds)
+    expected.remove(LEGACY_MOBILE_ID)
+    if (afterIds != expected) {
+      val missing = expected - afterIds
+      val extra = afterIds - expected
+      return "id 集合不符：缺失=" + missing.joinToString(",") + " 多出=" + extra.joinToString(",")
+    }
+    // (b) 上游 id 在场且未 disabled。
+    var upstreamFragment: String? = null
+    var upstreamKeyIndent = 2 // 顶层条目的键缩进 = 条目缩进(0) + 2
+    for (block in parseBlocks(after)) {
+      if (block.isInsert) continue
+      val entry = block.entries.firstOrNull { it.id == LEGACY_UPSTREAM_ID } ?: continue
+      upstreamFragment = lineRange(block.lines, entry.startLine, entry.endLine)
+      upstreamKeyIndent = entry.indent.length + 2
+      break
+    }
+    val upstream = upstreamFragment ?: return "归一后 " + LEGACY_UPSTREAM_ID + " 不在场"
+    // 只认**条目自身层级**的 disabled（config 块内更深的同名键不算）。
+    if (disabledAtIndent(upstream, upstreamKeyIndent) == true) {
+      return "归一后 " + LEGACY_UPSTREAM_ID + " 仍带 disabled: true"
+    }
+    // (c) 用户 config 逐行保留（机械判据）——从**归一前**的文本里自己取，避免调用方各取一份而漂移。
+    val mobileConfigLines = legacyMobileConfigLines(before)
+    // 排除 `config:` 键行本身（它带缩进，故用 trim 比较而不是 startsWith）。
+    val body = mobileConfigLines.filter { it.trim() != "config:" && it.trim().isNotEmpty() }
+    for (line in body) {
+      if (!upstream.contains(line.trim())) return "用户 config 行未保留: " + line.trim()
+    }
+    // (d) 可解析。
+    if (parseBlocks(after).none { it.entries.isNotEmpty() }) return "归一结果无法解析出条目"
+    return null
   }
 
   /**
@@ -554,6 +732,92 @@ internal object FactoryProfilePatch {
     }
     return best
   }
+
+  /**
+   * 取条目片段里的 `config:` 段（键行 + 其下所有更深缩进的行），**原样**返回。
+   *
+   * 为什么要整段而不是只取 provider/model：config 是**整体替换不是深合并**
+   * （`vendor/include/src/index.ts:109-123` + 实测 `{a,b}` 打 `{b}` 只剩 `{b}`），
+   * 少搬一个键就会静默丢用户配置。逐字搬运是最安全的语义。
+   *
+   * @return config 段各行（不含尾随换行）；无 `config:` 键时为空。
+   */
+  private fun extractConfigLines(fragment: String): List<String> {
+    val lines = fragment.split("\n")
+    val head = lines.indexOfFirst { CONFIG_KEY.matches(it.trimEnd('\r')) }
+    if (head < 0) return emptyList()
+    val keyIndent = leadingSpaces(lines[head])
+    val out = ArrayList<String>()
+    out += lines[head].trimEnd('\r')
+    for (index in head + 1 until lines.size) {
+      val raw = lines[index].trimEnd('\r')
+      if (raw.isBlank()) {
+        // 段内空行保留（配置块里可能是注释分隔），但要确认后面还有内容才继续收集。
+        out += raw
+        continue
+      }
+      val indent = leadingSpaces(raw)
+      if (indent.length <= keyIndent.length) break
+      out += raw
+    }
+    // 去掉尾部空行（它们属于块间距，不属于 config 段）。
+    while (out.isNotEmpty() && out.last().isBlank()) out.removeAt(out.size - 1)
+    return out
+  }
+
+  /** 去掉条目片段里的 `disabled:` 行，其余原样（用于把上游行改成纯 config 行）。 */
+  private fun extractNonDisabledBody(fragment: String): String {
+    val kept = fragment.split("\n").filterNot { ENTRY_DISABLED.matches(it.trimEnd('\r')) }
+    return kept.joinToString("\n")
+  }
+
+  /**
+   * 从 [block] 里删掉 [entry] 那一条，返回块剩余原文（条目外的行保真）。
+   *
+   * @return null = 删掉后块内不再有任何条目（调用方据此把整组也删掉）。
+   */
+  private fun dropEntry(block: Block, entry: Entry): String? {
+    val rewritten = rewriteBlock(block, emptyMap(), setOf(block.entries.indexOf(entry)))
+    val stillHasEntries = parseBlocks(rewritten).any { it.entries.isNotEmpty() }
+    if (!stillHasEntries) return null
+    return rewritten
+  }
+
+  /**
+   * 从 [liveText] 取出旧「单点」`-mobile` 块的 config 段各行（无则空）。
+   *
+   * 抽出来给两处共用（归一 + 校验），避免两边各写一份取值逻辑而漂移 ——
+   * 校验若用自己那份，就可能与归一实际搬的东西不一致，那样校验会变成摆设。
+   */
+  internal fun legacyMobileConfigLines(liveText: String): List<String> {
+    for (block in parseBlocks(liveText)) {
+      if (!block.isInsert) continue
+      val entry = block.entries.firstOrNull { it.id == LEGACY_MOBILE_ID } ?: continue
+      val fragment = lineRange(block.lines, entry.startLine, entry.endLine)
+      if (!fragment.contains(LEGACY_MOBILE_NAME)) continue
+      return extractConfigLines(fragment)
+    }
+    return emptyList()
+  }
+
+  /**
+   * 取行首的连续空白前缀（只用显式循环）。
+   *
+   * **为什么不用 `String.takeWhile { … }`**（ApiLevelGuardTest 的保守规则）：
+   * `kotlin.text.takeWhile` 在 `String`/`CharSequence` 上其实与 API 级别无关（纯 Kotlin 标准库），
+   * 但 `java.util.stream.Stream.takeWhile()` 是 **API 34**，而壳侧门禁的规则是**只看方法名的文本正则**
+   * （`ApiLevelGuardTest.kt:157`：`\.(dropWhile|takeWhile)\s*[({]`）—— 它无法可靠区分接收者类型。
+   * 取舍：**不放宽门禁**（精确化在文本层面不可靠，且会削弱一条真防线），改为壳侧源码**一律避用该方法名**。
+   * 于是这里写成显式循环：行为等价、可读性不减、门禁保持简单且不可协商。
+   */
+  private fun leadingSpaces(line: String): String {
+    var i = 0
+    while (i < line.length && line[i] == ' ') i++
+    return line.substring(0, i)
+  }
+
+  /** `config:` 键行（任意缩进）。 */
+  private val CONFIG_KEY = Regex("""^\s*config:\s*$""")
 
   /** 把工厂子条目片段从 [fromIndent] 重新缩进到 [toIndent]（仅前导缩进，内容原样）。 */
   private fun reindent(fragment: String, fromIndent: String, toIndent: String): String {

@@ -863,62 +863,184 @@
     缺陷只在**同一个量被两侧各算一次**时出现；而症状（上抬量恰好多一个键盘）极易被误读成「留白算大了」而去调系数，
     实际是**通道重复计数**。同类形态（一个事实两条通道各自生效）值得当成一族来查。
 
-186. **来源审计构建在 pnpm 安装后备份整个 vendor 包目录，会沿工作区符号链接递归（2026-09-27，远程 run 36261389579）**：
+186. **上游声明的运行期依赖没随 overlay 走：设备 boot 期 `ERR_MODULE_NOT_FOUND` 硬崩，而本地门禁结构性全绿**（2026-09-27，H-1）
+    **现象**：设备 boot 期引擎硬崩，报 `ERR_MODULE_NOT_FOUND`，被依赖的模块是 `@modelcontextprotocol/client`；
+    而本地全部门禁绿、打包正常 —— 缺陷只在**设备运行期**出现。
+    **真因**：上游 `dsh-mcp-client` 的运行期依赖从 `@modelcontextprotocol/sdk` 换成了 `@modelcontextprotocol/client@2.0.0`（改名/拆包），
+    而我们的 overlay 生成器 `scripts/gen-engine-overlay.mjs:66-90` 的 `collectPackages()` 只收 `@deepseek-ai/*`（`:90` 的 filter），
+    **第三方运行期依赖根本不在它的收集面内**；`vendorTop` 在生成器里**没有任何写入点**（全文只在旧表保留逻辑里被读），
+    靠人工补登 ⇒ 人工没跟上。**三条既有门禁结构性看不见**：`check-engine-overlay` 的正向闭包只对三份 `cordis.patch.yml` 的**行面**问责，
+    而 `dsh-mcp-client` 正是「不在我们装配行面上」的那类宿主。
+    **修法**：① `scripts/snapshot-config/engine-overlay.json` 的 `vendorTop` 补两条
+    `"@modelcontextprotocol/client": "2.0.0"` / `"@modelcontextprotocol/core": "2.0.0"`（36 → 38）；
+    实测该闭包 13 个包里 11 个已在快照内，只缺这两个 ⇒ 最小修法成立。
+    ② 新增门禁 `scripts/check-mcp-client-deps.mjs`：判据 = `@deepseek-ai/dsh-mcp-client` 的**运行期依赖闭包**在快照内全部可解析
+    （逐级读快照内 package.json，缺失即列出**引用者**）；已接进 `check-release-gates.mjs` 声明集（32 → 33）、本地链 `build-apk-013.ps1`、
+    云端链 `build-apk.mjs`（两链门禁集差集实测为 0）与 `check-patch-mirror.mjs` 的 `MIRROR_TOP`。
+    **为什么不动生成器**：`vendorTop` 是「构建期人工裁决」面（哪些第三方要随引擎顶层走，取决于 Node 解析面），把 npm 闭包全量自动化会引入
+    几百条传递依赖的登记抖动；先补缺口 + 用门禁把「再漏」挡住。
+    **复验证据**：正证（闭包完整的最小 tar）`CHECK-MCP-CLIENT-DEPS PASSED` exit=0；反证（同一 tar 删掉 `@modelcontextprotocol/client`）
+    `FAILED：… 闭包在快照内不可解析 1 条: [@modelcontextprotocol/client]` exit=1；修复前现状快照同判红并逐条列出 `MISS … <- @deepseek-ai/dsh-mcp-client`。
+    **同型提醒**：凡「上游改了依赖名/拆了包，而我们的清单/overlay 是人工维护的」，都要问一句「这条依赖有没有进收集面」；
+    行面门禁看不见非行面宿主。
+
+187. **「判据常态为 null」被写成否决条件 ⇒ 守卫恒触发 / 恒不触发**（2026-09-27，task-78）
+    **现象**：为修 issue #274 ①（探活超时即破坏性自愈），第一版判据写成「日志里没有强证据 → HOLD」。
+    跑既有回归时 `degradedHttpLadderEscalatesToRestartOnTheSixthTick` 判红：第 6 拍不再 RESTART，
+    连带 `halfDeadEngineStillReachesUndoAfterTheBootWindowExpires` 的 `undoProbed` 恒为 0。
+    **真因**：`WatchdogV2` 的 `logSignature` 只在日志尾部匹配到已知签名（`plugin tree failed to load` /
+    `uncaught`）时才非空，**其常态就是 null**（生产亦然，不是测试注入口径）。把「缺少证据」当否决条件 ⇒
+    这条守卫在**绝大多数正常路径**上都成立，等于把既有的、必需的阶梯语义整条掐死。
+    **修法**：判据只认**正向证据**（指认「是慢、不是死」：本次探活 `error=timeout`；或端口非本进程持有），
+    且证据是**放行**的理由而不是**前置条件**（`strongEvidenceForDestructiveRecovery` 命中时**解除**「慢」的否决）；
+    对「慢」这类单次观测无法与真卡死区分的形态必须有**有界宽限**：`DEGRADED_SLOW_GRACE_TICKS`（3 倍阶梯 ≈ 90s），
+    宽限用尽仍无改善即视为真卡死放行 —— 否则会制造「引擎卡死且永不重试」的死局。
+    **复验证据**：既有 4 条回归全绿；新增 5 条断言（慢→HOLD / 端口他进程→HOLD / **宽限用尽→放行** /
+    `refused`≠慢→放行 / 子进程已死时第 6 拍 RESTART 仍成立）。
+    **同型提醒**：任何「观测到 X 就否决」的守卫，先查 X 在**正常路径上的取值分布**；常态为 null/false 的 X
+    会让守卫恒触发或恒不触发，与「定义在但没接线」同族。
+
+188. **`treeStats` 把 root 自身计入 ⇒「空目录 = 0 条目」判据永不触发，整条防线作废**（2026-09-27，task-78）
+    **现象**：为 issue #273 ① 写「回滚前体检备份，空备份一律拒绝」的 `verifyPreviousForRollback`，
+    并在单测里造了一份空备份期望被拒 —— 实测**判红**（没被拒）。
+    **真因**：`SnapshotFs.treeStats` 的文档写「不含 root 自身」，实现却从 root 开始 `walk` ⇒ root 被计 1 条；
+    于是空目录报告 `entries=1` 而非 0，`if (stats.entries == 0L)` 恒不成立，
+    **「拒绝半份备份」整条判据全部作废**。这是本仓反复出现的「判据存在但无判别力」形态。
+    **修法**：`treeStats` 只遍历 `dir.listFiles()`（不含 root），并单独处理「root 本身是符号链接」。
+    **复验证据（判别力反证）**：把 `verifyPreviousForRollback` 的返回值硬置 null ⇒
+    `rollbackRefusesAnEmptyBackupInsteadOfWipingLive` **判红**；还原后复绿。
+    **同型提醒**：写「= 0 / 为空」判据时**先证明它造得出来**；造不出来或造出来判据不响，就是边界条件写错了。
+
+189. **测试里的静默 `return` 会伪装成 PASS —— 撤掉修法照样绿（假绿）**（2026-09-27，task-78）
+    **现象**：`backupKeepsSymbolicLinksAndRollbackRestoresThem` 需要建符号链接，本机（Windows，无
+    `SeCreateSymbolicLinkPrivilege`）建不出来，第一版写成「建不出来就 `return`」⇒ 它显示 **PASS**。
+    做判别力反证时（撤掉 A 的修法）**它照样绿**，正是这一点暴露了它：这个用例从来没验过任何东西。
+    **真因**：JUnit 里「无法构造前置条件」只能报 **SKIP**，不能静默返回 —— 静默返回与「断言通过」在报告上无法区分。
+    **修法**：改用 `org.junit.Assume.assumeTrue(...)`（无权限时如实进 SKIP 计数）。
+    **更深一层**：环境受限的能力**不能只靠 e2e** —— 本仓既有范式是把「可能失败/不可观测的一步」做成**可注入原语**
+    （`swap` 的 `move` / `delete` / `ownerProbe` / `spaceCheck`）。符号链接三动作（判链接 / 读目标 / 建链接）
+    同样抽成可注入接缝后，本机即可拿到真判红：正例断言 `createLink` 被调用且目标名逐字相同；
+    反例把它换成「一律当普通文件」判红；反例让 `createLink` 抛 IOException ⇒ 必须**向上冒错**而非静默跳过。
+    **接缝要抽到「做判断的那一步」**：只抽下游动作、分支仍读 `attrs.isSymbolicLink`，注入的替身就**永远不会被问到**
+    ⇒ 又变成「有接缝但无判别力」（本轮实测踩到并自查出）。
+    **复验证据**：SKIP 如实计数（全量实跑 skip=2，含本条与另一条同型 e2e）；
+    可注入判据的红/绿对照见 `SnapshotTransactionTest`（CP-A1b / CP-A1c 两条反证实测判红）。
+    **同型提醒**：`return` / `if (envOk)` 这类「环境不满足就跳过」的写法，与本仓「判据无判别力」是同一件事。
+
+190. **Kotlin 行首 `+` 是一元加号、不是续行 ⇒ 静态自审全绿但编译炸**（2026-09-27，task-78）
+    **现象**：`SnapshotTransaction.kt` 里两处多行字符串拼接写成
+    ```kotlin
+    notes += name + "…" + relink.restored + "/" + relink.expected
+      + " 条（备份缺链接，按 staged 工厂权威补回）"   // 行首 `+`
+    ```
+    编译报 `Unresolved reference 'unaryPlus' for operator '+'`（String 没有 `unaryPlus`）。
+    **真因**：Kotlin 的续行规则是「**上一行以运算符结尾**」，不是「下一行以运算符开头」。行首 `+` 被解析成**一元加号**。
+    只有**圆括号/方括号内部**的换行才无条件合法（`Log.w(...)` 那种调用实参里的行首 `+` 因此没事 —— 它在括号内）。
+    **修法**：把 `+` 挪到上一行行尾，或用括号包住整个多行表达式（本次采用后者，保留可读缩进）。
+    **为什么静态自审抓不到（本条的重点）**：同批改动跑过括号平衡（depth=0）、hash 核对、自写机械核对脚本 28 条全绿
+    —— **没有一条能发现编译错误**。括号平衡只数括号（行首 `+` 不改变括号计数），机械核对只匹配写下的模式串。
+    **静态 ≠ 编译 ≠ 运行**，三者是三个不同的证据等级。
+    **复验证据**：修前编译 `Unresolved reference 'unaryPlus'`（实测）；修后用「行首 `+`/`-` 且处于圆括号/方括号深度 0」的扫描
+    确认**全文件 0 处**（其余行首 `+` 全部合法地位于括号/实参内部，逐个看过上下文）。
+    **同型提醒**：任何「我用脚本查过所以没问题」的结论，都必须先问「这个脚本能不能看见我要防的那类错误」。
+
+191. **`stage/` 目录与 `snapshot.tar.xz` 不同步：门禁读了阶段树而非产物，得出与实际相反的结论**（2026-09-28，task-78）
+    **现象**：`node scripts/check-boot-budget.mjs --pull <serial>` 真检里 C5 的正向对照判 SKIP，理由原文：
+    `引擎树存在但未打过 P1 补丁（无 compose 探针面）：…/snapshot-013/x86_64/stage/root/…/dsh-client-modules/lib/index.js`
+    同一时刻另两条事实与它矛盾：
+      · `snapshot.tar.xz`（同目录，2026-09-28 01:30 重建）**tar 内该文件有 P1 marker**（47,466 B）；
+      · **设备引擎树里 P1 marker 命中 4 处**（设备实际跑的就是含 P1 的树）。
+    **真因**：该 stage 目录 mtime = **2026-09-08 18:21:32**，即**停留在两个月前的树**；
+    而 C5 的输入面读的是 **stage 树** —— 既不是 tar、也不是设备树。重建快照只刷新了 tar，**没有回写 stage**。
+    ⇒ 门禁拿到的是一个既不等于产物、也不等于运行时的第三方副本，于是结论与实际完全相反。
+    **这是同一根因的第二次现身**：第一次表现为 `-Fast` 静默复用陈旧 stage 树 + boot-budget「有设备产物就真检」
+    ⇒ 拿旧读数判红；这一次表现为 C5 正向对照读旧 stage 树 ⇒ 误判「无 P1」。
+    **修法建议（未实施）**：① C5 的输入面改读 **tar 或设备树**（二者至少有一个是真相），不再读 stage；
+    或 ② 构建链在重建快照后**同步刷新 stage**，并给 stage 树加一条「与 tar 同代」的自检（mtime/内容 hash 二选一）。
+    在没有修法之前，读 stage 的正向对照**一律不可信**——它是「第三份副本」，谁都不会去核它。
+    **复验证据（实测）**：
+      · stage 树文件 mtime = 2026-09-08 18:21:32、P1 marker 命中 **0**；
+      · 同目录 tar（01:30 重建）解出该文件 = 47,466 B、P1 marker 命中 **true**；
+      · 设备 `run-as grep -c` 该文件 = **4**；
+      · `grep -E 'SnapshotTransaction|SnapshotFs|UndoGate|WatchdogV2|EngineService' scripts/check-boot-budget.mjs` = **零命中**（该门禁不读壳侧 Kotlin，故三条红与 task-78 无关）。
+    **同型提醒**：凡「门禁/工具读一个中间副本（stage / cache / 中间产物）而不读产物本体或运行时」，
+    都要问一句「这个副本由谁负责刷新、有没有人核它」。**三份副本 = 没有真源。**
+
+192. **自愈只挂在「快照刷新」那条链上 ⇒ 指纹已 fresh 的设备永远拿不到修复**（2026-09-28，task-78）
+    **现象**：0.14.2-fx-2 的「旧单点写法归一」挂在 `FactoryProfilePatch.merge()` 入口，
+    单测全绿、包里也确有该代码（dex 搜到 `normalizeLegacyAgentDefaultModel`），
+    但**两台真机**装上含它的包后，冷启动**两次** `live patch` 的 md5 **一个字节都没变**，
+    旧形态（`- id: agent-default-model / disabled: true` + 换 id 的 `-mobile` 块）原样保留。
+    **真因**：本仓对 profile patch 有**两条**修复通道，各自有独立的门：
+      · `merge()`（归一挂的这条）：只在**快照刷新**时跑（`mergePatchYamlById`），门是 `if (snapshotFresh()) return true` ⇒ 现场**已 fresh，早退**；
+      · `repairProfilePatch()`：每次 `startEngine` 前的启动前置，门是 per-VERSION_NAME 标记 ⇒ 现场标记已存在，早退。`
+    本仓**早已**为同类缺陷写过这条教训（`EngineManager.kt:1443-1444`，apk #214）：
+    原文：「这类设备不一定再触发快照刷新（指纹未变则 merge 不跑），所以自愈必须在引擎读 profile 之前做一次，不能只依赖 refreshSnapshot。」
+    新写归一代码时**只挂了 merge**，等于重蹈这个坑。
+    **修法**：① 归一**同时**挂到 `repairProfilePatch` 的启动前置通道；
+    ② 用**独立**幂等标记 `.profile-patch-normalize-<version>`，**不复用**退役行那个标记 ——
+    复用会让「已装过同版本」的设备永远补不上这次新修复（现标记语义是「本版本已修退役行」）。
+    **复验证据**：修前实测两台 cold start x2 后 md5 均不变（`a7014fab…` / `904788b5…`）；
+    设备 fp == APK `assets/snapshot.sha256`（`b2c7244d…`）⇒ merge 早退成立；
+    `.profile-patch-repair-<version>` 标记在场 ⇒ repair 早退成立。
+    **同型提醒**：凡新增自愈/迁移代码，先问「**它依赖的那条链在这台设备上会不会跑**」。
+    判据是「设备的触发条件是否已满足」，不是「代码在不在包里」——本条的假绿形态正是「包里有、跑不到」。
+193. **来源审计构建在 pnpm 安装后备份整个 vendor 包目录，会沿工作区符号链接递归（2026-09-27，远程 run 36261389579）**：
     **现象**：`build-apk-source` 第 9 步在 `prepare-harness-vendor-overrides.py:172` 的 `shutil.copytree(target, backup, symlinks=False)` 抛出异常；日志在 `raise Error(errors)` 后约 5 小时没有新输出，最终碰到 GitHub Actions 6 小时上限而取消，APK 步骤均未执行。此前的 Corepack 下载重试已生效，不能把本轮 6 小时归因于下载；下载完成与 Python 脚本开始之间缺少时间戳，前段耗时不能拆分。
     **真因**：冻结安装先于旧版 Cordis 源码替换，pnpm 已在 `vendor/*/node_modules` 建立工作区链接。锁文件存在 `group → cordis → loader → cordis` 的回环；`symlinks=False` 会跟随链接复制其目标，整个包目录备份因此进入循环依赖图。仅改为 `symlinks=True` 也不够：旧实现随后 `rmtree(target)` 会删掉构建仍需的 `node_modules`。
     **修法**：包根目录保持原位，只把非 `node_modules` 条目移到临时备份，再复制固定提交的源码条目；任一包失败时倒序清理新源码并移回原条目。拒绝固定源码归档顶层携带 `node_modules`。PR 与来源构建入口先跑包含循环链接和跨包回滚的单测。
-    **复验证据**：本地非链接用例与回滚用例通过；新远程 run 36288879471 的 Linux 用例通过，五个旧版包在约 1 秒内替换完成，越过原 6 小时卡点。完整来源构建随后遇到锁文件声明漂移（坑 187）。
+    **复验证据**：本地非链接用例与回滚用例通过；新远程 run 36288879471 的 Linux 用例通过，五个旧版包在约 1 秒内替换完成，越过原 6 小时卡点。完整来源构建随后遇到锁文件声明漂移（坑 194）。
 
-187. **固定旧版 vendor 清单替换后，构建入口会用冻结锁文件复检声明（2026-09-27，远程 run 36288879471）**：
+194. **固定旧版 vendor 清单替换后，构建入口会用冻结锁文件复检声明（2026-09-27，远程 run 36288879471）**：
     **现象**：旧版 Cordis 包已成功替换，但 `pnpm run build` 立即报 `ERR_PNPM_OUTDATED_LOCKFILE`，例如 `vendor/include` 的 `@deepseek-ai/cordis` 与 loader 从锁文件 `workspace:~` 变为旧清单 `workspace:^`；构建在此正常判红。
     **真因**：上游固定 Harness 提交的锁文件与其当代 vendor 清单一致，旧版源码替换也带入了旧版 `package.json`；运行 build 前的 pnpm 依赖状态检查要求 importer 的 specifier 与现有清单相同。另 `pnpm-workspace.yaml` 对 `cosmokit`、`schemastery` 强制 `link:vendor/*`，有效 importer 声明是相对 `link:../*`，不能机械写成旧清单原文 `workspace:^`（远程 run 36289257326 二次判红实锤）。
     **修法**：`reconcile-harness-vendor-lock.mjs` 只对来源报告列出的五个 importer 按工作区覆盖后的有效声明改写 specifier、移除旧清单已无的依赖条目；任何旧清单新增而锁文件没有的依赖直接拒绝，不向 registry 重新解析。原锁文件、改动清单、调整前后哈希进入来源 artifact 与策略报告。旧版源码及打包清单保持固定提交原样。
     **复验证据**：纯函数单测覆盖声明更新、`link:` 覆盖、已锁解析保留、缺失解析拒绝；完整来源构建须由后续远程 run 验证。
 
-188. **当前 Harness 全仓类型检查不能与旧版 Cordis loader 源码混跑（2026-09-27，远程 run 36289546067）**：
+195. **当前 Harness 全仓类型检查不能与旧版 Cordis loader 源码混跑（2026-09-27，远程 run 36289546067）**：
     **现象**：旧版源码替换及有效锁文件对齐都完成后，`pnpm run build` 进入 TypeScript 阶段，`speech-to-text`、`llm-deepseek` 等当前包引用的 `loader/volatile-update` 事件在旧版 loader 的 `Events` 中不存在；当前测试还引用旧版 loader 没有的 `src/config/diff.ts`，全仓 `tsc -b tsconfig.host.json` 必红。
     **真因**：来源链把 0.1.7-rc.2 的其余源码与 overlay 固定的较早 Cordis 源码放进同一次全仓类型检查。两者发布时序不同，旧版包的 API 无法满足当前源码的静态检查；这不是缺失依赖或 TypeScript 缓存问题。
     **修法**：先按固定 0.1.7-rc.2 提交完成全仓与 Web UI 构建，再替换五个旧版 Cordis 包、对齐它们的锁文件 importer，单独用各包 tsconfig 和 tsdown filter 编译旧版包。打包时五个旧版 manifest 与源码仍等于固定旧提交，当前其余包来自固定 Harness 提交，不改上游源码。
     **复验证据**：远程 run 36289546067 证明锁文件复检已通过、进入全仓 TypeScript 并在上述不兼容处失败；run 36291011371 的 Harness 全仓与旧版包构建通过。
 
-189. **插件镜像的 package-lock 根声明过期，会让来源构建在昂贵前段完成后才失败（2026-09-27，远程 run 36289938732）**：
+196. **插件镜像的 package-lock 根声明过期，会让来源构建在昂贵前段完成后才失败（2026-09-27，远程 run 36289938732）**：
     **现象**：Harness 源码构建与 Termux bootstrap 验证均通过后，`Build project plugins and marketplace from source` 在 `dsh-android-linux-env` 的 `npm ci` 报清单与锁文件不同；同类漂移还存在于 browser 与 file-open。
     **真因**：三个插件的 `package.json` 已钉 Harness 0.1.7-rc.2 和 Cordis 4.0.4，镜像里的 `package-lock.json` 根声明仍是 0.1.1-rc.2 / Cordis 4.0.1；旧锁文件未随清单同步。此处与工作区 pnpm 锁文件调整是两套独立依赖图。
     **修法**：按各插件现有清单重算其 npm 锁文件；在 PR 与来源构建的早期步骤运行 `check-package-lock-roots.mjs`，逐个对照所有带锁文件的插件/组件根声明，及早拒绝旧镜像。
     **复验证据**：九份锁文件根声明核对通过，九个目录的 `npm ci --dry-run --ignore-scripts --no-audit --no-fund` 通过，三个修复插件的实际 `npm ci` 与 `npm run build` 通过；远程 run 36291011371 的插件构建步骤通过。
 
-190. **来源部署闭包中的 Linux GNU 原生文件必须逐包审计（2026-09-27，远程 run 36291011371）**：
+197. **来源部署闭包中的 Linux GNU 原生文件必须逐包审计（2026-09-27，远程 run 36291011371）**：
     **现象**：Harness 与插件构建通过后，`node-pty` Android ARM64 绑定已成功交叉编译，但原生模块审计发现 trycua、ubjs、sherpa-onnx 和 node-addon-require-builtin 的 Linux ARM64/x64 `.node` 文件，报 `unreviewed native module families` 而中止。
     **真因**：`pnpm deploy` 从固定 Harness 的当前依赖图带入跨平台 Linux GNU 包；审计器只认识先前登记的 Sharp、Koffi 等包族，且把 node-addon-require-builtin 限在旧版 0.1.4，实际部署解析到 0.1.6。这些文件名和包名指向 Linux，不是 Android 绑定，不能把审计报错当作 node-pty 编译失败。
     **修法**：按实际锁定版本、包路径、文件名和架构对应关系增加四个包族的严格匹配；将外平台 payload 与原因记入审计报告，未知版本、架构错配和未知原生包继续拒绝。入口增加正反用例。
     **复验证据**：远程日志确认 node-pty Android ARM64 绑定已产出并给出 SHA-256；本地包族正反用例通过，远程 run 36291780773 的交叉编译及原生模块审计步骤通过。
 
-191. **快照行为测试调用已删除的 boot 导出，会把上游接口更新误报成功能失败（2026-09-27，远程 run 36291780773）**：
+198. **快照行为测试调用已删除的 boot 导出，会把上游接口更新误报成功能失败（2026-09-27，远程 run 36291780773）**：
     **现象**：Termux 基座组装完成后，快照构建器执行 `boot-pending.test.mjs`，五个用例全因 `assertEntriesActivated is not a function` 失败；这些断言均未真正进入待测启动逻辑。
     **真因**：固定 Harness 0.1.7-rc.2 的 `dsh-app-boot` 已改为导出 `auditStartupEntries`，按全局必需 entry id 判定致命错误，可选条目的 pending/failed 只告警。仓库测试仍调用旧导出，并沿用「任何 FAILED 都致命」的旧口径；旧版测试在裸 clone 上因找不到目标而跳过，未及时暴露漂移。
     **修法**：保持快照构建器的镜像脚本不动，改它调用的测试文件：直接注入 Loader 条目调用当前导出，用必需 id `webserver`、可选第三方、pending/failed 和混合状态验证当前契约；目标存在时先断言导出函数存在。
     **复验证据**：使用仓库固定的 0.1.7-rc.2 app-boot 产物夹具及已安装依赖，本地五个真实行为用例全绿；完整来源构建须由下一次远程 run 验证。
 
-192. **来源审计链的检查器停在上一代引擎事实：预设载体断言在 pin 抬到 0.1.7-rc.2 后必然判红（2026-09-27，远程 run 36293117340）**：
+199. **来源审计链的检查器停在上一代引擎事实：预设载体断言在 pin 抬到 0.1.7-rc.2 后必然判红（2026-09-27，远程 run 36293117340）**：
     **现象**：快照成功产出（492.2 MB，sha256=e36b77b8…），pnpm 物化、运行时依赖链接、原生模块审计三个后续检查全过，紧接着 `check-dsh-source-snapshot.mjs` 抛 `source snapshot has no built-in dsh-agent-presets entries`，签名与 APK 步骤未执行。
     **真因**：该检查器是权威门禁 `check-engine-overlay.mjs` 的等价实现，而权威源在 0.14.2 追版时已把预设载体从 `@deepseek-ai/dsh-agent-presets/presets/` 重锚为 `agent-preset/skills/` + `web-app/presets/`（0.1.7 把该包拆成 agent-preset + agent-preset-registry）；等价实现没跟上。旧断言此前能通过，是因为上一版 pin 是 0.1.5-rc.1（那一代确有 `agent-presets/presets`，实测 4 项），本链把 pin 抬到 0.1.7-rc.2 后旧载体已不存在——**同一条链在换代后判红，指向的是门禁自身过期，不是产物缺失**。
     **修法**：载体清单抽成 `scripts/source-build/preset-carriers.mjs`（与权威源同口径：目录在场且递归**文件**数 ≥ 1；只断「包在场」是冗余，overlay 已覆盖包版本），检查器改为调用它并把逐载体计数记入报告；新增 `preset-carriers.test.mjs` 双向漂移守卫——它读权威源文本里的 CARRIERS 数组，比对两侧载体路径集合，权威源重锚即判红。测试接进 PR 与来源构建两处入口的早期步骤。
     **复验证据**：本地 6 例全绿；判别力反证两轮（把权威源载体路径改名 / 删掉 CARRIERS 结构）守卫均判红，还原后复绿；pin 侧实测：`packages/preset/agent-preset/skills` 15 个文件、`packages/bundle/web-app/presets` 4 个 `.patch.yml`，两者都在各自 package.json 的 `files` 里，故产物面应非空。完整来源构建须由下一次远程 run 验证。
 
-193. **来源链摘除第一方 overlay 钉，与「按这份清单判定」的 check-contract §7 相撞（2026-09-27，远程 run 36294910834）**：
+200. **来源链摘除第一方 overlay 钉，与「按这份清单判定」的 check-contract §7 相撞（2026-09-27，远程 run 36294910834）**：
     **现象**：快照、预设载体检查与签名证书都通过后，APK 步骤的第一批门禁里 `check-contract.mjs` 第 7 节判红 `engine-overlay.json 里没有 @deepseek-ai/dsh-app-boot 钉 —— 运行时版本无从确定`，其余门禁与打包均未执行。
     **真因**：来源链要让快照构建器**不可**按登记表回拉上游发布版 tarball 覆盖已注入的源码产物（`build-snapshot-013.mjs` 的 `overlayExtract` 是整目录替换），故构建期把 `@deepseek-ai/*` 全部摘出 `engine-overlay.json`；而 §7 的运行时版本、以及「profile patch 里 `@deepseek-ai/*` 的 insert 行是否与运行时同版」都按这份清单判——后者还决定哪些挂载行会被上游 boot 期**静默禁用**。这条链此前没暴露，是因为该门禁在**拿不到 semver 时 SKIP**，而旧链的产物树恰好提供不了；本次源码产物树能提供（`dsh-shell-termux/node_modules/semver`），门禁随即真判。教训：门禁的 SKIP 分支会掩盖「判据输入本身已经不存在」这类问题，SKIP 期间被放过的东西不构成「验过」。
     **修法**：新增 `scripts/source-build/restore-overlay-pins.mjs`，在 APK 步骤按 `source-build-policy.json` 记下的摘除清单把钉并回 `engine-overlay.json`（同名不同版判红、清单缺席判红、幂等），还原事实写进 policy provenance；workflow 既有退出 trap 仍把原 overlay 覆盖回去。**不能改为在快照构建期保留**——那正是上面要防的回拉路径。
     **复验证据**：本地端到端复现——按来源链摘掉 315 个钉后 `check-contract.mjs` 复现出与 CI 逐字相同的判红；跑还原脚本后第 7 节转绿（14 条 insert 全过、0 条会被禁用，含两条按 overlay 判同版的引擎包 insert 行），工作树随后还原干净。
 
-194. **来源链现场生成一次性签名证书，等于重新引入 e65818a 修掉的缺陷（2026-09-27，签名专项核查）**：
+201. **来源链现场生成一次性签名证书，等于重新引入 e65818a 修掉的缺陷（2026-09-27，签名专项核查）**：
     **现象**：来源审计构建的 APK 签名证书与仓库内置 `keystore/debug.keystore` 不同（实测 `64:FA:4B:7E…` vs `1D:DE:9D:98…`），且两次来源构建的证书互不相同（上一版 0.1.5-rc.1 的产物是 `4642e0dc…`）。后果：产物既不能 `install -r` 覆盖已有安装（必须先卸载，卸载清数据又触发快照全量重解压），两个版本的来源包之间也互相覆盖不了。
     **真因**：workflow 的签名步骤先 `rm -f keystore/debug.keystore` 再用 keytool 现场生成一张 `CN=DSH Source Build,OU=Ephemeral` 的证书，`repoDebug` signingConfig 于是签的是这张一次性证书。而项目规范恰恰相反且是有来历的——commit `e65818a`（2026-08-20，在 upstream/main 上）：「ci: 内置 debug.keystore 固定签名（否则每次构建新密钥，用户无法覆盖安装升级）」；`gotchas` 坑 10 / `DEPENDENCIES.md` / `design.md` 三处都写着「debug.keystore 固定，否则覆盖安装失败」；`build-snapshot.yml` 就是把仓库 keystore 拷进 `ANDROID_USER_HOME` 以保证 CI 与历史发布同签名。**用一次性证书区分「审计产物 ≠ 发布」这个目的，已由 `-source` 版本后缀与独立 artifact 名达成，用换签名来达成的代价是产物直接不可用。**
     **修法**：删除该步骤的 `rm` + `keytool -genkeypair`，直接使用入库的 keystore；新增产出侧断言——构建后用 apksigner 读 APK 的 `Signer #1 certificate SHA-256 digest`，必须等于固定指纹 `1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`，否则拒出包并把该指纹写入 provenance。**判据放在产出侧而不是输入侧**：只有产出能证伪「keystore 文件在、构建却用了别的密钥」，同时也挡回「再现场生成一次性证书」那种改法。
     **顺带排除的陷阱**：`keytool -list -v` 的输出**不可作为机器判据**——它随 JVM 语言变化（本机 JDK 24 直接输出德语），且在这份 keystore 上会抛 `IllegalFormatConversionException: d != java.lang.String`（`printX509Cert`/`withWeakConstraint`）。故输入侧只查文件在场，指纹一律从 apksigner 读（输出稳定、不本地化）。
     **复验证据**：正证——用入库 keystore 签出的 APK 经 apksigner 读到的指纹 `1dde9d98…45bcbd` 与断言常量逐字相等；反证——本次 run 36296811274 的产物（一次性证书 `64fa4b7e…`）与旧版产物（`4642e0dc…`）代入同一断言均判红。
 
-195. **签名判据锚定 apksigner 的行标签：新版把它从 `Signer #1` 改成 `V3.0 Signer:`，解析取空后静默判死（2026-09-27，远程 run 36303902361）**：
+202. **签名判据锚定 apksigner 的行标签：新版把它从 `Signer #1` 改成 `V3.0 Signer:`，解析取空后静默判死（2026-09-27，远程 run 36303902361）**：
     **现象**：run 36303902361 在 gradle `BUILD SUCCESSFUL`、APK 已产出之后，于 APK 步骤**静默退出 1**——日志里 `APK=` 之后一行输出都没有，分不清是清单为空、还是工具没解析到。前一轮（36300505103）同样症状。
     **真因**：签名断言用行首锚定的 `sed -n 's/^Signer #1 certificate SHA-256 digest: //p'` 取指纹，而 runner 上的 build-tools `37.0.0` 把签名者标签改成了**按签名方案版本编号**的形式：
     ```
@@ -929,20 +1051,20 @@
     **修法**：判据不再依赖任何行的前缀与措辞——抓 stdout+stderr、加 `--verbose`、去掉冒号并转小写后，只要求**期望指纹出现在输出里**；不出现就把 apksigner 原始输出整段打进日志再判红。另加构建前**自证**：用同一把 keystore 签一个探针包再读回来，验证「这条判据本身可用」，使工具/keystore 的问题在 2 分钟内暴露，而不是等 30 分钟打包跑完才在末尾判红（那两轮各烧掉约一小时，且产物被丢弃）。
     **复验证据**：探针 run 36311334613 打出 `V3.0 Signer: certificate SHA-256 digest: 1dde9d98…`（PROBE A/B/C 三种取法）；修后 run 36307651694 全链通过，日志 `签名检查 out/v0.14.2/…apk -> 1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`；本地用**另一个版本**的 apksigner 独立复核同一 APK，证书 DN `C=US, O=Android, CN=Android Debug`、指纹同为 `1dde9d98…`。
 
-196. **上游退役补丁后，来源链的期望补丁集与适配器锚点没跟上（2026-09-27，远程 run 36311846352）**：
+203. **上游退役补丁后，来源链的期望补丁集与适配器锚点没跟上（2026-09-27，远程 run 36311846352）**：
     **现象**：合并上游 0.1.7-rc.2-fx-1（#269）后重跑来源构建，第 14 步 `Apply project patches to the source-built marketplace` 抛 `shared patch runner changed; review the source-build marketplace adapter before updating it`，构建在约 10 分钟处终止。
     **真因**：#269 让 `market-A`、`market-C` 两个市场补丁退役（上游 0.1.7 自己修好了 A 的 waterfall 崩溃；C 的置灰对象被上游 `installCheck` 过滤掉，客户端拿不到不可安装的行），共享执行器 `scripts/patches/apply-patches.mjs` 里 A 的锚点整段消失。来源链适配器 `apply-source-marketplace-patches.mjs` 仍按旧锚点做「源码构建产物专用改写」，锚点断言失败即判红——**这是守卫按设计工作**：它要求人工复核适配器，而不是静默生成一份错的执行器。同一处 workflow 的期望集 `expectedPatches` 也还写着 A、C（适配器过了下一步照样判红）。
     **修法**：按守卫要求复核后——适配器删掉已成死代码的 A 改写，只保留「把生成副本的 HERE 指回 `scripts/patches`」那一处（锚点整体失配不需要适配器兜底：共享执行器对「check 为假且 apply 零改动」本就判红并拒报 ALL OK）；workflow 期望集去掉 A/C，并**加反向断言**「退役补丁不得悄悄回到注册表」，重启退役补丁必须人工复核来源链。
     **为什么记进坑位**：来源链与主链共用同一份补丁执行器，**上游每退役一个补丁都可能同时打断两条链**——主链会自动跟随注册表，来源链却带着自己的期望集与锚点改写，属于「同一事实两处登记」的典型漂移面。
     **复验证据**：本地以 `vendor` 跑适配器（check 档）→ `apply-patches: ALL OK（13/13，changed=0）`、vendor 树零改动；期望集/退役集断言按注册表实跑通过；完整来源构建须由下一次远程 run 验证。
 
-197. **镜像追到上游发布字节后，来源链还在重建旧源码树：市场补丁锚点必然失配（2026-09-27，远程 run 36312684359）**：
+204. **镜像追到上游发布字节后，来源链还在重建旧源码树：市场补丁锚点必然失配（2026-09-27，远程 run 36312684359）**：
     **现象**：修掉期望集之后重跑，第 14 步改为 `[fail] market-D-server: D 插入锚点未命中——apply 函数与 export 绑定都不在场`，构建再次在约 10 分钟处终止。本地以镜像跑 check 档却全绿——**本地验的是镜像，CI 验的是源码重建产物**，两者不是同一个输入。
     **真因**：`vendor/dshmarketplace-plugin/PATCHES.md` 写得很清楚：镜像来自 **npm 发布的 `dshmarketplace-plugin-0.1.7.tgz`**（用户报障「市场从 UI 里消失」，本轮把上游字节整体追到 0.1.7），全部 market-* 补丁也随之按**发布字节**重定锚。而来源链仍钉着组件源码树 `8354d9a0…`（0.1.5），并且还会对该目录跑一次 `npm ci && npm run build` —— 用不同工具链重建出的 minified 字节与发布字节不同，补丁的 check/apply 锚点在它上面全部落空。此前没暴露，是因为适配器里有一段「源码构建专用改写」把 A 的闭合形态差异兜住了；0.1.7 退役 A 时那段改写一并消失，兜底随之失效。
     **修法**：来源链改用**固定 npm 发布产物**作为该组件的输入——`curl` 拉 0.1.7.tgz、`sha256sum --check` 对照钉在 workflow 里的哈希、解包进 `vendor/dshmarketplace-plugin`；**把它从插件源码构建循环里移除**（发布产物自带打包好的 `lib/`，重建只会换掉字节）；provenance 从「上游 commit/tree + 源码文件哈希」改为「发布 tarball URL + 哈希 + 包版本」。这条输入与 Koffi/Sharp/Canvas/Termux 同类：**可信二进制输入，显式披露并钉哈希**，不声称本地源码编译。
     **复验证据**：本地端到端复刻该流程（拉 tarball → `sha256sum --check` OK → 解包 → 按 CI 同一命令打补丁）后，`lib/index.js` 与 `lib/client.js` 与仓库镜像**逐字节一致**（LF 归一后同哈希）；这同时证明了「发布产物 + 注册表补丁 = 镜像」这条等式成立。完整来源构建须由下一次远程 run 验证。
 
-198. **pnpm 布局下引擎补丁只打顶层副本，store 那份未打补丁 ⇒ 引擎 boot 硬崩（2026-09-27，真机 HUAWEI SGT-AL10 实测）**：
+205. **pnpm 布局下引擎补丁只打顶层副本，store 那份未打补丁 ⇒ 引擎 boot 硬崩（2026-09-27，真机 HUAWEI SGT-AL10 实测）**：
     **现象**：来源审计 APK 装机后引擎起不来，`engine.log` 首行 `dsh: host preparation failed: No usable native binding found for node-addon-require-builtin-android-arm64 (auto)`，三种候选（optional 包 / `build/nodeabi/node-v137-android-arm64` / `build/napi/napi-v9-android-arm64`）全落空，`info.txt` 记 `engine_exit: exit=1`。
     **真因**：`node-addon-require-builtin` 上游**不发布 Android 产物**，项目对策是引擎树补丁 `narb-android-N1`（把 `createEntryApi()` 包进 try/catch，回落 `require(moduleId)`，靠壳侧 `--expose-internals` 生效）。但来源链的引擎树是 **pnpm 布局**：同一包在顶层物化目录与 `node_modules/.pnpm/**` store 各有一份**物理文件**，而补丁只按登记表的顶层 target 写入 ⇒ store 副本保持原始字节；运行时按依赖查找解析到的正是 **store 那份**（设备栈路径即 `.pnpm/node-addon-require-builtin@0.1.6/...`）⇒ 加载未打补丁代码 ⇒ boot 硬崩。同批实测 **`pi-toolcall-G2`** 的 store 副本同样未打上——该补丁在设备上等于从未生效（静默功能缺失）。正常（LFS）链没有这个问题：它的引擎树是扁平 npm 布局，不存在 `.pnpm` 副本。
     **为什么 CI 全绿却发得出去**：快照检查器抽验 marker 时只看**顶层 target 那个文件**（恰好是打过补丁的那份），「同一目标的其它物理副本是否也带 marker」这条判据根本不存在。
@@ -950,14 +1072,14 @@
     **踩到的两个坑中坑**（都已固化成用例）：① 判据若用「路径结尾相同」匹配，`lib/bin.js` 这类短后缀会把**别的包**的同名文件误判成副本（实测把 `dsh-experimental-webworker-packer/lib/bin.js` 报成未打补丁）；引擎根包自身的文件必须**精确相等**。② 匹配器的「根」在两个调用点必须同一约定（引擎根 = `@deepseek-ai/dsh` 目录本身）——一度出现检查器传引擎根、收敛脚本传 stage root 的错位，导致精确匹配恒落空。
     **复验证据**：以真实快照的引擎树为靶——收敛前核对报 2 个目标各 1 份未打补丁副本（N1 的 872 B store 副本、G2 的 64152 B store 副本），跑收敛脚本后为 **0**，改写副本与已打补丁那份 sha256 逐字节一致；新单测 5 例全绿（含短后缀误报反证、幂等、全缺 marker 判红、目标缺失判红）。
 
-199. **来源审计链的专有门禁不在任何清单里：新增第三条链时漏了「谁跑哪些门禁」这一步（2026-09-27）**：
+206. **来源审计链的专有门禁不在任何清单里：新增第三条链时漏了「谁跑哪些门禁」这一步（2026-09-27）**：
     **现象**：来源链的 5 个专有门禁——`check-package-lock-roots` / `check-dsh-runtime-dependencies` / `check-android-native-runtime-packages` / `check-dsh-source-snapshot` / `check-dsh-source-snapshot-gate`——既不在 `check-release-gates.mjs` 的声明集合（32 项）、也不在 `build-apk.mjs` 的 `GATE_SCRIPTS`、也不在 `check-gate-skips.mjs` 的链枚举里；全仓只被自己那条 workflow 与 docs 引用。实跑 `node scripts/check-gate-skips.mjs` **仍然 PASSED**——盲区是隐形的。其中 `check-package-lock-roots.mjs` 最脆：单测只 import 纯函数 `checkPackageLockRoot`、不走 CLI 主块，两个 workflow 里的调用点删掉后脚本与单测都还在、三条链全绿，而门禁**从未真跑**。
     **真因**：新增一条构建链时，没把它的门禁登记进「谁跑哪些门禁」这条纪律。而 `check-gate-skips.mjs:78` 的 `CHAINS` **不能简单加第三条**：`executionSites`（:67-77）只认 `.mjs` 的 `gate('x.mjs')` 与 pwsh 的 `node … scripts\check-x.mjs` 两种形态，**没有 YAML 分支**；强行加入会让「声明集合每一项都被本链调用」这条断言对来源链必然判红（它只间接经 `build-apk.mjs` 跑）。同族的两处非递归扫描：`node --check`（`check-release-gates.mjs:251`）只列 `scripts/` 与 `scripts/lib` 两层，`scripts/source-build/` 等 5 个子目录共 **47 个 `.mjs` 从未被解析过**；SKIP 审计（`check-gate-skips.mjs:102`）的 `readdirSync` 同样非递归。
     **修法**：① `check-release-gates.mjs` 新增独立常量 `SOURCE_GATES` 与第三条链位置 `source-chain`（沿用 `ci-apk` 的 `needsApkTree` 模式；**刻意不进 `GATES`**——`ALL_GATES = GATES.map(...)`，进册会要求本地链与云端链也调用它们）；② 同文件 `node --check` 扫描面改为**递归**遍历 `scripts/` 全树；③ `check-gate-skips.mjs` 的 SKIP 审计同样改递归。
     **复验证据**：`PASS source-chain 门禁集 ⊇ 声明集合（5 项）`。判别力反证——把 workflow 里 5 个调用点全删 → 5 个全报；只删 1 个 → 精确报那一个。扫描面 75 → **122 个**、SKIP 审计 37 → **44 个**，两门禁仍 PASSED。
     **未闭合**：`CHAINS` 的反向断言（声明项必须有真实执行点）对第三条链仍无对应实现——本轮用 `source-chain` 位置覆盖了「声明了却没接线」这个主方向，其余待后续把 `executionSites` 扩到 YAML 形态。
 
-200. **判据「空过」：空集恒真、静默 continue、地板值远低于现实（2026-09-27）**：
+207. **判据「空过」：空集恒真、静默 continue、地板值远低于现实（2026-09-27）**：
     **现象**：四处新判据在「输入为空」时恒真，即**因为什么都没找到而判绿**。
     ① `check-package-lock-roots.mjs` 的受检集合是**发现式**的（只收存在 `package-lock.json` 的目录），旧实现无空集守卫：删掉/改名任一锁文件它就静默退 0，打印「一致: N 个目录」。而 `build-apk-source.yml` 的插件循环按 `if [ -f package-lock.json ]` 决定 `npm ci` 还是 `npm install`——**锁一缺就从「严格按锁文件」降级成「重新解析版本区间」，产出不再可复现而全链绿**。（对照：同一 workflow 的 pnpm 侧用的是 `--frozen-lockfile`，锁不符即失败。）
     ② `check-dsh-source-snapshot.mjs` 对 engine 补丁 `if (!marker) continue`：删掉 `marker` 字段、或写成全角括号注释（`replace(/（.*$/, '')` 后为空），该补丁就**同时退出**本判据与 `reconcile-engine-patch-copies.mjs` 的副本收敛（同一过滤条件）——两条路径一起静默跳过，而原注释承诺的「新增补丁自动纳入，无需再手改本文件」随之落空。
@@ -966,20 +1088,20 @@
     **修法**：① 加具名目录断言（`dsh-client-ui-responsive` / `dsh-shell-termux` 不靠发现、是写死在 `packageDirectories` 里的）与空集判红；② 加 markerless 计数并在核验前判红——要么补 `marker`，要么在 registry 显式登记 `overlayCheck:false` 走豁免（豁免有留档，与「忘了写 marker」不是一回事）；③ 加 `nativeInventory.length === 0` 守卫；④ 地板抬到 **266**，与同链 `materialize` 同源。
     **复验证据**：加守卫前先实测确认现状不会误伤（9 个受检目录全有锁、13 个 engine 补丁 marker 全非空、两处原生清单均为 27 项、实际包数 317）。① 正例「一致: 9 个目录」退 0 不变；反证——空集时逐条指名并退 1。全部 6 个 `source-build` 单测保持 PASS。
 
-201. **来源链在解压校验处写 `xz -T0`，违照明文的并行上限铁律而门禁看不见（2026-09-27）**：
+208. **来源链在解压校验处写 `xz -T0`，违照明文的并行上限铁律而门禁看不见（2026-09-27）**：
     **现象**：`scripts/source-build/check-dsh-source-snapshot.mjs:74` 解压快照做校验时用 `spawn('xz', ['-d', '-T0', '-c', snapshot])`——`-T0` = 吃满全部逻辑核。
     **真因**：`check-build-parallel-cap.mjs` 的受约束清单 `CONSTRAINED` 只有 5 个既有脚本，**来源链一个都不在**；且它的第 1 节只抓 `-T0` 字面量，第 3 节的「写死数字」判据只覆盖 `build-snapshot-013.mjs` 与 `build-apk-013.ps1` 两个文件。于是这条明文铁律（「模拟器优先」，其立项理由正是『构建链原先在压缩/解压处用 `xz -T0`』）在来源链上完全不受约束。本地跑 `run-local-source-chain.mjs`（文档化入口）时会与 MuMu 抢满 16 逻辑核；CI runner 只 4 核，云端反而无害。
     **修法**：改为消费单一常量 `-T${XZ_THREADS}`（从 `scripts/lib/shell.mjs` 导入），并把该文件列入 `CONSTRAINED` 锁住回归。
     **复验证据**：`PASS scripts/source-build/check-dsh-source-snapshot.mjs 无吃满型线程参数（-T0）`；判别力反证——`-T0` 字面量判红、`-T${XZ_THREADS}` 通过；`PARALLEL-CAP SELF-TEST PASSED`。
     **未闭合**：来源链另有两处**有界**的写死线程数（`prepare-termux-bootstrap.py:168` 的 `-T4`、`build-apk-source.yml:673` 的 `-T8`）——不吃满核，但要完全符合「并行度来自单一常量」须改构建命令本身，本轮未动，已在 `CONSTRAINED` 处登记。
 
-202. **来源链不是逐字节可复现：两个独立根因，且「哈希恒漂」会让完整性判据整个失效（2026-09-28，两次远程 run 实测）**：
+209. **来源链不是逐字节可复现：两个独立根因，且「哈希恒漂」会让完整性判据整个失效（2026-09-28，两次远程 run 实测）**：
     **现象**：`3ec3b68` 与 `45bf047` 两次构建——两者**只差 8 个判据文件、一个都不写快照内容**——产出的 APK sha256 却不同（`7aff2320…` vs `99f64ede…`，artifact 相差 459 B）。
     **逐层定位**（这层比"哈希不同"本身重要，因为定位方法要能复用）：229 个 APK 条目 **SHA-256 级比对 → 227 个完全相同**，只有快照本体与其 `.sha256` 随从文件不同；再把两个 `assets/snapshot.tar.xz` 解包、对 35053 个常规文件逐个 sha256 → **264 个不同**。按目录归类后发现 264 里有 **259 个是 `@deepseek-ai/*/package.json`**，且**只差对象键序**（`{"include":…,"loader":…}` 与 `{"loader":…,"include":…}`），内容逐字相同。再往上追：316 个引擎包中 **260 个的 tarball 哈希本身就不同，而 version 全部相同**。
     **两个根因**：
     **① `pnpm pack` 产出的 manifest 键序不稳定**（主因，260/316 个包）。打包点是 `export-dsh-engine.mjs:74`，而该处注释写的意图恰恰是「packed manifests stay exactly as their source commits」——**意图是确定性，结果不是**。键序不确定的具体来源（pnpm 自身还是 harness 构建阶段）未定位到，故修法取「不管根因、在产出侧钉死」。
     **② `dpkg/available` 直接写入整份活上游索引**（次因，1 个文件）。`build-snapshot-013.mjs:586` 把 `indexText`（3000+ 条）整份倒进快照，而 `status`/`status-old` 只写 `needed`（本链实际装的 79 个包）——同一个函数里唯独这一个文件例外。索引由 `prepare-termux-signed-repo.py:84` **活取**（`:87` 只做「与签名 Release 比对」，证明索引是真的，却没证明它是钉版时那一份）。实测两次运行相隔 90 分钟，索引 sha256 已从 `795749e0…` 变为 `2bf37bba…`，连签名的 Release 都换了（`0707fca9…` → `4ec8dc46…`）——上游掉了 `codon`、`ecl` 两个**与本链毫无关系**的包。
-    **为什么这条比"哈希不同"严重**：本链的核心主张是可来源审计、可外部复核，而验证闭环是「重跑 → 得到同一哈希 → 于是相信产物来自那份源码」。哈希恒漂 ⇒ 闭环不成立；更隐蔽的是**它把信号也一起淹没**——「两次构建哈希不同」从此不再是信号，那么真正该被发现的问题（比如某次构建静默少了个包，见坑 199-201 同族）就失去了最廉价、最强的兜底判据。**恒亮的警报灯等于没有警报灯。**
+    **为什么这条比"哈希不同"严重**：本链的核心主张是可来源审计、可外部复核，而验证闭环是「重跑 → 得到同一哈希 → 于是相信产物来自那份源码」。哈希恒漂 ⇒ 闭环不成立；更隐蔽的是**它把信号也一起淹没**——「两次构建哈希不同」从此不再是信号，那么真正该被发现的问题（比如某次构建静默少了个包，见坑 206-201 同族）就失去了最廉价、最强的兜底判据。**恒亮的警报灯等于没有警报灯。**
     **修法（三段，各自独立可用）**：
     **① 语义归一化**——新增 `scripts/source-build/normalize-snapshot.mjs`：把**表示层**差异（JSON/YAML 映射键序、pnpm 的时间戳字段 `prunedAt` / `lastValidatedTimestamp`）从摘要里剔除，给出稳定的 `normalizedManifestSha256`。三条设计约束缺一不可：**规则封闭**（每条写清"为什么这个差异不可能影响行为"）、**可无依赖复算**（外部人拿产物+脚本即可重算，不引第三方包，故 YAML 自带受限块映射归一化器）、**响亮失败**（遇到不认识的形态一律 throw）。关键边界：`dpkg/available` 那类**真**差异（包数 3003 vs 3001）**刻意不归一化**——把它和键序归入同一句"反正不影响"，就是给静默失败开后门。接入 `check-dsh-source-snapshot.mjs`（并把解包从"只解引擎前缀+canvas"改为全量，与外部复核方看同一份输入）。
     **② `pnpm pack` 之后就地规范化 tarball**（`export-dsh-engine.mjs`，落在 `packed.push` 记录哈希**之前**）：解包 → `canonicalJson` 重排 → 重打包。放在这里而不是产物末端，是因为此处上游尚无任何哈希被记录、也没有签名，规范化后的字节**就是**构建产物本身，此后所有 provenance 描述的都是真正发货的东西；放到末端则要重做 tar/xz、重打 zip、**重新签名**，反而引入三个新的不确定性来源。重打包自身确定用**可移植**手段（不依赖 GNU 专有开关——本机是 bsdtar，用它就要等一小时 CI 才知道对不对）：显式递归排序的条目清单定顺序、`utimesSync` 钉 mtime、不指定属主、gzip 经管道不写名字与时间戳。

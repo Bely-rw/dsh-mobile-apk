@@ -39,6 +39,15 @@ object WatchdogV2 {
   /** DEGRADED_HTTP 阶梯阈值：6 拍 × 5s = 30s（与 restartDeadConfirmations 同量级，远小于 90s 冷启动上限）。 */
   const val DEGRADED_RESTART_CONFIRMATIONS = 6
 
+  /**
+   * 「慢」的宽限拍数（issue #274 ①）：slowProbe 否决破坏性动作的**上界**。
+   *
+   * 为什么需要上界而不是无条件否决：真机上半死引擎的探活形态也是超时，与长 turn 的单次观测
+   * 无法区分；无条件否决会让真卡死的引擎永远救不回来（破坏 0.14.1 锁存盲区回归）。
+   * 3 倍阶梯 = 18 拍 ≈ 90s，与 START_COOLDOWN_MS 的冷启动预算同量级。
+   */
+  const val DEGRADED_SLOW_GRACE_TICKS = DEGRADED_RESTART_CONFIRMATIONS * 3
+
   /** 引擎日志尾部签名：插件树装配失败（`plugin tree failed to load`）。 */
   const val SIGNATURE_PLUGIN_TREE = "plugin-tree"
 
@@ -113,6 +122,8 @@ object WatchdogV2 {
     consecutiveDegradedHttp = 0
     consecutivePluginTreeFailures = 0
     lastLogSignature = null
+    lastProbeTimedOut = false
+    lastLogTail = ""
   }
 
   /**
@@ -123,11 +134,73 @@ object WatchdogV2 {
    * 只做分类，不承担副作用（#210.4）：标记消费由 [planTick] 的前置段在**任何状态**下
    * 统一执行——挂在 HEALTHY 分支尾部正是「DEGRADED_LOG 早退吞掉消费」的成因。
    */
+  /**
+   * 引擎日志尾部的**强证据签名**（issue #274 ①）：只有这些才支持「破坏性自愈」。
+   *
+   * 真因：`assessProbe` 在 HTTP 超 2.5s 预算时给 DEGRADED_HTTP（注释自承实测出现过 3061ms）。
+   * 长 turn / 慢磁盘足以让一次探活超预算 ⇒ 连续 6 拍（30s）即升级为「受控重启」，
+   * 而那条路径**会回滚用户配置并强杀活引擎**。一次慢响应不该有这种权限。
+   *
+   * 判据（命中任一条 = 有强证据，才允许跑破坏性阶梯）：
+   *  - `EADDRINUSE`：端口被别人占着（我们自己起不来，等下去也不会好）；
+   *  - `plugin tree failed to load`：插件树装配失败（引擎没起来，不会自愈）；
+   *  - `uncaught`：未捕获异常（进程已不可信）。
+   *
+   * **反向要求**：`reset()` 不得因此类证据缺失而破坏既有坑 153 的语义——半死引擎的 undo/
+   * 重启必须仍能生效。故本判据只否决**破坏性**阶梯（DEGRADED_HTTP → 重启/回滚），
+   * 不影响 DEAD 判定（进程真的没了是硬事实，不看日志）。
+   */
+  internal fun strongEvidenceForDestructiveRecovery(logTail: String?): Boolean {
+    if (logTail.isNullOrEmpty()) return false
+    return logTail.contains("EADDRINUSE")
+      || logTail.contains("plugin tree failed to load")
+      || logTail.contains("uncaught", ignoreCase = true)
+  }
+
+  /**
+   * 端口是否**不是**被本进程持有（issue #274 ① 的第二条判据）。
+   *
+   * 用途：DEGRADED_HTTP（端口可连但 HTTP 失败）有两种成因——① 我们自己半死（该救）；
+   * ② 端口被**别的**进程占着（我们把别人的服务当成了自己的引擎，重启我们毫无用处，
+   * 只会强杀活引擎 + 回滚用户配置）。`EADDRINUSE` 是 ② 的日志形态；
+   * 拿不到进程归属时保守返回「可能是本进程」（不因测量失败而放宽破坏性动作）。
+   */
+  internal fun portOwnedByOtherProcess(portOwnedByApp: Boolean?): Boolean = portOwnedByApp == false
+
+  /**
+   * 最近一次探活是否**超时**（而非连接被拒）。
+   *
+   * 为什么必须区分（issue #274 ①）：HTTP 超 2.5s 预算 = 「引擎在忙 / 磁盘慢」，
+   * 而连接被拒 = 端口根本没开 = 引擎真的不在。前者绝不该成为回滚用户配置的理由。
+   * 实测出现过 3061ms 的一次超预算（本文件注释自承），单靠拍数无法区分这两者。
+   */
+  @Volatile
+  var lastProbeTimedOut = false
+    private set
+
+  /**
+   * 最近一次探活读到的引擎日志尾部原文（[assessProbe] 写、证据面读）。
+   *
+   * 为什么保留原文而不只保留签名：回滚的证据门要判 `EADDRINUSE` 这类**具体**形态，
+   * 而签名会把它们压成 `uncaught`/`plugin-tree` 之外的 null。原文让判据可扩展、可诊断。
+   */
+  @Volatile
+  var lastLogTail: String = ""
+    private set
+
   fun assessProbe(context: Context): ProbeState {
-    val base = EngineProbe.check(2_500).optBoolean("running", false)
+    val probe = EngineProbe.check(2_500)
+    // 「超时」与「拒绝」是两种病因：前者是慢，后者是死。记下来供证据面使用。
+    lastProbeTimedOut = probe.optString("error", "") == "timeout"
+    // 日志尾部**必须在任何早退之前读**：证据门关心的正是 DEGRADED_HTTP 这一支
+    // （它就在下面那个 `if (!base)` 里提前返回）。旧写法把读取放在健康分支之后，
+    // 于是最需要证据的时刻 lastLogTail 恒为空 —— 判据形同虚设。
+    val tail = readEngineLogTail(context)
+    lastLogTail = tail
+    lastLogSignature = logSignatureOf(tail)
+    val base = probe.optBoolean("running", false)
     if (!base) return if (EngineProbe.portReachable(1_000)) ProbeState.DEGRADED_HTTP else ProbeState.DEAD
-    val signature = engineLogFailureSignature(context)
-    lastLogSignature = signature
+    val signature = lastLogSignature
     if (signature != null) {
       LogCollector.log(TAG, "engine log reports a recoverable warning while HTTP remains alive: " + signature)
       return ProbeState.DEGRADED_LOG
@@ -152,6 +225,16 @@ object WatchdogV2 {
     startCooldownMs: Long = EngineManager.START_COOLDOWN_MS,
     /** 本拍的引擎日志签名（[assessProbe] 写、这里读；测试显式传，避免为测试在生产面留钩子）。 */
     logSignature: String? = lastLogSignature,
+    /**
+     * 端口是否归本应用持有（issue #274 ①）。null = 未知（不否决）。
+     * 生产面由 EngineService 从进程归属算出；JVM 测试直接传值。
+     */
+    portOwnedByApp: Boolean? = null,
+    /**
+     * 本次探活是否**超时**（=引擎在忙/磁盘慢），而非连接被拒（=真的死）。
+     * 默认取 [lastProbeTimedOut]；测试可显式注入。
+     */
+    slowProbe: Boolean = lastProbeTimedOut,
     feedProbe: (Boolean) -> Unit,
     consumeMarkers: () -> Unit,
     refreshWake: () -> Unit,
@@ -169,6 +252,41 @@ object WatchdogV2 {
     if (degradedLadderTripped) {
       logs += "DEGRADED_HTTP 连续 " + consecutiveDegradedHttp + " 拍（端口可连但 HTTP 持续失败）→ 升级为受控重启"
     }
+    // 【issue #274 ①】破坏性动作的证据门。**本条只作用于「强杀一个还活着的进程」这一件事**
+    // （下面的 RESTART 分支），不拦 undo、也不拦「重启一个已经死掉的进程」。
+    //
+    // 为什么不能拿「日志里没有强证据」当否决理由：logSignature 只在与已知签名（插件树失败/
+    // uncaught）匹配时才非空，**其常态就是 null**（生产也一样）。拿它做前提会让半死引擎
+    // 永久救不回来，直接破坏 0.14.1 的锁存盲区回归（halfDeadEngineStillReachesUndo…）——
+    // 那条防线要求「托管进程活着但 HTTP 永不健康」时 undo 仍能在预算用尽后介入。
+    //
+    // 因此判据取**正向证据**（指认「是慢、不是死」或「占着端口的不是我们」），而不是
+    // 「缺少证据」：
+    //   · [slowProbe]：本次探活**超时**（引擎在忙 / 磁盘慢）⇒ 它可能就是没死，先不动它；
+    //   · 端口**由他进程持有** ⇒ 重启我们不解决问题（该处理的是那个占用者）——这条**无上界**（它是硬事实）。
+    // 注意 `error=refused`（端口没开）**不算**慢——那是真的死，必须能走恢复流程。
+    val portForeign = portOwnedByOtherProcess(portOwnedByApp)
+    // 「慢」的否决是**有界宽限**，不是永久封锁 —— 这一点是刻意的，理由如下：
+    //
+    // 真机上半死引擎（进程在、HTTP 永远不健康）的探活形态**同样是超时**，与「长 turn 导致的
+    // 慢」在单次观测里无法区分。若把 slowProbe 做成无条件否决，就再也救不回真正卡死的引擎，
+    // 直接破坏 0.14.1 锁存盲区回归（halfDeadEngineStillReachesUndo…：它要求托管进程存活时
+    // undo 仍能在预算用尽后介入）——那是**生产语义**，不是测试注入口径。
+    //
+    // 所以宽限只覆盖「比常态阶梯长得多」的一段：阶梯 6 拍（30s）到达时先不动手，
+    // 继续观察；慢若持续到 [DEGRADED_SLOW_GRACE_TICKS] 拍（= 3 倍阶梯，约 90s）仍无改善，
+    // 视为真卡死，放行破坏性动作。这既消掉 #274 的「30s 慢响应就回滚」，又不制造死局。
+    val slowGraceExhausted = consecutiveDegradedHttp >= DEGRADED_SLOW_GRACE_TICKS
+    // 强证据（EADDRINUSE / 插件树装配失败 / uncaught）**解除**「慢」这条否决：
+    // 它把「探活超时」从「可能只是在忙」变成「确知引擎坏了」。
+    // 注意方向——证据是**放行**的理由，不是**前置条件**（后者会挡掉必需的第 6 拍，见上）。
+    val strongEvidence = strongEvidenceForDestructiveRecovery(logSignature)
+    // 两组条件作用面不同，故用「或」：
+    //  · portForeign：监听者不是我们 ⇒ **任何**恢复动作都不解决问题（含子进程已死时盲目重启）；
+    //  · slowProbe：探活只是超时，但**只有在我们确实托管着一个活进程时**才谈得上「别强杀它」；
+    //    子进程已死时重启它不具破坏性，不该被这条拦住。
+    val destructiveBlocked = degradedLadderTripped &&
+      (portForeign || (engineProcessAlive && slowProbe && !slowGraceExhausted && !strongEvidence))
     // DEGRADED_LOG 保留「绝不重启」语义：HTTP 存活时重启会打断活动 turn。
     // **例外：插件树装配失败**（[pluginTreeHung]）。那一刻引擎没起来，且不会自愈——设备实测
     // （2026-09-21，注入坏插件后重启）：本行早退 IDLE ⇒ 自动 undo 永不被求值（调用方还会在 IDLE
@@ -200,6 +318,24 @@ object WatchdogV2 {
     // 配置回滚（undo）与「禁止盲目重启」（熔断）是两种正交的恢复手段，不应互斥：先给 undo 机会，
     // 熔断继续守它该守的「undo 不可用时不得盲目反复重启」。反向对照见 WatchdogLadderTest 的
     // circuitBreakerStillBlocksBlindRestartWhenUndoIsUnavailable。
+    // 【issue #274 ①】破坏性动作的证据门（**位于 undo 之前**，因为 undo 也会回滚用户配置，
+    // 那正是本 issue 要收窄的对象之一）。
+    //
+    // 只在「托管进程还活着」时才可能误伤——进程已死时下面任何动作都只是恢复，不是破坏。
+    // 判据取**正向证据**（指认「是慢、不是死」或「占端口的不是我们」）：
+    //   · [slowProbe]：本次探活超时（引擎在忙/磁盘慢）⇒ 它没死，掐掉它是 #274 的靶子；
+    //   · 端口由他进程持有 ⇒ 重启/回滚我们都不解决问题。
+    // **不得**用「日志里没有强证据」当否决理由：logSignature 常态就是 null（只在与插件树失败 /
+    // uncaught 匹配时非空），拿它做前提会把半死引擎永久锁死，破坏 0.14.1 的锁存盲区回归。
+    if (destructiveBlocked) {
+      return TickPlan(
+        TickAction.HOLD,
+        logs + if (portForeign)
+          "destructive recovery withheld: the listening port belongs to another process; restarting us cannot help"
+        else
+          "destructive recovery withheld: the probe timed out (slow engine/disk), not a dead engine"
+      )
+    }
     if (undoReady()) {
       return TickPlan(TickAction.UNDO, logs + ("auto-undo trigger after confirmed failures=" + effectiveFailureCount()))
     }
@@ -364,7 +500,6 @@ object WatchdogV2 {
 
   /** 引擎日志尾部异常扫描（最近 4KB 内 fatal/Error 关键字；命中率控制：只取尾部）。 */
   /** 读引擎日志尾部 4KB，返回命中的签名（[SIGNATURE_PLUGIN_TREE] 优先；无命中 null）。 */
-  private fun engineLogFailureSignature(context: Context): String? = logSignatureOf(readEngineLogTail(context))
 
   /** 纯函数：日志尾部文本 → 签名（插件树优先于未捕获异常）。 */
   internal fun logSignatureOf(tail: String): String? = when {

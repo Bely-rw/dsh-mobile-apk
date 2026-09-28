@@ -411,6 +411,13 @@ foreach ($abi in @('arm64', 'x86_64')) {
     node (Join-Path $Root "scripts\check-runtime-assets.mjs") $abi --require 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "运行时补丁资产过期或缺失（从快照重新生成 assets/patched）"; continue }
 
+    # MCP client 运行期依赖闭包（0.14.2-fx-2 H-1）：该宿主**不在我们装配的行面上**（用户自己在
+    # profile 里挂的 entry，实测 @deepseek-ai/dsh-mcp-client），故 check-engine-overlay 的正向闭包
+    # 结构性看不见它——设备实测 boot 阶段 ERR_MODULE_NOT_FOUND 硬崩、exit=1。
+    Write-Host "== MCP client 运行期依赖闭包门禁（$abi，严格）=="
+    node (Join-Path $Root "scripts\check-mcp-client-deps.mjs") $abi --require --snapshot $snapIn 2>&1
+    if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "MCP client 运行期依赖在快照内不可解析（补 engine-overlay 的 vendorTop/packages）"; continue }
+
     # A1 出厂声明值对账（P-AC-01，--require 严格档）：注入后快照的 profile 清单必须带 patchReload 出厂值。
     Write-Host "== 性能度量入口与 A1 出厂值门禁（$abi，严格）=="
     node (Join-Path $Root "scripts\check-perf-instrumentation.mjs") --require --snapshot $snapIn --abi $abi 2>&1

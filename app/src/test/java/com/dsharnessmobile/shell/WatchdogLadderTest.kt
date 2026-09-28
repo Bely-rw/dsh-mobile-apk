@@ -415,4 +415,188 @@ class WatchdogLadderTest {
     assertFalse(running)
     assertTrue(recovered)
   }
+
+  // ── M.3 F（issue #274 ①）：破坏性自愈的证据门 ──────────────────────────────────
+  //
+  // 真因：assessProbe 在 HTTP 超 2.5s 预算时给 DEGRADED_HTTP（注释自承实测出现过 3061ms），
+  // 连续 6 拍（30s）即升级为受控重启 —— 而那条路径会**回滚用户配置 + 强杀活引擎**。
+  // 长 turn / 慢磁盘足以误触发。一次慢响应不该有这种权限。
+  //
+  // 判据取**正向证据**（不是「缺少强证据」）：logSignature 常态为 null，拿它做前提会挡掉
+  // 必需的阶梯行为。详见 planTick 内注释与 DEGRADED_SLOW_GRACE_TICKS。
+
+  /** 强证据判据（纯函数）：只有这三类日志形态才算。 */
+  @Test
+  fun onlyStrongLogEvidenceJustifiesDestructiveRecovery() {
+    assertTrue("EADDRINUSE = 我们自己起不来，等下去不会好", WatchdogV2.strongEvidenceForDestructiveRecovery("Error: listen EADDRINUSE :::3080"))
+    assertTrue("插件树装配失败 = 引擎没起来，不自愈", WatchdogV2.strongEvidenceForDestructiveRecovery("plugin tree failed to load"))
+    assertTrue("uncaught = 进程已不可信", WatchdogV2.strongEvidenceForDestructiveRecovery("Uncaught Exception: boom"))
+    // 反证：普通日志 / 空 / null 一律**不**构成破坏性动作的理由。
+    assertFalse("普通日志不得放行", WatchdogV2.strongEvidenceForDestructiveRecovery("turn started"))
+    assertFalse("空串不得放行", WatchdogV2.strongEvidenceForDestructiveRecovery(""))
+    assertFalse("null 不得放行", WatchdogV2.strongEvidenceForDestructiveRecovery(null))
+    assertFalse("只是慢（无日志证据）不得放行", WatchdogV2.strongEvidenceForDestructiveRecovery("dsh web: listening on 3080"))
+  }
+
+  @Test
+  fun foreignPortHolderDisqualifiesDestructiveRecovery() {
+    assertTrue("端口确认非本进程持有 ⇒ 重启我们毫无意义", WatchdogV2.portOwnedByOtherProcess(false))
+    assertFalse("端口归我们 ⇒ 不因这条否决", WatchdogV2.portOwnedByOtherProcess(true))
+    assertFalse("未知（拿不到归属）保守按「可能是我们」处理，不因测量失败放宽破坏性动作", WatchdogV2.portOwnedByOtherProcess(null))
+  }
+
+
+
+  /**
+   * 反证（F，核心）：**只是慢**（探活超时）时，破坏性动作必须被压住 —— 这是 #274 的靶子。
+   * 前置：进程存活 + 阶梯到时 + slowProbe。
+   */
+  @Test
+  fun merelySlowProbeWithholdsDestructiveRecovery() {
+    repeat(WatchdogV2.DEGRADED_RESTART_CONFIRMATIONS) {
+      WatchdogV2.recordProbe(WatchdogV2.ProbeState.DEGRADED_HTTP)
+    }
+    var undoAsked = false
+    val plan = WatchdogV2.planTick(
+      state = WatchdogV2.ProbeState.DEGRADED_HTTP,
+      now = 999_999L,
+      nextRestartAllowedAt = 0L,
+      engineReady = true,
+      engineProcessAlive = true, // 进程还活着：强杀它就是破坏性动作
+      bootAgeMs = 999_999L,
+      restartDeadConfirmations = 2,
+      slowProbe = true, // 本次探活只是超时（引擎在忙 / 磁盘慢）
+      portOwnedByApp = true,
+      feedProbe = {},
+      consumeMarkers = {},
+      refreshWake = {},
+      undoReady = { undoAsked = true; true },
+    )
+    assertEquals(
+      "只是慢（超时）时必须 HOLD：不得强杀活引擎、不得回滚用户配置",
+      WatchdogV2.TickAction.HOLD,
+      plan.action,
+    )
+    assertFalse("连 undo 都不该问（undo 会回滚用户配置）", undoAsked)
+    assertTrue("必须留可诊断叙述: " + plan.logs, plan.logs.any { it.contains("slow engine") })
+  }
+
+  /** 反证（F）：端口**由他进程持有**时必须 HOLD —— 重启我们不解决问题。 */
+  @Test
+  fun foreignPortHolderWithholdsDestructiveRecovery() {
+    repeat(WatchdogV2.DEGRADED_RESTART_CONFIRMATIONS) {
+      WatchdogV2.recordProbe(WatchdogV2.ProbeState.DEGRADED_HTTP)
+    }
+    val plan = WatchdogV2.planTick(
+      state = WatchdogV2.ProbeState.DEGRADED_HTTP,
+      now = 999_999L,
+      nextRestartAllowedAt = 0L,
+      engineReady = true,
+      engineProcessAlive = true,
+      bootAgeMs = 999_999L,
+      restartDeadConfirmations = 2,
+      slowProbe = false,
+      portOwnedByApp = false, // 端口是别人的
+      feedProbe = {},
+      consumeMarkers = {},
+      refreshWake = {},
+      undoReady = { true },
+    )
+    assertEquals("端口非本进程持有时不得做破坏性动作", WatchdogV2.TickAction.HOLD, plan.action)
+    assertTrue("必须点名真因: " + plan.logs, plan.logs.any { it.contains("another process") })
+  }
+
+  /**
+   * 正证（F，**防死局**）：慢的否决是**有界宽限**，不是永久封锁。
+   * 慢若持续到宽限拍数（3 倍阶梯）仍无改善，必须放行破坏性动作 ——
+   * 否则真卡死的引擎永远救不回来（那正是 0.14.1 锁存盲区回归要防的死局）。
+   */
+  @Test
+  fun persistentSlownessIsEventuallyTreatedAsStuck() {
+    repeat(WatchdogV2.DEGRADED_SLOW_GRACE_TICKS) {
+      WatchdogV2.recordProbe(WatchdogV2.ProbeState.DEGRADED_HTTP)
+    }
+    assertTrue(
+      "前置：已到宽限上界",
+      WatchdogV2.consecutiveDegradedHttp >= WatchdogV2.DEGRADED_SLOW_GRACE_TICKS,
+    )
+    val plan = WatchdogV2.planTick(
+      state = WatchdogV2.ProbeState.DEGRADED_HTTP,
+      now = 999_999L,
+      nextRestartAllowedAt = 0L,
+      engineReady = true,
+      engineProcessAlive = true,
+      bootAgeMs = 999_999L,
+      restartDeadConfirmations = 2,
+      slowProbe = true, // 一直超时
+      portOwnedByApp = true,
+      feedProbe = {},
+      consumeMarkers = {},
+      refreshWake = {},
+      undoReady = { true },
+    )
+    assertEquals(
+      "宽限用尽后必须放行恢复动作（否则留下「引擎卡死且永不重试」的死局）",
+      WatchdogV2.TickAction.UNDO,
+      plan.action,
+    )
+  }
+
+  /** 正证（F）：error=refused（端口没开）**不算慢** —— 那是真的死，必须能走恢复流程。 */
+  @Test
+  fun refusedProbeIsNotSlowAndStillRecovers() {
+    repeat(WatchdogV2.DEGRADED_RESTART_CONFIRMATIONS) {
+      WatchdogV2.recordProbe(WatchdogV2.ProbeState.DEGRADED_HTTP)
+    }
+    val plan = WatchdogV2.planTick(
+      state = WatchdogV2.ProbeState.DEGRADED_HTTP,
+      now = 999_999L,
+      nextRestartAllowedAt = 0L,
+      engineReady = true,
+      engineProcessAlive = true,
+      bootAgeMs = 999_999L,
+      restartDeadConfirmations = 2,
+      slowProbe = false, // refused != slow
+      portOwnedByApp = true,
+      feedProbe = {},
+      consumeMarkers = {},
+      refreshWake = {},
+      undoReady = { true },
+    )
+    assertEquals("端口没开 = 真的死，不得被「慢」这条挡住", WatchdogV2.TickAction.UNDO, plan.action)
+  }
+
+  /**
+   * 正证（F）：第 6 拍的既定语义仍在（既有回归的显式复述，防我改坏）。
+   * 用**未知**端口归属（= 生产默认口径）与已死子进程，避开与「端口确属他人」那条的正交情形。
+   */
+  @Test
+  fun sixthTickStillRestartsWhenTheChildIsAlreadyGoneAndOwnershipIsUnknown() {
+    // 不预热计数：阶梯由 planTick 自己的前置段逐拍累积（与既有回归同构），
+    // 否则第 1 拍就已「到时」，断言会变成在验另一件事。
+    var firstRestartTick = 0
+    for (tick in 1..WatchdogV2.DEGRADED_RESTART_CONFIRMATIONS) {
+      val plan = WatchdogV2.planTick(
+        state = WatchdogV2.ProbeState.DEGRADED_HTTP,
+        now = tick * 5_000L,
+        nextRestartAllowedAt = 0L,
+        engineReady = true,
+        engineProcessAlive = false, // 没有活进程可杀 ⇒ 不具破坏性，不该被拦
+        bootAgeMs = 999_999L,
+        restartDeadConfirmations = 2,
+        slowProbe = true, // 即便探活超时
+        portOwnedByApp = null, // 未知归属：不否决（这是生产默认口径）
+        feedProbe = {},
+        consumeMarkers = {},
+        refreshWake = {},
+        undoReady = { false },
+      )
+      if (plan.action == WatchdogV2.TickAction.RESTART && firstRestartTick == 0) firstRestartTick = tick
+    }
+    assertEquals(
+      "进程已不在场时不具破坏性：第 6 拍 RESTART 的既定语义必须仍然成立",
+      WatchdogV2.DEGRADED_RESTART_CONFIRMATIONS,
+      firstRestartTick,
+    )
+  }
 }

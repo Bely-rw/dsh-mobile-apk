@@ -12,6 +12,10 @@
     "check-boot-budget.mjs": {
       "max": 1,
       "why": "C5 正向对照需要**打过 A5/P1 探针补丁的引擎树**，而补丁在**注入阶段**打（设备实测同源：stage 树无探针面、注入后快照有）。发布链前置门禁跑在注入之前，故该对照取不到判据（如实记 SKIP，不算绿）；C1-C4/C6 六项全部按真实产物真检。"
+    },
+    "check-mcp-client-deps.mjs": {
+      "max": 2,
+      "why": "两处 SKIP 的输入在发布链时序里必然不在场：① 单 ABI 调用时另一 ABI 的快照不在场；② 快照缺席时无法枚举包树（预检档 exit 0 记账，发布链以 --require 强制齐全）。0.14.2-fx-2 缺陷 H：本门禁守的是**不在我们装配行面上**的宿主（用户自挂的 @deepseek-ai/dsh-mcp-client）的运行期依赖闭包——正向闭包门禁 check-engine-overlay（只对三份 cordis.patch.yml 问责）结构性看不见它，这正是设备侧 boot 硬崩的那条。"
     }
   }
 }
