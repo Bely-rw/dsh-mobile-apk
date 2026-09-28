@@ -37,6 +37,19 @@ export function checkDshRuntimeDependencies(engineRootArg) {
   const packageFiles = [join(engineRoot, 'package.json')]
   for (const name of readdirSync(scopeRoot)) packageFiles.push(join(scopeRoot, name, 'package.json'))
 
+  // 平台死重（slim.json 的 platformDeadPackages）：这些包被构建期**刻意剔除**——它们是
+  // glibc/musl 的 Linux ELF，Android（bionic）上永不加载。但它们仍可能被声明为**非 optional**
+  // 依赖：实测 `@openai/codex` 被 `@deepseek-ai/dsh-subagent-codex` 声明，于是落到下面那条
+  // `no installed package.json` 判红。那是**刻意缺席**，不是断链——该二进制在设备上本来就
+  // exec 不了，删与不删功能等价。
+  // 但「放过」不等于「静默」：刻意缺席单独计数、列进报告，外部复核方看得到；
+  // 若有人把某条从 slim.json 删掉，这里立刻恢复判红（清单与判据自洽）。
+  const platformDead = new Set(
+    (JSON.parse(readFileSync(join(import.meta.dirname, '..', 'snapshot-config', 'slim.json'), 'utf8'))
+      .platformDeadPackages ?? []).map((entry) => entry.name),
+  )
+  const deliberatelyAbsent = []
+
   let packageCount = 0
   for (const packageFile of packageFiles) {
     if (!existsSync(packageFile)) continue
@@ -53,6 +66,10 @@ export function checkDshRuntimeDependencies(engineRootArg) {
       dependencyCount++
       const installedPath = findInstalledPackage(engineRoot, packageDir, dependency)
       if (!installedPath) {
+        if (platformDead.has(dependency)) {
+          deliberatelyAbsent.push(`${manifest.name ?? packageFile} -> ${dependency}`)
+          continue
+        }
         failures.push(`${manifest.name ?? packageFile} -> ${dependency}: no installed package.json in the deploy tree`)
         continue
       }
@@ -78,6 +95,9 @@ export function checkDshRuntimeDependencies(engineRootArg) {
     dependencyPresence: failures.length ? 'failed' : 'passed',
     resolvedDependencies,
     failures,
+    // 刻意剔除的平台死重（非故障）：声明仍在但包按设计不在树里。计数可见、理由见 slim.json。
+    deliberatelyAbsentCount: deliberatelyAbsent.length,
+    deliberatelyAbsent,
   }
   if (failures.length) {
     console.error(failures.join('\n'))
