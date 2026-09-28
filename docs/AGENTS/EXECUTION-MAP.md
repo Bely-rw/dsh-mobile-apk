@@ -120,7 +120,7 @@ sequenceDiagram
 | P03 | 浏览器与虚拟屏插件 | browser_* 与 vd* 工具落壳侧控制 op 并如实回执 | 模型调用 browser_* / android_vdisplay_* 工具 | 稳态控制 | K08,K07,桥控制队列 | 引擎启动时按装配集注册 | plugins/dsh-android-browser/src/tools.ts,plugins/dsh-android-browser/src/index.ts,plugins/dsh-android-vdisplay/src/index.ts,plugins/dsh-android-vdisplay/src/status.ts | 高 |
 | P04 | 文件打开、Linux 环境与模型能力插件 | 外部来件草稿、工具链与缓存清理、模型能力写回 | 壳侧 FileIncoming 投递 / 设置页 HTTP / cordis 装配 | 稳态控制 | 桥与鉴权、客户端注入层、shell-termux 工具链表、快照装配链 | 壳侧 FileIncoming.processIncomingIntent、设置页与开发者选项、cordis 装配 | plugins/dsh-android-file-open/src/index.ts,plugins/dsh-android-linux-env/src/runtime-cache.ts,plugins/dsh-model-capability/src/index.ts | 高 |
 | S01 | 引擎侧注入层（三个子仓） | 页面内发布标记与桥入口、钳面板几何、装配老内核垫片 | 客户端插件 apply() 装载；每个 index 响应经 tapIndex 注入 | 交互面 | K04（壳侧 androidBridge/dshBackBridge 桥面） | 引擎插件系统按 profile-web.cordis.patch.yml 的 insert 行拉起 | dsh-client-ui-responsive/src/client/index.ts,dsh-host-web-compat/lib/index.js,dsh-shell-termux/src/index.ts | 高 |
-| B01 | 构建链与快照注入 | 快照构建 插件注入 门禁收口 到 APK 出包 | 人手动 pwsh -File scripts\build-apk-013.ps1 或发布链/CI 调用 | 构建与发布 | 门禁块,壳侧快照解压,插件源码与 vendor 固化面 | 开发者手动,发布链 build-release.ps1,CI 与云端 build-apk.mjs | scripts/build-apk-013.ps1,scripts/build-snapshot-013.mjs,scripts/inject-all.py,scripts/patches/apply-patches.mjs | 高 |
+| B01 | 构建链与快照注入 | 快照构建 插件注入 门禁收口 到 APK 出包；另有不读 LFS 快照的 ARM64 来源审计构建（签名 Termux 包 → NDK 跨编译 node-pty → 原生闭包门禁 → 快照 → APK） | 人手动 pwsh -File scripts\build-apk-013.ps1、发布链/CI 或 workflow_dispatch | 构建与发布 | 门禁块,壳侧快照解压,插件源码与 vendor 固化面,可信上游签名/哈希 | 开发者手动,发布链 build-release.ps1,CI 与云端 build-apk.mjs,build-apk-source.yml | scripts/build-apk-013.ps1,scripts/build-snapshot-013.mjs,scripts/inject-all.py,scripts/source-build/*,.github/workflows/build-apk-source.yml | 高 |
 | B02 | 静态门禁链与 CI | 33 个静态门禁脚本与三层接线的唯一声明处 | PR/CI、两条打包链、发布链 | 测试与门禁 | B01,B03 | 提交 PR、推 main、构建/发版 | scripts/check-release-gates.mjs,scripts/check-gate-skips.mjs,.github/workflows/pr-gate.yml,scripts/build-apk-013.ps1 | 高 |
 | B03 | 设备验收套件（CDP 与 adb 面） | 9 个 CDP/设备断言套件 + 5 个部署冒烟脚本的设备侧验收入口 | 人手动逐个执行 node scripts/verify-*.mjs 与 pwsh scripts/*.ps1 | 测试与门禁 | S-12 双 ABI 包装机、快照刷新完成、桥面 / 浏览器宿主 / 虚拟屏 / 注入层各块 | 人（PR 前设备门禁，无 CI 接入） | scripts/verify-webview-015.mjs,scripts/verify-state-sync.mjs,scripts/verify-browser-host.mjs,scripts/verify-browser-panel.mjs,scripts/verify-vdisplay-viewer.mjs,scripts/verify-vdisplay-float.mjs,scripts/verify-engine-log-copy.mjs,scripts/verify-screen-scope-matrix.mjs,scripts/verify-adb-only-tree.mjs,scripts/verify-notify-consumption.mjs,scripts/verify-auto-undo.mjs,scripts/device-smoke.ps1,scripts/deploy-device.ps1,scripts/deploy-embedded.ps1,scripts/t0-check.ps1,scripts/e2e-phone-test.ps1 | 高 |
 
@@ -526,6 +526,7 @@ sequenceDiagram
 | B01 | 协同仓权威源 | scripts/patches/**、build-apk-013.ps1、build-snapshot-013.mjs、inject-all.py 等双仓逐字节镜像，单边演进即拒 | scripts/check-patch-mirror.mjs:109,160-279 |
 | B01 | 发布链 build-release.ps1 | 复用同一门禁集与指纹对账，输入走设备侧 make-snapshot.sh 产出的 snapshot/snapshot-*.tar.xz | scripts/build-release.ps1:56-61,89-114,147 |
 | B01 | CI 与云端构建链 | 云端 build-apk.mjs 与本地链门禁集差集必须为 0；apk 仓 build-snapshot.yml 仍走 inject-snapshot.py 三包注入 | scripts/check-release-gates.mjs:191-212,.github/workflows/build-snapshot.yml:104 |
+| B01 | 来源审计 ARM64 构建 | 不读取 base/ LFS 快照；入口先核对插件 package-lock 根声明；Harness 固定当前源码先构建 CLI/Web UI，再单独编译固定旧版 Cordis 包并部署；替换时保留 pnpm 链接，构建期锁文件只对齐五个 importer；Termux bootstrap 校验和固定，InRelease 与每个 deb 经签名/哈希校验；插件从本地或固定上游源码构建并导出来源清单，原生文件按固定包族审计，快照测试驱动当前 boot 审计导出，内置预设载体的口径与权威 overlay 门禁同源并单测守卫，APK 步骤把构建期摘除的第一方 overlay 钉按 policy 还原后再跑门禁 | .github/workflows/build-apk-source.yml:1,scripts/source-build/check-package-lock-roots.mjs:1,scripts/source-build/check-android-native-runtime-packages.mjs:1,scripts/source-build/prepare-harness-vendor-overrides.py:1,scripts/source-build/reconcile-harness-vendor-lock.mjs:1,scripts/source-build/prepare-termux-bootstrap.py:1,scripts/source-build/prepare-termux-signed-repo.py:1,scripts/source-build/export-dsh-engine.mjs:1,scripts/source-build/seed-dsh-profiles.mjs:1,scripts/source-build/preset-carriers.mjs:1,scripts/source-build/preset-carriers.test.mjs:1,scripts/source-build/restore-overlay-pins.mjs:1,scripts/source-build/restore-overlay-pins.test.mjs:1,scripts/tests/boot-pending.test.mjs:1 |
 | B02 | B01 | 门禁集由两条编排器逐项调用；聚合入口断言本地链与云端链门禁集差集为 0，并锁发布链必须走 --run | scripts/check-release-gates.mjs:135 |
 | B02 | B03 | 冷启动预算的真数据只能来自设备产物，--require-real 由设备验收承担，构建机与 CI 只计 SKIP | scripts/check-boot-budget.mjs:671 |
 | B02 | K03 | 快照指纹、剥离后置断言、运行时补丁资产三门禁共同守内嵌 assets/snapshot.tar.xz 与 assets/patched 同源 | scripts/check-runtime-assets.mjs:126 |
@@ -2167,6 +2168,34 @@ flowchart TD
   U --> S
   S -->|"是"| X
   S -->|"否"| V["交付 out 目录产物"]
+```
+
+**ARM64 来源审计变体**：`.github/workflows/build-apk-source.yml` 是独立的 `workflow_dispatch` 入口。它从固定 Harness commit 构建 CLI、递归 bundle 与 Web UI；部署前临时把 overlay 清单中的第一方工作区包加入实际部署目标 `apps/cli` 的 production dependencies，并同步更新锁文件 `apps/cli` importer 后 pnpm deploy，以纳入这些包及其生产依赖闭包；deploy 完成即恢复上游 `apps/cli/package.json` 与锁文件，并把临时输入哈希和包清单附入 provenance。第一方 tarball 构建产物写入 deploy 树中对应符号链接的物理包目录，保留 pnpm 依赖目录与虚拟 store 链接；快照生成后把第一方包顶层 payload 物化为普通文件目录，并令 `.pnpm` store 中相同 payload 通过相对链接回指顶层文件，为顶层包合并包内和 `.pnpm` 同级的依赖链接并保留 Node 搜索优先级，之后重打包并更新快照 SHA-256。注入后、快照构建后分别由 `scripts/source-build/check-dsh-runtime-dependencies.mjs` 按 Node 的 `node_modules` 祖先查找规则验证必需依赖的 `package.json` 在运行时树中可达，并保存路径报告；该检查确认 pnpm 包依赖在运行时树内；APK 源码构建在打包步骤临时用 source-build 适配器把既有 overlay 门禁调用路由至 `source-build/check-dsh-source-snapshot.mjs`，从最终压缩快照核验固定来源包版本与 tarball 哈希、依赖链接、引擎补丁标记及内置预设载体（载体清单在 `scripts/source-build/preset-carriers.mjs`，与权威 overlay 门禁的 CARRIERS 同源，其单测读权威源文本双向比对以防重锚后脱钩）；原件由退出 trap 恢复，原件/适配器/检查器哈希记入策略 provenance，普通构建仍走 `check-engine-overlay.mjs`。同一打包步骤在跑门禁前用 `restore-overlay-pins.mjs` 按策略报告记下的清单把构建期摘除的第一方 overlay 钉并回 `engine-overlay.json`（摘除是为了让快照构建器不可回拉上游发布版 tarball 覆盖源码产物；而 `check-contract.mjs` 第 7 节按这份清单定运行时版本并判 profile 引擎包 insert 行同版），还原记录进策略 provenance，退出 trap 随后覆盖回原文件。Termux 官方 bootstrap 以固定 SHA-256 校验后生成 `usr` 基座，并将源码部署树清单写入 provenance；再从 bootstrap 读取 Termux 密钥验证 `InRelease` 和包索引列出的每个 `.deb`。profile 文件由上游 `profile.ts` 模板初始化。壳插件从项目源构建，host-web-compat 对照固定上游 commit，marketplace 用**固定 npm 发布产物**（`dshmarketplace-plugin-0.1.7.tgz`，sha256 钉在 workflow 里；不再从组件源码树重建——我们的镜像与 market-* 补丁都按发布字节定义，重建会用不同工具链产出不同字节、把补丁锚空，见坑 205）；此变体把旧 LFS 基座独有且未挂载的四个遗留包排除，名单与理由随策略清单附出。此流程不启用 LFS、不读取 `base/base-usr-*` 或 `base-dsh`，通过本地只读 HTTP 镜像把验签后的索引与 deb 交给既有快照构建器，最后出 ARM64 APK 与来源清单/哈希。打包用仓库内置的固定 debug keystore（与本地/正常 CI 链同一把），并在产出侧用 apksigner 断言 APK 的签名证书等于该 keystore 的固定指纹（坑 202）。实现分别位于 `scripts/source-build/prepare-termux-bootstrap.py`、`prepare-termux-signed-repo.py`、`seed-dsh-profiles.mjs`、`export-dsh-engine.mjs`、`inject-dsh-engine-packages.mjs`、`check-dsh-runtime-dependencies.mjs`、`materialize-dsh-pnpm-packages.mjs`、`check-dsh-source-snapshot.mjs`、`check-dsh-source-snapshot-gate.mjs`、`prepare-pnpm-deploy-runtime-closure.mjs`。Android 运行时闭包还锁定 Koffi 3.2.1、启用 Android/ARM64 目标并加入 Sharp WASM 后备；`check-android-native-runtime-packages.mjs` 核验 AArch64 ELF、WASM 可解析路径与包 payload 哈希。
+
+```mermaid
+flowchart LR
+  A["workflow_dispatch arm64"] --> B["检出项目源码 不启用 LFS"]
+  B --> R["核对插件 package-lock 根声明"]
+  R --> C["固定 Harness commit"]
+  C --> D["pnpm install 冻结锁文件"]
+  D --> P["当前 Harness 全仓源码构建"]
+  P --> V["原位替换固定 Cordis 源码 保留 node_modules"]
+  V --> W["只对齐五个旧版包的锁文件 importer"]
+  W --> Q["单独编译五个固定旧版包"]
+  Q --> E["导出 first-party overlay tarballs 与源码哈希"]
+  B --> F["下载 pinned Termux bootstrap ZIP"]
+  F --> G{"SHA-256 匹配"}
+  G -->|"否"| X["终止 不产 APK"]
+  G -->|"是"| H["按 SYMLINKS 重建 usr 并从 profile.ts seed"]
+  H --> I["bootstrap 密钥验证 InRelease"]
+  I --> J{"签名与 Packages.gz 哈希匹配"}
+  J -->|"否"| X
+  J -->|"是"| K["下载依赖闭包并逐 deb 核 SHA-256"]
+  E --> L["快照构建 本地镜像只提供验过的 Termux 文件"]
+  K --> L
+  L --> M["既有注入与门禁"]
+  M --> N["assembleDebug arm64 APK"]
+  N --> O["APK SHA-256 与来源清单"]
 ```
 
 #### B02 静态门禁链与 CI

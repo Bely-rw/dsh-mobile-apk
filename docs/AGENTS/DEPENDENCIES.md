@@ -11,7 +11,7 @@
 | Gradle | 8.11.1 | gradle-wrapper.properties distributionUrl（发布链必须用本仓 wrapper，勿用系统 gradle） |
 | compileSdk / targetSdk / minSdk | 36 / 34 / 26 | 理由见 docs/AGENTS/ANDROID-API-USAGE.md §5 |
 | versionCode / versionName | 38 / 0.14.0-preview | app/build.gradle.kts:25-30（快照构建可加 -PversionNameSuffix） |
-| 签名 | repoDebug（keystore/debug.keystore，CI 与本地字节兼容） | build.gradle.kts 签名块注释：跨机同签名是覆盖安装前提 |
+| 签名 | repoDebug（keystore/debug.keystore，CI 与本地字节兼容）；来源审计链同样走这一把并在产出侧断言指纹 | build.gradle.kts 签名块注释：跨机同签名是覆盖安装前提；坑 202 |
 | lint | checkReleaseBuilds=false / abortOnError=false | 离线环境无 lint 缓存，不在发布关键路径 |
 
 ## 2. gradle 依赖（app/build.gradle.kts:111-120，共 7 项，全部 implementation）
