@@ -1101,7 +1101,7 @@
     **两个根因**：
     **① `pnpm pack` 产出的 manifest 键序不稳定**（主因，260/316 个包）。打包点是 `export-dsh-engine.mjs:74`，而该处注释写的意图恰恰是「packed manifests stay exactly as their source commits」——**意图是确定性，结果不是**。键序不确定的具体来源（pnpm 自身还是 harness 构建阶段）未定位到，故修法取「不管根因、在产出侧钉死」。
     **② `dpkg/available` 直接写入整份活上游索引**（次因，1 个文件）。`build-snapshot-013.mjs:586` 把 `indexText`（3000+ 条）整份倒进快照，而 `status`/`status-old` 只写 `needed`（本链实际装的 79 个包）——同一个函数里唯独这一个文件例外。索引由 `prepare-termux-signed-repo.py:84` **活取**（`:87` 只做「与签名 Release 比对」，证明索引是真的，却没证明它是钉版时那一份）。实测两次运行相隔 90 分钟，索引 sha256 已从 `795749e0…` 变为 `2bf37bba…`，连签名的 Release 都换了（`0707fca9…` → `4ec8dc46…`）——上游掉了 `codon`、`ecl` 两个**与本链毫无关系**的包。
-    **为什么这条比"哈希不同"严重**：本链的核心主张是可来源审计、可外部复核，而验证闭环是「重跑 → 得到同一哈希 → 于是相信产物来自那份源码」。哈希恒漂 ⇒ 闭环不成立；更隐蔽的是**它把信号也一起淹没**——「两次构建哈希不同」从此不再是信号，那么真正该被发现的问题（比如某次构建静默少了个包，见坑 206-201 同族）就失去了最廉价、最强的兜底判据。**恒亮的警报灯等于没有警报灯。**
+    **为什么这条比"哈希不同"严重**：本链的核心主张是可来源审计、可外部复核，而验证闭环是「重跑 → 得到同一哈希 → 于是相信产物来自那份源码」。哈希恒漂 ⇒ 闭环不成立；更隐蔽的是**它把信号也一起淹没**——「两次构建哈希不同」从此不再是信号，那么真正该被发现的问题（比如某次构建静默少了个包，见坑 206-208 同族）就失去了最廉价、最强的兜底判据。**恒亮的警报灯等于没有警报灯。**
     **修法（三段，各自独立可用）**：
     **① 语义归一化**——新增 `scripts/source-build/normalize-snapshot.mjs`：把**表示层**差异（JSON/YAML 映射键序、pnpm 的时间戳字段 `prunedAt` / `lastValidatedTimestamp`）从摘要里剔除，给出稳定的 `normalizedManifestSha256`。三条设计约束缺一不可：**规则封闭**（每条写清"为什么这个差异不可能影响行为"）、**可无依赖复算**（外部人拿产物+脚本即可重算，不引第三方包，故 YAML 自带受限块映射归一化器）、**响亮失败**（遇到不认识的形态一律 throw）。关键边界：`dpkg/available` 那类**真**差异（包数 3003 vs 3001）**刻意不归一化**——把它和键序归入同一句"反正不影响"，就是给静默失败开后门。接入 `check-dsh-source-snapshot.mjs`（并把解包从"只解引擎前缀+canvas"改为全量，与外部复核方看同一份输入）。
     **② `pnpm pack` 之后就地规范化 tarball**（`export-dsh-engine.mjs`，落在 `packed.push` 记录哈希**之前**）：解包 → `canonicalJson` 重排 → 重打包。放在这里而不是产物末端，是因为此处上游尚无任何哈希被记录、也没有签名，规范化后的字节**就是**构建产物本身，此后所有 provenance 描述的都是真正发货的东西；放到末端则要重做 tar/xz、重打 zip、**重新签名**，反而引入三个新的不确定性来源。重打包自身确定用**可移植**手段（不依赖 GNU 专有开关——本机是 bsdtar，用它就要等一小时 CI 才知道对不对）：显式递归排序的条目清单定顺序、`utimesSync` 钉 mtime、不指定属主、gzip 经管道不写名字与时间戳。
@@ -1110,3 +1110,24 @@
     **复验证据（A+B 之后，同提交 `a0d1534` 并行两次构建）**：逐文件差异从 **264 个降到 3 个**——259 个 `package.json` 键序差异全部消失（B 生效），`dpkg/available` 不再是差异（A 生效）。剩余 3 个是 **pnpm 自己在 deploy 阶段生成的状态文件**（`node_modules/.modules.yaml` 的 `prunedAt`、`node_modules/.pnpm-workspace-state-v1.json` 的 `lastValidatedTimestamp`、引擎根的 `pnpm-workspace.yaml` 键序）——它们不在 B 的射程内（B 规范化的是 `pnpm pack` 产出的 tarball，而这 3 个在其后生成），但**全部已被归一化规则覆盖**。两个 run 各自记录的归一化摘要**逐字相同**（`ca8c7b69ea471824…`），我从两个 APK 各取出快照独立跑归一化器也得到同一值（`6899f4ed3f8ff3ae…`，两次相同）⇒ **语义可复现成立**。未继续追「原始 sha256 相同」：剩下那 3 个是 pnpm 的内部状态文件，运行时 pnpm 可能读它们，改写状态文件的风险大于它买到的收益。
     **⚠️ 同批踩到的坑中坑（坑 183 同型复发，已修）**：归一化最初放在**检查器**里，而检查器看到的是 `.deploy-tmp/.../snapshot.tar.xz`——**注入前**的那份；APK 装的却是 `build-apk.mjs` 经 `inject-all.py` 生成的 `snap-final2.tar.xz`（**注入后**）。两者条目数都不同（CI 记 42443，从 APK 实测 42839，差 396）。后果是**公布的摘要描述的不是发货产物**，外部复核方（只有 APK）根本复算不出来——而「可被外部独立复核」正是这条链的核心主张。`build-apk.mjs:304-320` 那一串既有门禁**全都跑在 `snapIn`（注入后）上**，只有新加的这一处跑在注入前。**修法**：从检查器移除，改由 workflow 新步骤「Snapshot semantic normalization digest」在 `build-apk.mjs` **之后**执行——直接 `unzip -p <APK> assets/snapshot.tar.xz`、解包、归一化，即**与复核方做完全同一件事**，产出 `snapshot-normalization.json` 随 artifact 附出。教训与坑 183 一致：**凡是「公布给外部的产出侧数字」，都必须取自最终产物本身，而不是取自它之前的中途文件。**
     **未闭合（B 的确定性与剩余风险）**：A+B 是否真能让两次构建的**原始** sha256 相同，须由「同一提交并行两次构建」实测；若仍不同，则还有第四类不确定性（例如 `pnpm pack` 之外的时间戳或 harness 构建阶段）。另：`preinstall.json` 的 `targets` 仍只有包名、不带版本，`.deb` 的版本与哈希同样来自活索引——上游抬版本时会静默换包，尚未钉。
+
+210. **来源链 APK 比正常链大 3.1 倍：完整 pnpm deploy 按 Linux 宿主平台拉进了 1.2 GB 的 Linux 原生载荷（2026-09-28）**：
+    **现象**：来源审计链产出的 APK **489 MB**，而正常链的正式发布包只有 **158 MB**——同样跑 `assembleDebug`、同一把 keystore、同一个引擎版本，体积差 3.1 倍。
+    **逐层定位**（这个方法可复用）：把两边的 `assets/snapshot.tar.xz` 分别取出来、`tar -tvJ` 列清单、**按目录聚合体积**——比总数差分更能指向真凶：
+    ```
+                         他们        我们
+    解压后总计        700.1 MB   2016.8 MB
+    usr/lib/node_modules  189.0 MB  1629.4 MB   ← 差异全在这里
+    usr/lib/perl5          53.0 MB    53.0 MB   ✓ 逐字节相同
+    usr/bin/node           43.2 MB    43.2 MB   ✓
+    libicudata.so.78.3     31.6 MB    31.6 MB   ✓
+    usr/lib/ruby           29.5 MB    29.6 MB   ✓
+    usr/share/vim          25.6 MB    25.4 MB   ✓
+    ```
+    条目数我们**更少**却**体积更大** ⇒ 差异必在少数巨型文件。再对 `node_modules` 单独聚合，前几名是：`@openai/codex` 的两个 Linux musl 二进制（246.7 + 212.3 MB，另有 `codex-code-mode-host` 66.2 + 60.4 MB）、`claude-agent-sdk-linux-{x64,arm64}`（205.7 + 205.2 MB）、`cua-driver-linux-*-gnu`、`sherpa-onnx-linux-*`、`sharp-libvips-linux-*`……
+    **真因**：来源链做的是**完整 `pnpm deploy`**，而 CI 跑在 **Linux** 上 ⇒ pnpm 按**宿主平台**解析 `optionalDependencies`，把 `linux-x64` / `linux-arm64` 的原生载荷一并装进引擎树；**Android 是 bionic**，这些 glibc/musl 二进制在设备上永不加载。正常链没有这个问题：它从**设备基座**出发，基座上本就没有这些 Linux 载荷——所以「正常链有没有」是一条**已被设备验证过**的可靠判据（实测这批包在正常链快照里**一个都没有**）。
+    **为什么之前没被发现**：`check-android-native-runtime-packages.mjs` 早就**看见**了它们，但定性是「跨平台部署的**外平台 payload**，不视为 Android 绑定」——**只记录不拦截**；而「快照内每个包都要有来源」这条反向面判据（`check-engine-overlay.mjs` 里有）**在来源链换门禁时没有对应实现**（见坑 199 的未闭合项），于是没有任何判据要求它们离开。**记账 ≠ 防线。**
+    **修法**：`snapshot-config/slim.json` 新增 `platformDeadPackages`（21 条，逐条带平台与理由），`build-snapshot-013.mjs` 在 `engineStalePackages` 之后施加。删除面覆盖 pnpm 布局下实测在场的三处：`.pnpm/<enc>@<ver>*`（实体与大文件）、`.pnpm/node_modules/<pkg>`（提升副本）、顶层物化副本。守卫沿用 `engineStalePackages` 的形态：**命中的包若已在 overlay 登记表内即中止**（防把真依赖删掉）。
+    **判据为什么是「平台」而不是「在不在登记表」**：`@deepseek-ai/libreoffice-kit-wasm` 体积同样可观（145 MB）但它是 **WASM**——平台无关、设备上可能真能用，**必须保留**；而 codex / claude-agent-sdk / cua-driver / sharp-linux / koffi-linux / ripgrep-linux / ubjs-node / node-addon-*-linux 这些是 glibc 或 musl 的 ELF，Android 上加载不了。两者都「不在登记表」，若共用一个键就会把前者一起删掉——故分设两键、各自写明理由。
+    **复验证据**：用真实快照清单模拟匹配——715 个 store 目录中命中 23 个，**21/21 个包全覆盖**（另两处删除面亦确认在场）。量化：将剔除 **1210.2 MB**（未压缩），快照 2017 MB → 约 807 MB（降 60%），预计 APK 489 MB → 约 **205 MB**。安全网：删多了会让 `check-dsh-runtime-dependencies`（只认非 optional 依赖）与 `check-android-native-runtime-packages` 判红。**完整来源构建须由下一次远程 run 验证。**
+    **未闭合**：`@deepseek-ai/libreoffice-kit-wasm`（145 MB）**刻意保留**——它是 WASM，「正常链没有」不足以定它的死（正常链的基座是 0.12.5-fx-1 时代抓的，该包可能只是当时还不存在）。要动它必须先做一次真机文档转换验证。

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// restore-overlay-pins 的判别力用例（坑 193）。
+// restore-overlay-pins 的判别力用例（坑 200）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
