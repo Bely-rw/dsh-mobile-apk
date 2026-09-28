@@ -304,7 +304,14 @@ foreach ($abi in @('arm64', 'x86_64')) {
             if (Test-Path (Join-Path $src "lib\client.js")) {
                 $dst = Join-Path $degradeStaged $leaf
                 Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
-                robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+                if (Get-Command robocopy -ErrorAction SilentlyContinue) {
+                    robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+                } else {
+                    # 非 Windows runner 无 robocopy（GitHub ubuntu-latest 实测：The term 'robocopy' is not
+                    # recognized）——发布链要在 Linux 上跑同一条链，故给跨平台等价拷贝（内容等价，含子目录）。
+                    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+                    Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+                }
                 node (Join-Path $Root "scripts\check-browser-syntax-floor.mjs") --degrade --stage $dst 2>&1
                 if ($LASTEXITCODE -ne 0) { $degradeFailDetail = "注入段浏览器语法降级失败（$leaf）" }
                 elseif ($leaf -eq 'undo-degraded') { $undoDeg = $dst }
@@ -395,9 +402,19 @@ foreach ($abi in @('arm64', 'x86_64')) {
     Write-Host "== 快照机密门禁（$abi，严格）=="
     node (Join-Path $Root "scripts\check-snapshot-secrets.mjs") $snapIn --require 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "SNAPSHOT_SECRET_CHECK_FAILED：快照含机密或归档不可读"; continue }
-    $wslPath = $snapIn.Replace('D:', '/mnt/d').Replace('\', '/')
-    $wslCmd = "tar -tf `"$wslPath`" | grep -cE '^usr/bin/(node|bash|rg|python|perl|ruby|zip|vim|zsh|openssl|socat|busybox)$'; tar -tf `"$wslPath`" | grep -c '^-'"
-    wsl -e bash -lc $wslCmd 2>$null | Select-Object -First 2
+    # 本段只是**可观测性打印**（数一遍关键可执行与常规文件条数），不参与任何判据；
+    # 真正的判据是下面的 check-snapshot-secrets / elf-check / 运行时补丁资产门禁。
+    # 非 Windows runner 无 wsl（GitHub ubuntu-latest 实测：The term 'wsl' is not recognized）⇒
+    # 用本机 bash 跑同一条命令（路径本就是 POSIX，无需 /mnt/d 翻译）。
+    if (Get-Command wsl -ErrorAction SilentlyContinue) {
+        $wslPath = $snapIn.Replace('D:', '/mnt/d').Replace('\', '/')
+        $wslCmd = "tar -tf `"$wslPath`" | grep -cE '^usr/bin/(node|bash|rg|python|perl|ruby|zip|vim|zsh|openssl|socat|busybox)$'; tar -tf `"$wslPath`" | grep -c '^-'"
+        wsl -e bash -lc $wslCmd 2>$null | Select-Object -First 2
+    } else {
+        $posixPath = $snapIn.Replace('\', '/')
+        $posixCmd = "tar -tf `"$posixPath`" | grep -cE '^usr/bin/(node|bash|rg|python|perl|ruby|zip|vim|zsh|openssl|socat|busybox)$'; tar -tf `"$posixPath`" | grep -c '^-'"
+        bash -lc $posixCmd 2>$null | Select-Object -First 2
+    }
     $elfOut = node (Join-Path $Root "scripts\elf-check.mjs") $snapIn $abi 2>&1
     $elfCode = $LASTEXITCODE
     $elfOut

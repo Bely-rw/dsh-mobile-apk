@@ -6,7 +6,7 @@
 // 先跑本脚本再派发，把「远程跑到第 10 分钟才发现锚点没命中」这类往返省掉。
 //
 // 覆盖（都是本地可复现、且历史上真的判红过的面）：
-//   1. 与上游的同步性（落后主流即提示先合并——坑 203/204 都发生在合并之后）
+//   1. 与上游的同步性（落后主流即提示先合并——坑 204/204 都发生在合并之后）
 //   2. 登记表补丁对仓库镜像自洽（apply-patches --check）
 //   3. 市场插件链：按 workflow 里钉的 URL+sha256 取发布产物 → 解包 → 打补丁 → 与镜像逐字节比对
 //   4. 来源链单测（预设载体漂移守卫、overlay 钉还原、锁文件根声明、vendor 锁对齐）
@@ -51,7 +51,7 @@ function stepSyncWithUpstream() {
   }
   const behind = Number(execFileSync('git', ['rev-list', '--count', 'upstream/main..HEAD'], { cwd: ROOT, encoding: 'utf8' }).trim())
   const ahead = Number(execFileSync('git', ['rev-list', '--count', 'HEAD..upstream/main'], { cwd: ROOT, encoding: 'utf8' }).trim())
-  if (ahead > 0) return fail('落后 upstream/main', `${ahead} 个提交未合入——先合并再派发（合并会改变链的输入，见坑 203/204）`)
+  if (ahead > 0) return fail('落后 upstream/main', `${ahead} 个提交未合入——先合并再派发（合并会改变链的输入，见坑 204/204）`)
   ok('未落后 upstream/main', `领先 ${behind} 个提交`)
 }
 

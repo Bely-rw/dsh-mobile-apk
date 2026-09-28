@@ -55,11 +55,18 @@ $gateAgg = Join-Path $root "scripts\check-release-gates.mjs"
 Write-Output "== 发布门禁接线断言（唯一接线面聚合入口）=="
 node $gateAgg
 if ($LASTEXITCODE -ne 0) { throw "发布门禁接线断言失败，中止组装" }
-Write-Output "== 发布门禁集执行（与打包同源）=="
-# ST-31：发布链要求 SKIP=0——--require 让每个支持它的门禁把 SKIP 判为失败（不得以 SKIP 结案）。
-node $gateAgg --run --require --snapshot-dir (Join-Path $root "dsh-mobile-apk\snapshot")
-if ($LASTEXITCODE -ne 0) { throw "发布门禁未通过，中止组装" }
-if ($GatesOnly) { Write-Output "== -GatesOnly：门禁段结束（未做插件构建与打包）=="; exit 0 }
+# G.0 ① 净冗余消除（0.14.2-fx-2，用户裁定「裁剪掉无意义校验」）：**发布路径不再在注入前输入上复跑整套门禁**。
+# 真因（实测）：这两个输入 tar 由 build-apk-013.ps1 产出，而它**已经**对它们跑过自己的内联门禁集；
+# 本脚本第 2f) 段还会对**真正的发布物**（注入后 tar）再跑一次同一套 `--run --require`。
+# 原先这里（第 60 行）再跑一遍 = 同一批门禁在三种输入上各跑一次，而本段输入既不是发布物、也不是唯一输入面 ⇒ 净冗余。
+# 不可裁面：门禁集本身仍在发布关键路径上（2f 对发布物逐 ABI 跑，--require 严格档），本段只是去掉它的副本。
+if ($GatesOnly) {
+  # -GatesOnly 是「只跑门禁、不打包」的验收档，此时 2f) 不会执行，故本档仍需在此跑一次。
+  Write-Output "== 发布门禁集执行（-GatesOnly 档，与打包同源）=="
+  node $gateAgg --run --require --snapshot-dir (Join-Path $root "dsh-mobile-apk\snapshot")
+  if ($LASTEXITCODE -ne 0) { throw "发布门禁未通过，中止组装" }
+  Write-Output "== -GatesOnly：门禁段结束（未做插件构建与打包）=="; exit 0
+}
 
 # 0) Version (default: the APK versionName)
 $apkVer = (Select-String -Path (Join-Path $root "dsh-mobile-apk\app\build.gradle.kts") -Pattern 'versionName = "([^"]+)"').Matches.Groups[1].Value
@@ -104,17 +111,28 @@ foreach ($abi in $ABIS) {
   # 2b) npm layer assertion
   $hasNpm = & tar -tf $abi.f 2>$null | Select-String "usr/lib/node_modules/@deepseek-ai/dsh/package.json" | Select-Object -First 1
   if (-not $hasNpm) { throw ("快照缺少 npm 层（dsh 引擎未安装）: " + $abi.f) }
-  # 2c) Host injection: byte-level tar stream replacement (Python tarfile, zero symlink-metadata loss;
-  #     Windows bsdtar needs admin rights to unpack symlinks — silent loss would drop node SONAME libs)
-  $injectPy = Join-Path $root "scripts\inject-snapshot.py"
-  $outTmp = $abi.f + ".new"
-  Remove-Item $outTmp -Force -ErrorAction SilentlyContinue
-  $pkgArgs = @()
-  foreach ($p in $pluginSrcs) { $pkgArgs += (Join-Path $root $p) }
-  python $injectPy $abi.f $outTmp @pkgArgs 2>&1 | Select-Object -Last 3
-  if (-not (Test-Path $outTmp)) { throw ("快照注入失败: " + $abi.n) }
-  Move-Item $outTmp $abi.f -Force
-  Write-Output ("  快照 OK: " + $abi.n + " (" + $abi.expect + " + npm 层 + 插件注入)")
+  # 2c) Host injection —— G.0 ② 净冗余消除（0.14.2-fx-2）：**输入已是注入后产物时跳过重复注入**。
+  #     判据（正向事实，不是「大概齐」）：tar 里已存在注入集插件路径
+  #     `home/.dsh/profiles/web/node_modules/@dsh-android/dsh-android-bridge/lib/` ⇒ 该输入就是
+  #     build-apk-013.ps1 导出的**注入后**快照（发布链的输入正是它），再注入一遍是纯重复
+  #     （每 ABI 全量重打包约 743MB），且下方 2e) 会逐字节核对「插件确实在快照里且与发布 tgz 同源」
+  #     ——即「是否真的注入过」仍由门禁守着，不靠这里重做一遍来保证。
+  $alreadyInjected = & tar -tf $abi.f 2>$null | Select-String "home/.dsh/profiles/web/node_modules/@dsh-android/dsh-android-bridge/lib/" | Select-Object -First 1
+  if ($alreadyInjected) {
+    Write-Output ("  注入跳过（输入已是注入后产物，2e 逐字节复核）: " + $abi.n)
+  } else {
+    # 字节级 tar 流替换（Python tarfile，零符号链接元数据损失）——
+    # Windows bsdtar 解软链需管理员权限，静默丢链会丢 node 的 SONAME 库。
+    $injectPy = Join-Path $root "scripts\inject-snapshot.py"
+    $outTmp = $abi.f + ".new"
+    Remove-Item $outTmp -Force -ErrorAction SilentlyContinue
+    $pkgArgs = @()
+    foreach ($p in $pluginSrcs) { $pkgArgs += (Join-Path $root $p) }
+    python $injectPy $abi.f $outTmp @pkgArgs 2>&1 | Select-Object -Last 3
+    if (-not (Test-Path $outTmp)) { throw ("快照注入失败: " + $abi.n) }
+    Move-Item $outTmp $abi.f -Force
+    Write-Output ("  快照 OK: " + $abi.n + " (" + $abi.expect + " + npm 层 + 插件注入)")
+  }
   Copy-Item $abi.f (Join-Path $snapDir ("snapshot-" + $abi.n + ".tar.xz")) -Force
 }
 

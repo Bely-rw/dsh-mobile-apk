@@ -185,7 +185,7 @@ try {
 
   // 内置预设载体：口径与权威门禁 check-engine-overlay.mjs 的 CARRIERS 同源，漂移由
   // preset-carriers.test.mjs 双向复核。此处曾盯 0.1.5-rc.1 时代的 `dsh-agent-presets/presets`
-  // ——该包在 0.1.7 被拆分，本链抬 pin 后旧断言必然判红（坑 199）。
+  // ——该包在 0.1.7 被拆分，本链抬 pin 后旧断言必然判红（坑 200）。
   const carrierChecks = checkPresetCarriers(engineRoot)
 
   const report = {

@@ -93,7 +93,7 @@ jobs:
           printf '%s\n' "$apksigner_bin" > .deploy-tmp/source-build/apksigner-path.txt
           echo "apksigner: $apksigner_bin"
           "$apksigner_bin" version
-          # 自证（坑 202）：先用这把 keystore 签一个探针包、再把它读回来，验证「apksigner 能读出期望
+          # 自证（坑 203）：先用这把 keystore 签一个探针包、再把它读回来，验证「apksigner 能读出期望
           # 指纹」这条判据本身可用。放在构建**前**，是为了让工具/keystore 的问题在 2 分钟内暴露，
           # 而不是等 30 分钟的打包跑完才在末尾判红（前两轮各因此烧掉一小时，且产物被丢弃）。
           expected_signing_certificate='1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd'
@@ -687,7 +687,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 固定签名（坑 201）：本链曾现场生成一次性证书，等于重新引入 e65818a 修掉的缺陷
+          # 固定签名（坑 202）：本链曾现场生成一次性证书，等于重新引入 e65818a 修掉的缺陷
           # ——每次构建新密钥，产物既装不上已有安装，两次构建的包也互相覆盖不了。
           # 项目规范（gotchas 坑 10 / DEPENDENCIES.md / design.md / build-snapshot.yml）是
           # 「CI 与本地同一把 keystore/debug.keystore」，来源链同样走这一把：
@@ -750,7 +750,7 @@ jobs:
             echo "::error::未产出 APK 清单（.deploy-tmp/source-build/apk-sha256.txt 为空）"
             exit 1
           fi
-          # 产出断言（坑 201）：APK 必须真由仓库固定 keystore 签。判据放在产出侧而不是输入侧，
+          # 产出断言（坑 202）：APK 必须真由仓库固定 keystore 签。判据放在产出侧而不是输入侧，
           # 因为「keystore 文件在、构建却用了别的密钥」这条断链只有产出能证伪；顺带也挡回
           # 「现场生成一次性证书」那种改法。apksigner 的输出不随语言/JDK 版本变（keytool 会）。
           # 期望值是 keystore/debug.keystore 的证书 SHA-256（小写；keytool 打印为大写同值）。
@@ -768,12 +768,12 @@ jobs:
             # 判据刻意不依赖任何行的前缀与措辞：抓 stdout+stderr、加 --verbose、去掉冒号转小写后
             # 只要求「期望指纹出现在输出里」。apksigner 各版本的输出布局与流向并不一致
             # （实测 build-tools 37.0.0 上按 `Signer #1 certificate SHA-256 digest:` 行首解析会取空，
-            # 且失败时输出被管道吞掉、日志里什么都看不到——坑 202）。
+            # 且失败时输出被管道吞掉、日志里什么都看不到——坑 203）。
             cert_output=$("$apksigner_bin" verify --print-certs --verbose "$apk_path" 2>&1 || true)
             normalized=$(printf '%s' "$cert_output" | tr 'A-F' 'a-f' | tr -d ':')
             echo "签名检查 $apk_path -> $(printf '%s' "$normalized" | grep -o "$expected_signing_certificate" || echo '<未出现期望指纹>')"
             if ! printf '%s' "$normalized" | grep -q "$expected_signing_certificate"; then
-              echo "::error::$apk_path 的签名证书不是仓库固定 keystore 的 $expected_signing_certificate（坑 201：产物必须能覆盖安装，签名必须固定）"
+              echo "::error::$apk_path 的签名证书不是仓库固定 keystore 的 $expected_signing_certificate（坑 202：产物必须能覆盖安装，签名必须固定）"
               echo "--- apksigner 原始输出开始 ---"
               printf '%s\n' "$cert_output"
               echo "--- apksigner 原始输出结束 ---"
@@ -805,7 +805,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 语义归一化摘要（坑 209）——**必须从产出的 APK 取快照**。
+          # 语义归一化摘要（坑 210）——**必须从产出的 APK 取快照**。
           # 检查器（check-dsh-source-snapshot.mjs）看到的是注入**前**的快照，而 APK 装的是
           # 注入**后**的（build-apk.mjs 的 snapIn，经 inject-all.py 生成）；两者条目数都不同
           # （实测 42443 vs 42839）。把注入前那份的摘要公布出去，等于给外部复核方一个他们

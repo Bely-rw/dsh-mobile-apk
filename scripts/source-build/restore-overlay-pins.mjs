@@ -11,7 +11,7 @@
 //   - `overlay.packages['@deepseek-ai/dsh-app-boot']` 定「设备上跑的运行时版本」；
 //   - profile patch 里 `@deepseek-ai/*` 的 insert 行按「与运行时同版」判是否会被静默禁用。
 // 来源链此前没暴露这条是因为该门禁在拿不到 semver 时 SKIP（见门禁自身的 SKIP 文案）；
-// 源码产物树现在能提供 semver，门禁随即真判并要求清单完整（坑 200）。
+// 源码产物树现在能提供 semver，门禁随即真判并要求清单完整（坑 201）。
 //
 // 还原的是**事实**不是补丁：这些包确实以这些版本进入运行时，且
 // check-dsh-source-snapshot.mjs 已按原始 overlay 逐包核验过版本与 tarball 哈希。

@@ -590,7 +590,7 @@ mkdirSync(join(dpkgDir, 'info'), { recursive: true })
 mkdirSync(join(dpkgDir, 'parts'), { recursive: true })
 writeFileSync(join(dpkgDir, 'status'), dpkgStatus.join('\n'))
 writeFileSync(join(dpkgDir, 'status-old'), dpkgStatus.join('\n'))
-// dpkg/available：由**整份活上游索引**改为「本链实际安装的那些包」（坑 209）。
+// dpkg/available：由**整份活上游索引**改为「本链实际安装的那些包」（坑 210）。
 // 旧实现把 3000+ 条全倒进去，于是上游动一个与本链毫无关系的包（实测相隔 90 分钟两次构建，
 // 上游掉了 codon / ecl 两个包）快照哈希就变一次——而产物**不是逐字节可复现**这件事，
 // 会让「重跑比哈希」这个最廉价的完整性判据永远失效：恒亮的警报灯等于没有警报灯。

@@ -4,7 +4,7 @@
 // 漂移守卫为什么必要：来源审计链的检查器是**权威门禁的等价实现**，权威源一旦重锚载体
 // （0.14.2 就重锚过一次：`dsh-agent-presets/presets` → `agent-preset/skills` + `web-app/presets`），
 // 等价实现若没跟上，表现是云端构建跑到第 40 分钟才判红一句「预设载体为空」，
-// 而真因是门禁自身过期（坑 199）。这里把该漂移提前到 PR 门禁的秒级步骤。
+// 而真因是门禁自身过期（坑 200）。这里把该漂移提前到 PR 门禁的秒级步骤。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
