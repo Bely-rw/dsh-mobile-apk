@@ -230,6 +230,14 @@
       "summary": "PTC 子进程的 V8 堆参数从 argv 位置 1 移出改走 env.NODE_OPTIONS；并对解析出的可执行文件加绝对值/系统动态链接器两条守卫（fails loud，不静默回退、不猜替代路径）。",
       "provenance": "0.14.2 fx-1 只把 profile 的 ptc-runtime.nodeExecutable 钉成绝对路径，未改 argv 构造，故 worker spawn bug 在 rc.2 产物上仍在（dsh-ptc-runtime-node/lib/index.js:947 逐字节：`...packaged ? [] : [heapFlag],`）。危害：packaged===false 时 heapFlag 落在 argv[1]，而 executable 若被解析成安卓系统链接器（direct exec 被拒时壳侧改用 /system/bin/linker64，process.execPath 随之被污染），linker64 把第一个非参数当程序路径，heapFlag 排在它前面 ⇒ linker64 自己报 error: expected absolute path: \"--max-old-space-size=512\" 退出，Node 从未被加载。附带如实记录一处**既有行为**（别误当新增副作用）：上游 subprocess-local 的 childEnv() 是 {...scrubbedParentEnv(), ...spec.env}（spawn.ts:44-54 posix 分支），targetEnvironment() 再 filter 掉值为 undefined 的项（runner-launch.ts:300-314），而现有代码那份 env 先把非启动项全部 tombstone 成 undefined（index.js:956）⇒ 今天 NODE_OPTIONS 本就被删掉（这正是 heapFlag 当初只能塞进 argv 的原因之一）。本补丁把「NODE_OPTIONS 完全消失」改成「NODE_OPTIONS 恰为我们的 heap flag」。如实登记的后果：引擎自己若设了 NODE_OPTIONS 会被我们覆盖，但既有行为里子进程本就看不到它，故不构成回归。",
       "marker": "dsh-mobile ptc argv heap via NODE_OPTIONS (L1)"
+    },
+    {
+      "id": "file-upload-restart-R1",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-file-upload/lib/index.js",
+      "scope": "engine",
+      "summary": "Agent resolver 单槽注册改为同槽覆盖——cordis 重启 fiber 的顺序是「先跑新实例 body、后释放旧 effect」，上游对已占用槽直接 throw ⇒ session-controller 每次重启即判 FAILED，sessionController 服务永久缺席（在设置里换一次默认模型即触发）",
+      "provenance": "2026-09-28 模拟器 5556 实锤：设置里换一次默认模型 → 内置插件面板 196 个里 1 个失败（api-session-controller），此后新建会话/切模型恒报 sessionController is unavailable；诊断版 cordis（fiber 失败点写 stderr）拿到 file-upload: Agent resolver is already registered 栈；补丁后同机切模型 3 次 = 0 失败、0 报错",
+      "marker": "dsh-mobile file-upload resolver replace (R1)"
     }
   ],
   "retired": [

@@ -985,3 +985,29 @@
     `.profile-patch-repair-<version>` 标记在场 ⇒ repair 早退成立。
     **同型提醒**：凡新增自愈/迁移代码，先问「**它依赖的那条链在这台设备上会不会跑**」。
     判据是「设备的触发条件是否已满足」，不是「代码在不在包里」——本条的假绿形态正是「包里有、跑不到」。
+
+193. **cordis 重启 fiber 的顺序是「先跑新实例、后释放旧 effect」⇒ 单槽注册表上的 effect 每次重启即永久死亡**（2026-09-28，竖屏模拟器 5556 实锤）
+    **现象**：在设置里换一次默认模型（或任何改写 `agent-default-model` 条目 config 的动作）之后：
+      · `内置插件` 面板从 `196 个 0 失败` 变成 `196 个 1 个失败`，点名 `api-session-controller`；
+      · 此后任何控制面动作（新建会话 / 切模型 / 会话控制流）恒得
+        `typert gateway: session/create|session/control: active Service "sessionController" is unavailable`；
+      · **engine.log 零痕迹**：`dsh web` 的启动审计 warn 出口是空函数（上游 `dsh-bundle-web-app/lib/index.js` 里
+        `auditStartupEntries(connectionCtx.root, "dsh web", () => {})`），fiber 失败只在面板上体现，日志里一个字都没有。
+    **真因**：两层叠加。
+      ① 触发链：config-editor 改写 `agent-default-model` 条目 config ⇒ 该 fiber 重启 ⇒ 依赖 `agentDefaultModel` 的
+         session-controller 跟着重启（cordis 的服务实现变更会刷新依赖方）。
+      ② 死亡机制：`Fiber._reload()` 的顺序是 `await this._execute(runner)`（跑新实例 body）→ `_updateState()` → `_unload()`（释放旧 effect）。
+         于是新 `SessionController` 构造里的 `ctx.effect(() => ctx.fileUploads.registerAgentResolver(...))` 执行时
+         **旧注册还在槽里**；上游 `registerAgentResolver` 对已占用槽直接
+         `throw new Error("file-upload: Agent resolver is already registered")` ⇒ 新 fiber 判 FAILED，随后旧 fiber 释放
+         ⇒ 服务永久缺席（**不是 pending**，所以启动审计不拦、也不自动重试）。
+    **定位手段（可复用；本次即由此拿到原始栈）**：插件失败默认无声时，把 cordis 的失败点接出来——
+      `cordis/lib/index.js` 的 `_reload()` catch 里，在 `this.ctx.logger.error(reason)` 前插一行 `process.stderr.write(...)`，重启即见栈。
+    **修法**：`file-upload-restart-R1`（`scripts/patches/registry.json`，scope=engine）——`registerAgentResolver` 去掉
+      already-registered 守卫、改为**同槽覆盖**；disposer 保留身份判据（`if (this.agentResolver === resolve)`），
+      旧 fiber 的 disposer 因此不会清掉新注册；仍只有一个槽。不选「改 session-controller 侧」的理由：单槽语义下
+      替换与上游意图等价，且全文只有它一个调用方，不依赖 cordis 内部顺序。
+    **复验证据（模拟器 5556，同一份运行树）**：补丁前 = 切一次模型即 `1 个失败` + 恒报 service unavailable；
+      补丁后 = 冷启动 → 连切 3 次模型 → 面板 `0 失败`、控制台 0 条报错、切完模型真能改。
+    **同型提醒**：凡「在插件构造函数里占住某个单槽注册表 / 全局登记处，且靠 effect 释放」的写法，在 cordis 里都经不起
+      一次 fiber 重启。**判据**：问「这个注册被重复执行会怎样」——会 throw 的，重启即死。
