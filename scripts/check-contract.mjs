@@ -54,10 +54,11 @@ const skip = (msg) => {
  *  真实 run 36359806116 就是这条：apk 自包含树没有 docs/UPSTREAM-CONTRACT.md，
  *  而链以 --require 跑 ⇒ 合法缺席被当成判红，整链在最后一段 §9 停下。 */
 const APK_SELF_CONTAINED = !existsSync(join(root, 'dsh-mobile-apk'))
-let softSkipped = 0
 const softSkip = (msg) => {
-  softSkipped += 1
-  console.log('  SKIP(*)  ' + msg + ' —— 自包含树合法缺席，不计入 --require（协调仓布局下必须真跑）')
+  // 计入 skipped 只为让 SKIP 编号连续（check-gate-skips 要求每个 SKIP 打印行都是「已计数行」）；
+  // 关键差别是**不 push 到 issues** ⇒ 严格档下也不算失败。
+  skipped += 1
+  console.log('  SKIP(#' + skipped + ')  ' + msg + ' —— 自包含树合法缺席，不计入 --require（协调仓布局下必须真跑）')
 }
 
 /* --self-test：新加的每一条判据都要「故意造反例必判红」的自证（AGENTS 反证要求）。
