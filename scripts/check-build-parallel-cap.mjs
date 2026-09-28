@@ -49,6 +49,9 @@ const CONSTRAINED = [
 ]
 
 const failures = []
+// 协调仓不携带来源审计链（scripts/source-build/** 是 apk 仓独有执行面），缺席的受约束脚本记**具名 SKIP**
+// 而不是判红——同一条镜像门禁要在两个仓各自自洽；计数与可见性按 check-gate-skips 的 SKIP 纪律。
+let skipped = 0
 const check = (label, ok, detail) => {
   console.log((ok ? 'PASS  ' : 'FAIL  ') + label + (ok || detail === undefined ? '' : ' -> ' + detail))
   if (!ok) failures.push(label)
@@ -87,7 +90,11 @@ function runChecks() {
   console.log('== 1. 吃满型线程参数（-T0 / -dT0）在可执行代码里必须为 0 ==')
   for (const rel of CONSTRAINED) {
     const text = readOrNull(rel)
-    if (text === null) { check('受约束脚本在场: ' + rel, false, '文件缺席（清单失效）'); continue }
+    if (text === null) {
+      skipped += 1
+      console.log('SKIP(#' + skipped + ') 受约束脚本不在本仓: ' + rel + '（来源审计链是 apk 仓独有执行面，协调仓不携带）')
+      continue
+    }
     const code = codeOnly(text)
     const hits = code.split('\n')
       .map((l, i) => ({ l, n: i + 1 }))
@@ -256,9 +263,11 @@ else if (argv.includes('--list')) {
   if (failures.length > 0) {
     console.error('')
     console.error('PARALLEL-CAP FAILED（' + failures.length + ' 项）：构建并发不得吃满全部逻辑核'
-      + '（0.14.1 用户拍板：固定 ' + CAP_DEFAULT + ' 线程，保证 MuMu 模拟器与系统稳定）')
+      + '（0.14.1 用户拍板：固定 ' + CAP_DEFAULT + ' 线程，保证 MuMu 模拟器与系统稳定）'
+      + ' SKIP=' + skipped)
     process.exit(1)
   }
   console.log('')
-  console.log('PARALLEL-CAP PASSED（并发上限单一常量 + 默认 ' + CAP_DEFAULT + ' + 构建链已消费 + 设备侧同受限）')
+  console.log('PARALLEL-CAP PASSED（并发上限单一常量 + 默认 ' + CAP_DEFAULT + ' + 构建链已消费 + 设备侧同受限）'
+    + ' SKIP=' + skipped)
 }
