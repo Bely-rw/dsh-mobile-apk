@@ -216,3 +216,22 @@ real-only 反证；判据全在设备事实上，证据不足判 `INCONCLUSIVE` 
   `android_capabilities · all`（见证据目录 `p2-conversation.txt`），随后仍在推理中被本轮取证打断，
   未取到完成态。故「解锁链路是否被模型自主走通」目前只有**一次未完成的观察**，
   尚不足以判定（既不能算通过，也不能算断链）。
+
+## 0.14.2-fx-2-root.2 已知未闭合（2026-09-30，诚实登记）
+
+- **Shizuku 通道自身在本机不可用（授权断链）**：`Shizuku.checkSelfPermission()` 恒返回 denied
+  （服务端 v13.6 判据里没有公开 `checkPermission`；客户端 AAR 为 13.1.5，**版本差**是首要嫌疑），
+  且管理器「应用管理」列表里看不到本应用——授权请求此前只在 `ensureBound` 的后台路径自动发起，
+  而 `requestPermission` 需要前台 Activity ⇒ 静默失败。**已补**：`requestShizukuPermission()`
+  桥方法 + 设置页「请求 Shizuku 授权」按钮（UI 线程发起，对话框落得到用户眼前）。
+  **未验证**：授权框弹出后能否真的授予（需人点一次「允许」）。**影响**：不影响 root 能力——
+  root 走 su 直连（`RootAccess`）；Shizuku 仅作可选通道。
+- **`argv` 形态未改（issue #262 的引号逃逸约束）**：本方案（A）不做降权包装 ⇒ 该逃逸向量不成立，
+  故 `runShell` 仍为 `sh -c <command>` 形态；约束已写进 `ShizukuTransport.runShell` 的注释
+  （将来任何降权/包装必须走 argv 单元素）。**未做**：主动 argv 化（无收益，且改动面大）。
+- **模拟器层验收未做**：本机 MuMu 播放器未运行（只有后台服务进程），三层验收里的
+  「MuMu x86_64」这一层以**真机 arm64** 代替（更强目标，但不是仓库协议的默认首验层）。
+  另：仓库协议的「真实任务由模型自行编排」一轮尚未跑（本轮验收为 CDP 状态机 + adb 设备事实）。
+- **`repairOwnership` 的 su 路径未做单元测试**：chown/`su` 依赖 root 环境，JVM 侧无法真跑，
+  仅有源码契约测试（路径必须在应用数据目录内、未授权时拒绝、`find -not -user` 形态）；
+  行为证据来自真机实测（healed=4 且应用侧写入恢复）。

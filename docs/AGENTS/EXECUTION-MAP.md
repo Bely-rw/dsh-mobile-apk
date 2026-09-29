@@ -2529,6 +2529,9 @@ app/src/main/java/com/dsharnessmobile/shell/ShizukuTransport.kt
 app/src/main/java/com/dsharnessmobile/shell/ShizukuUserService.kt
 app/src/main/java/com/dsharnessmobile/shell/ShizukuProbe.kt
 app/src/main/java/com/dsharnessmobile/shell/ShizukuSupport.kt
+app/src/main/java/com/dsharnessmobile/shell/RootGrant.kt
+app/src/main/java/com/dsharnessmobile/shell/RootAccess.kt
+app/src/main/java/com/dsharnessmobile/shell/LocalDocs.kt
 app/src/main/java/com/dsharnessmobile/shell/ProcIo.kt
 app/src/main/java/com/dsharnessmobile/shell/FileIncoming.kt
 app/src/main/java/com/dsharnessmobile/shell/PathOpen.kt

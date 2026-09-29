@@ -1218,3 +1218,45 @@
 219. **跨平台发布链不能假设 PowerShell 的 `$env:TEMP` 存在（2026-09-29，release run 36599977147）**：**现象**：两处 self-contained APK 根目录修复后，arm64 与 x86_64 均完成 runtime asset 门禁、快照指纹门禁和 `assembleDebug`；导出注入后快照时，`check-snapshot-asset.ps1` 在 `build-apk-013.ps1:485` 报 `Cannot bind argument to parameter 'Path' because it is null`，双 ABI 资产未归集，因而没有创建 draft Release。**真因**：Linux GitHub Actions 的 PowerShell 运行环境未提供 `$env:TEMP`，`Join-Path $env:TEMP ...` 生成 null 临时路径；Windows 本地环境有 TEMP，因此问题此前未暴露。**修法**：用 `[IO.Path]::GetTempPath()` 获取平台运行时临时目录；不降低 APK 内嵌快照与发布快照的一致性门禁。**复验证据**：失败日志显示两 ABI 的 `SNAPSHOT-FINGERPRINT CHECK PASSED` 与 `BUILD SUCCESSFUL`，仅 snapshot asset checker 在临时路径绑定处失败；修复后必须重新触发 workflow 并核验双 ABI 资产、MANIFEST 和 draft Release。
 
 
+
+
+215. **本地自组快照但漏 snapshot.sha256 ⇒ 升级装上了、运行时却永远不刷新（2026-09-30，9c2a0c45 实测）**：
+    **现象**：换快照重打 APK（vc 43→44）覆盖安装并启动，引擎正常 boot、无任何报错，但
+      files/.snapshot-fingerprint 停在旧值、live profile 里该更新的包原样不动——**刷新从未发生**。
+    **真因**：EngineManager.bundledFingerprint() 读的是 assets/snapshot.sha256（发布链
+      build-release.ps1 生成）；本地 assembleDebug 只校验 snapshot.tar.xz **在场**（缺失才报错），
+      不校验 sha256 文件。文件缺席 ⇒ bundledFingerprint() 返回空串 ⇒ snapshotFresh() 走
+      「legacy build：不强制重抽取」分支 ⇒ 永远判 fresh。**静默路径**：装机成功 + 引擎正常 = 无任何信号。
+    **修法**（本地链）：放快照后必须同步写 app/src/main/assets/snapshot.sha256（内容＝快照
+      tar.xz 的 sha256 十六进制小写、无文件名后缀）。写完重打，装机启动即见
+      .snapshot-fingerprint 翻转 + 事务跑完（本机 arm64 全程 <3 分钟）。
+    **复验**：补 sha256（182e7ec6…）重打 vc44 装机 → 指纹翻转、两份 profile 的
+      dsh-client-ui-responsive/lib/client.js 均更新为新产物（316,708B、含 rootGrantState）。
+    **上游可报**：assembleDebug 对「有 tar 无 sha256」应显式报错而不是当 legacy 放行——
+      这是一条「升级了但升级内容永不生效」的静默失败路径（issue 候选）。
+
+216. **写后回读的回包缺 `ok` ＋ 拒收码不进 CALL_REASON ⇒ 已成功的动作被渲染成「失败：原因未在本版登记」（2026-09-30，用户实测撤销同意）**：
+    **现象**：设置页取消勾选「已阅读」提示「撤销同意失败：调用失败原因未在本版登记」——实际状态**已生效**（重查状态可见 consentValid=false、granted=false）。
+    **真因**：①`RootGrant.setConsent` 回包只带 state 字段、**没有 `ok:true`**，而页面结算 `settleLinkCall` 只认 `answer?.ok === true`，缺字段一律走失败支；②`setGranted` 的拒收回包只有 `code/guidance`，人话翻译 `describeCallReason` 只读 `reason`，两个码（consent-required / not-root-channel）又不在 `user-copy.ts` 的 `CALL_REASON` 唯一真源里 ⇒ 落 `UNKNOWN_CALL_REASON` 兜底文案。
+    **修法**：①`setConsent` 显式 `put("ok", true)`（SharedPreferences.apply 同步写，无失败支）；②`setGranted` 拒收分支同时带 `reason`（= code，code 留给 data-code/grep）；③两码登记进 CALL_REASON 表。回归钉三处：TSX「结算只认 ok===true」「拒收翻译不落兜底」+ Kotlin 源码契约（setConsent 体必须含 put("ok", true)、setGranted 体必须含 put("reason")）。
+    **通则**：**凡页面用 settleLinkCall 结算的桥方法，成功回包必须显式带 ok:true；凡可能失败的 reason 码必须同步登记 CALL_REASON**——缺一样就是「静默成功 + 吓人报错」或「未登记兜底」，两者用户都读不出真相。
+
+217. **JavaBridge 线程里创建 WebView/弹窗 ⇒ bridge 回包还能带回异常，但进程随后原生崩溃（闪退）（2026-09-30，用户实测「点免责声明闪退」）**：
+    **现象**：设置页点《AI root 权限免责声明》，应用直接闪退（不是弹窗失败，是进程消失）。
+    **真因**：`@JavascriptInterface` 方法在 **JavaBridge 线程**被调用；`LocalDocs.open` 在该线程直接 `WebView(activity)` + `AlertDialog.show()`。bridge 回包能带回 `IllegalStateException`（被函数内 catch 抓到、如实回 ok:false），**但 WebView 已在错误线程上被创建**，随后渲染启动 → 原生层崩溃、进程消失（CDP 复现：pid before 有值 → 调 openRootDisclaimer() 回 {"ok":false,"reason":"IllegalStateException"} → 3 秒后 pid 消失）。
+    **修法**：整段 UI 组装 marshal 到主线程（`activity.runOnUiThread`），用**短闩（1.5s）**等真实结果——超时回 `ui-thread-timeout`、组装抛错回异常类名，**绝不谎报已打开**；catch 用 `Throwable`（Error 也要拦住，否则又是进程级闪退）；弹窗关闭即 `view.destroy()`（WebView 重量级，不销毁会泄漏）；静态文档 `javaScriptEnabled = false`。
+    **判据（源码契约）**：`open()` 体内必须出现 `runOnUiThread`，且 `WebView(activity)` / `AlertDialog.Builder` 的构造**出现在它之后**（LocalDocsTest 钉死）。
+    **通则**：**凡从 `@JavascriptInterface` 里碰 UI（WebView/对话框/View/Toast 的创建），先问「这段代码跑在哪个线程」**——`startActivity` 类调用是线程无关的，UI 对象的创建不是。同类桥方法（ExternalLinks 只做 startActivity）不受影响。
+
+218. **root 通道写盘把文件属主变成 root:root ⇒ 应用自己读不回来（2026-09-30，主人点名「Root 属主这种 bug 也得找一找修一修」）**：
+    **现象**：root 身份（Shizuku 以 root 启动的 UserService / su）写进应用数据目录的文件与 mkdirs 出的目录，属主是 `0:0`；应用侧对它的写入直接 `Permission denied`（0644 尚可读，可写面全死）⇒ watcher / 插件更新 / 引擎读写连带失败。
+    **真因**：全仓**零 chown 处理**（grep 实证）——`ShizukuUserService.writeChunk` 以 uid 0 落盘、su 命令写盘同理，谁都没把属主修回来。
+    **修法（两条路径都做）**：①**su 直连（主路，不依赖 Shizuku）**：`RootAccess.repairOwnership`（路径限应用数据目录内 + `find -not -user <uid> -exec chown <uid>:<uid> {} +` + restorecon）+ `execRoot` 原语 + `ShellOps` 在**通道级失败**时回退 su（命令自身 exit≠0 不重跑）；②**Shizuku 通道（AIDL v3）**：`configure(appUid, appDataDir)` 回填身份 + `writeChunk` 写后自愈（含 mkdirs 父目录）+ `repairOwnership` 有界遍历（`lchown` 不跟随符号链接、只归一到已配置的应用 uid、越界拒绝）。③启动期热点路径顶层抽查 + 页面「修复文件属主」按钮；**逐项失败必须计数暴露**（旧版只在成功时累加 ⇒ 全失败也报 ok:true 的静默形态）。
+    **复验**：root 种文件/目录（属主 0:0）→ 应用侧写入 Permission denied → 跑修复 → `healed=4`、属主翻回 10241、应用侧写入 OK。
+    **Kotlin 坑**：拼 shell 脚本时 `"$P"` 会被当 Kotlin 变量插值（编译期 Unresolved reference）——shell 变量必须写 `\$P`。
+
+219. **UserService 跨应用重启存活 ⇒ 新加的 AIDL 方法「装上了却调不到」（2026-09-30 实测）**：
+    **现象**：新版本 APK 装了、代码在、`repairOwnership` 却恒返回 unsupported（configure 静默失败），属主一个没修。
+    **真因**：Shizuku 的 UserService 进程**由 Shizuku 管理器持有、跨应用重启存活**；`UserServiceArgs.version(...)` 取自 `BuildConfig.VERSION_CODE`，**versionCode 不变时 Shizuku 不会重建服务** ⇒ 跑的还是旧版 dex，v3 的 transaction 根本不存在。
+    **修法**：①加 AIDL 面就**同时 bump versionCode**（让 Shizuku 自动重建）；②已有的出口是设置页「重置链接」（`unbindUserService(remove=true)` 强制移除后重建）；③代码侧一律 `runCatching` + 结构化 `*-unsupported` 回报，**不假装成功**。
+    **复验**：vc 44→45 重装后 `configure` 生效、`repairOwnership` 返回真实计数。
