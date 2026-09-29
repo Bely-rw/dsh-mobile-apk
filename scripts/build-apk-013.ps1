@@ -221,7 +221,8 @@ if (Test-Path $overlayManifest) {
 # 版本单一来源：build.gradle.kts（0.13.1 踩坑：硬编码 out\v0.13.0 与 $ver 会让纯净版产物错误命名旧版本）
 $GradleVer = (Select-String -Path (Join-Path $apkDir "app\build.gradle.kts") -Pattern 'versionName = "([^"]+)"').Matches[0].Groups[1].Value
 $Out = Join-Path $Root ("out\v" + $GradleVer)
-$apkDir = Join-Path $Root "dsh-mobile-apk"
+# Keep the layout-resolved path from the root self-detection above.
+# Overwriting it here breaks self-contained APK checkouts by targeting Root\dsh-mobile-apk.
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 # 注入集单一常量（0.13.8-b ST-06 / F-ENV-04）：dirs/externals 都在 scripts/plugin-dirs.json，
