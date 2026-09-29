@@ -218,6 +218,12 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.deploy-tmp/source-build"
           cd .deploy-tmp/deepseek-harness
+          # 复跑安全：先把固定 checkout 复位到钉住状态。本步是「先全仓类型检查、再替换五个旧版
+          # Cordis 源码、再单独编译旧版包」；上一轮若在替换之后被杀，树会停在替换态，于是这一轮的
+          # **全仓检查**拿当前源码配旧版 loader，以 `loader/volatile-update` 之类报错假红（坑 187 的形态，
+          # 本地实测）。CI 每轮全新检出，本复位为无操作；`clean -fd` 不带 -x，不碰 node_modules 等忽略产物。
+          git checkout -- .
+          git clean -fdq
           corepack enable
           corepack pnpm install --frozen-lockfile
           corepack pnpm --version > "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
