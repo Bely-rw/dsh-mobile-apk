@@ -59,6 +59,53 @@ interface ShizukuStatus {
   guidance: string
 }
 
+/**
+ * issue #262「AI root 权限」开关状态（壳侧 [RootGrant.state] 的同构面）。
+ *
+ * 判据要点：`channelRoot` 是**通道身份**（Shizuku 服务端 uid==0），不是「设备是否 root」——
+ * 已 root 但 Shizuku 以 ADB 启动的设备此值为 false，开关必须置灰（假绿是 issue 点名的缺陷形态）。
+ */
+interface RootGrantStatus {
+  /** 状态是否真的读到了（false = 桥缺席/解析失败，界面不得冒充「未授权」以外的任何状态）。 */
+  readable: boolean
+  granted: boolean
+  /** 「已阅读」同意是否对**当前版本**有效（与 versionCode 绑定，升级后需重新确认）。 */
+  consentValid: boolean
+  /** 通道身份 uid（读不到 = -1）。 */
+  channelUid: number
+  /** 通道身份是否 root（== 开关是否具备开启资格）。 */
+  channelRoot: boolean
+  /** 应用级 root 授权（Root 管理器）是否已获得——开关放行的第三道门（2026-09-30 主人定例）。 */
+  rootGranted: boolean
+  /** 应用级 root 授权状态词（unknown/requesting/granted/denied/timeout/no-su）。 */
+  rootState: string
+  /** 壳侧诚实性说明（策略门 ≠ 技术沙箱）。 */
+  honesty: string
+}
+
+/**
+ * 应用级 root 授权面（壳侧 [RootAccess.state] 的同构面，2026-09-30 主人定例）。
+ *
+ * 「这个开关应该调用一下 root 弹窗，并且检测 root 是否授权，如果没有，请写好引导去
+ * Root 管理器，授予 root」——本面就是那条流程的读面：状态 + 管理器 + 引导语。
+ */
+interface RootAccessStatus {
+  readable: boolean
+  /** 本机是否存在可执行的 su（未 root / 未装管理器时为 false）。 */
+  suExists: boolean
+  /** unknown | requesting | granted | denied | timeout | no-su */
+  state: string
+  uid: number
+  granted: boolean
+  /** 请求在飞（弹窗已弹出、等用户在管理器上点「允许」）。 */
+  requesting: boolean
+  /** Root 管理器（KernelSU / Magisk / APatch）。 */
+  managerLabel: string
+  managerInstalled: boolean
+  /** 壳侧引导语（每态都能说清「下一步做什么」）。 */
+  guidance: string
+}
+
 const STATUS_LABEL: Record<VdisplayState, string> = {
   disabled: '已关闭',
   blocked: '需要准备',
@@ -82,6 +129,32 @@ const SHIZUKU_UNREADABLE: ShizukuStatus = {
   binding: false,
   guidance: '',
 }
+
+const ROOT_GRANT_UNREADABLE: RootGrantStatus = {
+  readable: false,
+  granted: false,
+  consentValid: false,
+  channelUid: -1,
+  channelRoot: false,
+  rootGranted: false,
+  rootState: 'unknown',
+  honesty: '',
+}
+
+const ROOT_ACCESS_UNREADABLE: RootAccessStatus = {
+  readable: false,
+  suExists: false,
+  state: 'unknown',
+  uid: -1,
+  granted: false,
+  requesting: false,
+  managerLabel: '',
+  managerInstalled: false,
+  guidance: '',
+}
+
+/** issue #262 用户指定文案（**逐字保留**，未 root 通道下的红字）。 */
+export const ROOT_GRANT_NOT_ROOT_TEXT = '无法在未 root 的设备上赋予该权限'
 
 /**
  * 外链/拉起失败原因的中文口径在**唯一真源** `../user-copy.ts`（0.14.1 批 3 / P3-1）。
@@ -224,6 +297,118 @@ export function readShizuku(): ShizukuStatus {
   }
 }
 
+/**
+ * issue #262「AI root 权限」读面（壳侧 [RootGrant.state] 的桥接）。
+ *
+ * 读不到一律回落 [ROOT_GRANT_UNREADABLE]（`readable:false`）：界面据此显示「状态不可读」
+ * 而不是冒充「未授权」或「可开启」——与 [readShizuku] 同纪律。
+ */
+export function readRootGrant(): RootGrantStatus {
+  try {
+    const raw = window.androidBridge?.rootGrantState?.()
+    const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : undefined
+    if (parsed === undefined || typeof parsed.granted !== 'boolean') return ROOT_GRANT_UNREADABLE
+    return {
+      readable: true,
+      granted: parsed.granted === true,
+      consentValid: parsed.consentValid === true,
+      channelUid: typeof parsed.channelUid === 'number' ? parsed.channelUid : -1,
+      channelRoot: parsed.channelRoot === true,
+      rootGranted: parsed.rootGranted === true,
+      rootState: typeof parsed.rootState === 'string' ? parsed.rootState : 'unknown',
+      honesty: typeof parsed.honesty === 'string' ? parsed.honesty : '',
+    }
+  } catch {
+    return ROOT_GRANT_UNREADABLE
+  }
+}
+
+/**
+ * 应用级 root 授权读面（壳侧 [RootAccess.state] 的桥接）。
+ *
+ * 读不到一律回落 [ROOT_ACCESS_UNREADABLE]（`readable:false`）：界面据此显示「状态不可读」
+ * 而不是冒充「未授权」或「已授权」——与 [readRootGrant] 同纪律。
+ */
+export function readRootAccess(): RootAccessStatus {
+  try {
+    const raw = window.androidBridge?.rootAccessState?.()
+    const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : undefined
+    if (parsed === undefined || typeof parsed.state !== 'string') return ROOT_ACCESS_UNREADABLE
+    const manager = (parsed.manager ?? {}) as Record<string, unknown>
+    return {
+      readable: true,
+      suExists: parsed.suExists === true,
+      state: parsed.state,
+      uid: typeof parsed.uid === 'number' ? parsed.uid : -1,
+      granted: parsed.granted === true,
+      requesting: parsed.requesting === true,
+      managerLabel: typeof manager.label === 'string' ? manager.label : '',
+      managerInstalled: manager.installed === true,
+      guidance: typeof parsed.guidance === 'string' ? parsed.guidance : '',
+    }
+  } catch {
+    return ROOT_ACCESS_UNREADABLE
+  }
+}
+
+/** 应用级 root 授权状态 → 中文状态词（与壳侧 RootAccess 的状态常量一一对应）。 */
+export function rootAccessStateLabel(status: RootAccessStatus): string {
+  if (!status.readable) return '状态不可读'
+  switch (status.state) {
+    case 'granted': return '已授权（uid 0）'
+    case 'requesting': return '请求中…请在手机上点「允许」'
+    case 'denied': return '已拒绝'
+    case 'timeout': return '授权框未响应'
+    case 'no-su': return '本机没有可用的 su'
+    default: return '未检测'
+  }
+}
+
+/** 请求按钮可否点：有 su 且没有请求在飞。 */
+export function canRequestRoot(status: RootAccessStatus): boolean {
+  return status.readable && status.suExists && !status.requesting
+}
+
+/**
+ * 开关状态 → 中文状态词（与壳侧字段一一对应，供测试直接断言）。
+ *
+ * 顺序即真实判据顺序：读不到 → 通道非 root（置灰）→ 未授权 → 已授权。
+ */
+export function rootGrantStateLabel(status: RootGrantStatus): string {
+  if (!status.readable) return '状态不可读'
+  if (!status.channelRoot) return '通道不是 root，无法授权'
+  if (!status.granted) return '未授权'
+  return '已授权（AI 可用 root）'
+}
+
+/** 开关可否点击：只有**通道身份确为 root**才可点（读不到/非 root 一律不可点）。 */
+export function canToggleRootGrant(status: RootGrantStatus): boolean {
+  return status.readable && status.channelRoot
+}
+
+/** Shizuku 以 ADB（shell）身份启动时的通道 uid（issue #262 点名的分流判据）。 */
+export const SHIZUKU_SHELL_UID = 2000
+
+/**
+ * 非 root 通道下的引导语（issue #262 要求**按通道身份分流**，2026-09-30 对账补）：
+ *  - 通道 uid == 2000（Shizuku 以 ADB 启动，设备**可能已 root**）⇒ 引导「在 Shizuku 内以 root 启动」；
+ *  - 其它（无通道 / 未 root）⇒ 用户指定红字「无法在未 root 的设备上赋予该权限」（逐字）。
+ *
+ * 两者都置灰开关；区别只在**用户下一步该做什么**——把已 root 的设备误报成「未 root」会让人
+ * 去折腾设备 root，而真正要做的是重启 Shizuku 的启动方式。
+ */
+export function rootGrantChannelHint(status: RootGrantStatus): { text: string; kind: 'shell-identity' | 'not-root' | 'none' } {
+  if (!status.readable) return { text: '', kind: 'none' }
+  if (status.channelRoot) return { text: '', kind: 'none' }
+  if (status.channelUid === SHIZUKU_SHELL_UID) {
+    return {
+      text: 'Shizuku 当前以 shell（uid 2000）身份运行——请在 Shizuku 内以 root 启动它，再回到本页开启。',
+      kind: 'shell-identity',
+    }
+  }
+  return { text: ROOT_GRANT_NOT_ROOT_TEXT, kind: 'not-root' }
+}
+
 /** 无障碍通道状态；读不到时如实报不可读，不冒充「未开启」（0.14.1 UI 审查 P1）。 */
 export function readA11y(): A11yStatus {
   try {
@@ -254,6 +439,14 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
   const [scale, refreshScale] = useShellState<number>(readScale)
   const [floatOn, refreshFloat] = useShellState<boolean>(readFloat)
   const [a11y, refreshA11y] = useShellState<A11yStatus>(readA11y, { pollMs: 3_000 })
+  // issue #262：root 授权面（2s 轮询与 Shizuku 面同拍——开关资格取决于通道身份，二者必须同源同拍）。
+  const [rootGrant, refreshRootGrant] = useShellState<RootGrantStatus>(readRootGrant, { pollMs: 2_000 })
+  // 2026-09-30 主人定例：应用级 root 授权面（2s 同拍——开关资格与授权状态必须同源同拍）。
+  const [rootAccess, refreshRootAccess] = useShellState<RootAccessStatus>(readRootAccess, { pollMs: 2_000 })
+  /** 用户尝试开启开关但 root 未授权：壳侧已弹授权框，授权一到就自动续开（见下方 effect）。 */
+  const [pendingEnable, setPendingEnable] = useState(false)
+  const [rootMsg, setRootMsg] = useState<string | null>(null)
+  const [rootOk, setRootOk] = useState<boolean | null>(null)
   const [confirmStage, setConfirmStage] = useState(0)
   // 失败回执带 `code`：码只进 `data-code`（可 grep / 可截图给维护方），不进正文（P3-1/P3-6）。
   const [forceMsg, setForceMsg] = useState<{ ok: boolean; text: string; code?: string } | null>(null)
@@ -342,6 +535,24 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
   }, [runShizukuAction])
 
   /**
+   * 2026-09-30：**显式请求 Shizuku 授权**。
+   *
+   * 实测缺陷：授权请求此前只在 `ensureBound` 的后台路径自动发起，而 Shizuku 的
+   * `requestPermission` 需要前台 Activity 才能把对话框落到用户眼前 ⇒ 静默失败，
+   * 管理器「应用管理」列表里根本没有本应用、状态恒 denied，用户没有任何可点的授权入口。
+   * 本入口在 UI 线程发起请求，对话框随即出现。
+   */
+  const requestShizukuPermission = useCallback(() => {
+    runShizukuAction(
+      window.androidBridge?.requestShizukuPermission
+        ? () => window.androidBridge!.requestShizukuPermission!()
+        : undefined,
+      '已发起 Shizuku 授权请求——请在弹窗上点「允许」（本页每 2 秒自动刷新）。',
+      '请求 Shizuku 授权失败',
+    )
+  }, [runShizukuAction])
+
+  /**
    * 「重置链接」：强制移除 Shizuku 侧 UserService 并清空绑定态。
    *
    * 与「刷新状态」同一行（都是非破坏性只读/自愈动作），结算沿用既有 [runShizukuAction] →
@@ -360,6 +571,150 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
       '重置 Shizuku 连接失败',
     )
   }, [runShizukuAction])
+
+  /**
+   * issue #262：root 授权面三个动作（开关 / 「已阅读」确认 / 免责声明）的共同收口。
+   *
+   * 结算口径沿用 [settleLinkCall]（壳侧回 {ok, code/guidance}），写后立刻 [refreshRootGrant] 回读——
+   * 不新造结算口径、不新开定时器（2s 轮询已由 useShellState 承担）。
+   */
+  const runRootAction = useCallback((
+    call: (() => string) | undefined,
+    okText: string,
+    failLead: string,
+    preRaw?: string,
+  ) => {
+    let raw: string | undefined = preRaw
+    if (raw === undefined) {
+      try { raw = call?.() } catch { raw = undefined }
+    }
+    const settled = settleLinkCall(raw, okText, failLead)
+    setRootOk(settled.ok)
+    setRootMsg(settled.text)
+    refreshRootGrant()
+    refreshRootAccess()
+  }, [refreshRootGrant, refreshRootAccess])
+
+  const toggleRootGrant = useCallback((next: boolean) => {
+    // 尝试开启 ⇒ 记 pending：若壳侧因「root 未授权」拦下并弹出授权框，授权一到自动续开。
+    if (next) setPendingEnable(true)
+    else setPendingEnable(false)
+    let raw: string | undefined
+    try {
+      raw = window.androidBridge?.setRootGranted ? window.androidBridge.setRootGranted(next) : undefined
+    } catch { raw = undefined }
+    // 「请求已发起」不是失败（2026-09-30 复核补）：壳侧在被第三道门拦下时当场弹授权框并回
+    // `code=request-started`——渲染成「进行中」，否则用户先看到红字「开启失败」、2 秒后开关
+    // 又自己开起来（提示与实际结果自相矛盾）。
+    const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : undefined
+    if (next && parsed?.code === 'request-started') {
+      setRootOk(true)
+      setRootMsg('root 授权框已弹出，请在手机上点「允许」——授权后本页会自动续开开关。')
+      refreshRootGrant()
+      refreshRootAccess()
+      return
+    }
+    runRootAction(
+      undefined,
+      next
+        ? '已开启 AI root 权限：特权通道按 root 身份执行，请在需要时使用、用完即关。'
+        : '已关闭 AI root 权限：特权通道已恢复整体拒绝。',
+      next ? '开启 AI root 权限失败' : '关闭 AI root 权限失败',
+      raw,
+    )
+  }, [runRootAction, refreshRootGrant, refreshRootAccess])
+
+  /** 显式请求 root 授权（弹窗由壳侧后台 su 触发；本页 2s 轮询看到结果）。 */
+  const requestRoot = useCallback(() => {
+    runRootAction(
+      window.androidBridge?.requestRootAccess
+        ? () => window.androidBridge!.requestRootAccess!()
+        : undefined,
+      '已发起 root 授权请求——请在手机的授权框上点「允许」（本页每 2 秒自动刷新）。',
+      '请求 root 授权失败',
+    )
+    refreshRootAccess()
+  }, [runRootAction, refreshRootAccess])
+
+  /** 打开 Root 管理器（KernelSU / Magisk / APatch）手动授予 root。 */
+  const openRootManager = useCallback(() => {
+    runRootAction(
+      window.androidBridge?.openRootManager
+        ? () => window.androidBridge!.openRootManager!()
+        : undefined,
+      '已打开 Root 管理器——请在其中允许本应用使用 root，然后回到本页点「请求 root 授权」。',
+      '打开 Root 管理器失败',
+    )
+  }, [runRootAction])
+
+  /**
+   * root 通道写盘属主自愈（2026-09-30 主人定例「Root 属主这种 bug 也得找一找修一修」）。
+   * 回执带真实计数（checked/healed），不是一句「已修复」——静默成功是本项目在清的缺陷形态。
+   */
+  const repairOwnership = useCallback(() => {
+    let raw: string | undefined
+    try { raw = window.androidBridge?.repairRootOwnership?.() } catch { raw = undefined }
+    const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : undefined
+    if (parsed?.ok === true) {
+      const skipped = parsed.skipped === 'channel-not-root'
+      setRootOk(true)
+      setRootMsg(
+        skipped
+          ? '当前通道不是 root，无需修复属主。'
+          : '已检查 ' + String(parsed.checked ?? 0) + ' 个顶层条目，修复 ' + String(parsed.healed ?? 0) + ' 个属主条目。',
+      )
+    } else {
+      // 失败时带**真实计数**（2026-09-30 复核补）：只报「失败」看不出修了多少、剩多少。
+      const checked = String(parsed?.checked ?? 0)
+      const healed = String(parsed?.healed ?? 0)
+      const failures = String(parsed?.failures ?? 0)
+      const reason = typeof parsed?.reason === 'string' ? parsed.reason : undefined
+      setRootOk(false)
+      setRootMsg(
+        '修复文件属主未完成（检查 ' + checked + ' 项 / 修好 ' + healed + ' 项 / 失败 ' + failures + ' 项）：'
+        + describeCallReason(reason),
+      )
+    }
+  }, [])
+
+  /**
+   * 自动续开（2026-09-30 主人定例的体验闭环）：用户开开关 → 壳侧因「root 未授权」拦下并
+   * **弹出授权框** → 用户点「允许」→ 本页 2s 轮询看到 `rootAccess.granted` → 自动把开关续开。
+   * 用户只需点一次开关 + 在弹窗上点一次「允许」，不必回设置页再点一次。
+   */
+  useEffect(() => {
+    if (!pendingEnable) return
+    if (rootGrant.granted) {
+      setPendingEnable(false)
+      return
+    }
+    if (rootAccess.granted) {
+      setPendingEnable(false)
+      toggleRootGrant(true)
+    }
+  }, [pendingEnable, rootGrant.granted, rootAccess.granted, toggleRootGrant])
+
+  const toggleRootConsent = useCallback((next: boolean) => {
+    runRootAction(
+      window.androidBridge?.setRootConsent
+        ? () => window.androidBridge!.setRootConsent!(next)
+        : undefined,
+      next
+        ? '已记录「已阅读」——与当前版本绑定，升级后需重新确认。'
+        : '已撤销同意，并同时关闭了 AI root 权限。',
+      next ? '记录「已阅读」失败' : '撤销同意失败',
+    )
+  }, [runRootAction])
+
+  const openRootDisclaimer = useCallback(() => {
+    runRootAction(
+      window.androidBridge?.openRootDisclaimer
+        ? () => window.androidBridge!.openRootDisclaimer!()
+        : undefined,
+      '已打开免责声明（APK 内置文档，离线可读）。',
+      '打开免责声明失败',
+    )
+  }, [runRootAction])
 
   const tapForce = useCallback(() => {
     const next = confirmStage + 1
@@ -446,9 +801,125 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
         <button type="button" className="dsh-dev-btn" onClick={refreshShizuku}>刷新状态</button>
         <button type="button" className="dsh-dev-btn" onClick={resetShizuku}>重置链接</button>
       </div>
+      {shizuku.granted ? null : (
+        <div className="dsh-dev-row">
+          <button
+            type="button"
+            className="dsh-dev-btn"
+            disabled={!shizuku.readable || !shizuku.running}
+            onClick={requestShizukuPermission}
+          >
+            请求 Shizuku 授权
+          </button>
+          <span className="dsh-dev-hint">
+            授权框需要前台界面才能弹出——后台自动请求会静默失败（管理器里会看不到本应用）。
+          </span>
+        </div>
+      )}
       {shizukuMsg === null ? null : (
         <p className={shizukuOk === true ? 'dsh-dev-hint' : 'dsh-dev-error'}>{shizukuMsg}</p>
       )}
+
+      {/* issue #262 方案 A：AI root 权限授权开关（策略门 + 免责门 + 通道身份探测）。
+          判据是**通道身份**（Shizuku 服务端 uid==0）而非「设备是否 root」——已 root 但 Shizuku
+          以 ADB 启动的设备同样置灰 + 红字（用户指定文案，逐字保留），引导以 root 启动 Shizuku。 */}
+      <div className="dsh-screen-control-detail">
+        <strong>AI root 权限</strong>
+        <span data-code={rootGrant.readable ? undefined : 'root-grant-unreadable'}>
+          {rootGrantStateLabel(rootGrant)}
+        </span>
+      </div>
+      {!rootGrant.readable ? (
+        <p className="dsh-dev-hint">读不到授权状态：壳侧桥未装配或解析失败；特权通道按未授权处理。</p>
+      ) : rootGrantChannelHint(rootGrant).kind === 'shell-identity' ? (
+        <p className="dsh-dev-hint" data-code="shizuku-shell-identity">{rootGrantChannelHint(rootGrant).text}</p>
+      ) : rootGrantChannelHint(rootGrant).kind === 'not-root' ? (
+        <p className="dsh-dev-error" data-code="not-root-channel">{rootGrantChannelHint(rootGrant).text}</p>
+      ) : null}
+      <label className="dsh-screen-scope-row">
+        <span>
+          <strong>授权 AI 使用 root</strong>
+          <small>
+            {rootGrant.honesty !== ''
+              ? rootGrant.honesty
+              : '本开关是策略门与知情同意门，不是技术沙箱；开启后特权命令按通道身份（root）执行。'}
+          </small>
+        </span>
+        <input
+          type="checkbox"
+          aria-label="授权 AI 使用 root"
+          checked={rootGrant.granted}
+          disabled={!canToggleRootGrant(rootGrant) || !rootGrant.consentValid}
+          onChange={(event) => toggleRootGrant(event.target.checked)}
+        />
+      </label>
+      <label className="dsh-screen-scope-row">
+        <span>
+          <strong>已阅读</strong>
+          <small>
+            我已阅读
+            <button type="button" className="dsh-dev-link" onClick={openRootDisclaimer}>
+              《AI root 权限免责声明》
+            </button>
+            ，理解开启后 AI 的破坏性操作由我自行承担，与开发者及本项目无关。勾选后才能开启上面的开关；
+            取消勾选会同时关闭开关（升级后需重新确认）。
+          </small>
+        </span>
+        <input
+          type="checkbox"
+          aria-label="已阅读免责声明"
+          checked={rootGrant.consentValid}
+          disabled={!canToggleRootGrant(rootGrant)}
+          onChange={(event) => toggleRootConsent(event.target.checked)}
+        />
+      </label>
+      {rootMsg === null ? null : (
+        <p className={rootOk === true ? 'dsh-dev-hint' : 'dsh-dev-error'}>{rootMsg}</p>
+      )}
+
+      {/* 2026-09-30 主人定例：应用级 root 授权面——检测 + 弹窗 + 管理器引导 + 属主自愈。 */}
+      <div className="dsh-screen-control-detail">
+        <strong>Root 授权（应用自身）</strong>
+        <span data-code={rootAccess.readable ? undefined : 'root-access-unreadable'}>
+          {rootAccessStateLabel(rootAccess)}
+        </span>
+      </div>
+      <p className="dsh-dev-hint">
+        {rootAccess.guidance !== ''
+          ? rootAccess.guidance
+          : '点「请求 root 授权」会弹出 Root 管理器的授权框；未授权时上面的开关不会开启。'}
+      </p>
+      <div className="dsh-dev-row">
+        <button
+          type="button"
+          className="dsh-dev-btn"
+          disabled={!canRequestRoot(rootAccess)}
+          onClick={requestRoot}
+        >
+          请求 root 授权
+        </button>
+        <button
+          type="button"
+          className="dsh-dev-btn"
+          disabled={!rootAccess.managerInstalled}
+          onClick={openRootManager}
+        >
+          打开 Root 管理器
+        </button>
+      </div>
+      <p className="dsh-dev-hint">
+        {rootAccess.managerInstalled
+          ? 'Root 管理器：' + rootAccess.managerLabel + '。若授权框没有弹出，可点「打开 Root 管理器」手动允许本应用。'
+          : '未检测到 Root 管理器（KernelSU / Magisk / APatch）——本机可能尚未 root。'}
+      </p>
+      <div className="dsh-dev-row">
+        <button type="button" className="dsh-dev-link" onClick={repairOwnership}>
+          修复文件属主
+        </button>
+        <span className="dsh-dev-hint">
+          root 通道写盘会把文件属主变成 root:root（应用读不回来）——这里做有界抽查与修复。
+        </span>
+      </div>
 
       <label className="dsh-screen-scope-row">
         <span>
