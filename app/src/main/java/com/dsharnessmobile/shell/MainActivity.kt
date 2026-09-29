@@ -1021,9 +1021,24 @@ class MainActivity : ComponentActivity() {
         // （它会强制移除 Shizuku 侧 UserService），故不做任何自动触发；resetConnection 内部
         // 绝不同步等待新绑定（UI 路径），重置后的收敛交给既有 2s 轮询 + kickBind。
         onResetShizukuConnection = { ShizukuTransport.resetConnection(this).toString() },
+        // issue #262 免责门：免责声明走 APK 内 assets（LocalDocs 通道），页面不传路径。
+        onOpenRootDisclaimer = { LocalDocs.open(this, LocalDocs.ROOT_DISCLAIMER) },
+        // 2026-09-30：Shizuku 授权的**显式请求**入口（必须 UI 线程 + 前台 Activity，
+        // 后台自动请求落不到用户眼前 ⇒ 管理器列表里根本没有本应用、状态恒 denied）。
+        onRequestShizukuPermission = { ShizukuTransport.requestPermission(this).toString() },
       ),
       "androidBridge",
     )
+    // 2026-09-30：root 通道写盘**属主自愈**（有界抽查 + 有界修复，只在通道身份为 root 时动作）。
+    // 延后 15s：不与引擎冷启动的 I/O 抢资源；失败静默——自愈不是启动路径的前置条件，
+    // 页面另有「修复文件属主」按钮可手动触发（repairRootOwnership）。
+    val healCtx = applicationContext
+    Thread({
+      runCatching {
+        Thread.sleep(15_000)
+        ShizukuTransport.autoHealOwnership(healCtx)
+      }
+    }, "dsh-root-owner-heal").start()
     // 返回策略（计划 §5.1 方案 1）：页面 → 壳的层栈上行接口。独立接口对象，只暴露
     // setAvailable/getBackAvailable 两个方法（授权面窄于 androidBridge 的 34 个方法）；
     // addJavascriptInterface 的方法调用是同步的——正是「同步决策」需要的形态。

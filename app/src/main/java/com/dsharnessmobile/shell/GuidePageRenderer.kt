@@ -231,6 +231,38 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
   private var apkReadyToInstall: File? = null
   private var apkBusy = false
 
+  /** 失败相位自愈的防重入标记（相位可能被多次应用；同一时刻只跑一次）。 */
+  private var ownershipRepairRunning = false
+
+  /**
+   * 失败相位的一次性属主自愈（2026-09-30，主人一问「root 属主会导致无法启动，你在设置里弄真有用吗」）。
+   *
+   * 纪律：①**自动**跑，不等用户点任何按钮（启动挂了的用户进不到设置页）；②防重入；
+   * ③结果**如实**写进提示行——修好了说清修了几条并给出下一步；一条没修到就**不加噪音**
+   * （无污染/无 root 路径时沉默，避免把「一切正常」渲染成「出事了」）。
+   */
+  private fun autoRepairOwnershipOnFailure() {
+    if (ownershipRepairRunning) return
+    ownershipRepairRunning = true
+    Thread({
+      val result = runCatching { ShizukuTransport.autoHealOwnership(activity.applicationContext) }.getOrNull()
+      activity.runOnUiThread {
+        ownershipRepairRunning = false
+        val healed = result?.optInt("healed") ?: 0
+        val failures = result?.optInt("failures") ?: 0
+        val skipped = result?.optString("skipped") ?: ""
+        val text = when {
+          result == null -> ""
+          skipped.isNotEmpty() -> ""
+          healed > 0 -> "已自动修复 $healed 个 root 属主条目（root 通道写盘遗留）——点上方按钮重试启动。"
+          failures > 0 -> "发现需修复的属主条目但修复失败（$failures 项）——请检查 root 授权后重试。"
+          else -> ""
+        }
+        if (text.isNotEmpty()) pushHint(text, HintSource.PHASE, sticky = true)
+      }
+    }, "dsh-root-owner-repair-guide").start()
+  }
+
   fun buildGuideView(): LinearLayout {
     chrome = buildGuideChrome(
       activity,
@@ -288,6 +320,12 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     val resolvedHint = hint ?: defaultHint(phase)
     // S1-2：相位文案走仲裁漏斗（不可打断相位期间，旁路回执不得顶掉它）。
     pushHint(resolvedHint, HintSource.PHASE, sticky = phaseLocked(phase))
+
+    // 2026-09-30（主人一问换来：「root 属主会导致无法启动，你在设置里弄真有用吗」）：
+    // **失败相位自动属主自愈**——启动已经挂了的时候用户就停在这一页，此时自动跑一次有界自愈
+    // （su 优先），并把结果如实写进提示行。修复不依赖用户找到任何按钮（启动挂了的用户
+    // 根本进不到设置页，那里的按钮形同虚设）。
+    if (phase == GuidePhase.Error) autoRepairOwnershipOnFailure()
 
     val busy = phase == GuidePhase.Starting ||
       phase == GuidePhase.Extracting ||

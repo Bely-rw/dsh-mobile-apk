@@ -490,6 +490,18 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       }
       // 中断事务已由启动前置（startupRecoverThenProbe）恢复——此处只做新鲜度判定。
       if (!isCurrentEngineFlow(generation)) return@Thread
+      // 2026-09-30（主人一问换来：「root 属主会导致无法启动，你在设置里弄真有用吗」）：
+      // **启动前置属主自愈**——必须在快照判定与引擎启动**之前**跑。
+      //
+      // 为什么不能在设置页等用户点：root 通道写盘留下的 root:root 属主会让引擎/快照事务
+      // 读不了自己的文件（usr/bin/node、引擎包、profile 包）⇒ **启动即挂**，而启动挂了的用户
+      // 根本进不到设置页，修复按钮形同虚设。放在这里 = 污染在咬人之前被清掉。
+      //
+      // 有界且不阻塞判定：无 root 路径（su 未授权且 Shizuku 非 root）时立即返回；
+      // 有 root 路径时做有界抽查 + 有界修复（顶层几十次 stat，命中才整棵修）。失败静默——
+      // 自愈不是启动路径的前置条件，它的失败不能把启动也拖死。
+      runCatching { ShizukuTransport.autoHealOwnership(activity.applicationContext) }
+      if (!isCurrentEngineFlow(generation)) return@Thread
       if (!activity.engineManager.snapshotFresh()) {
         if (!isCurrentEngineFlow(generation)) return@Thread
         // 0.14.1 D2（issue #240 建议 2）：**降级闸门**。同一份快照上刷新已连续失败达阈、
