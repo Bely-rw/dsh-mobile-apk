@@ -437,9 +437,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp/source-build
-          curl --fail --location --retry 3 \
-            'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
-            --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          # 已存在则跳过下载：内容哈希由下一步的 prepare-termux-bootstrap.py 按固定值校验，
+          # 下载与否都验，故跳过不放过坏文件；本地复跑省一次 31 MB 往返（CI 无操作）。
+          if [ ! -f .deploy-tmp/source-build/bootstrap-aarch64.zip ]; then
+            curl --fail --location --retry 3 \
+              'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
+              --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          fi
           # 先清空解包目标：本步对**同一目录**重跑不安全——上一轮按 SYMLINKS.txt 建出的符号链接
           # 会让这一轮的 safe_member 解析出界（报 `bootstrap path escaped staging root`）。
           # CI 每轮全新目录所以从不暴露，本地复跑必踩；清掉即幂等。
@@ -554,10 +558,15 @@ jobs:
         run: |
           set -euo pipefail
           ndk_archive=.deploy-tmp/source-build/android-ndk-r30-linux.zip
-          curl --fail --location --retry 3 \
-            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
-            --output "$ndk_archive"
-          printf '%s  %s\n' '5107f898313790e449e87eee2183d9a20602dee9' "$ndk_archive" | sha1sum --check -
+          ndk_sha1='5107f898313790e449e87eee2183d9a20602dee9'
+          # 已存在且钉死的哈希对得上就跳过下载：本地复跑省 704 MB（CI 每轮全新目录，无操作）。
+          # 跳过不等于放行——下面那条 sha1sum --check 无论下载与否都照跑。
+          if ! printf '%s  %s\n' "$ndk_sha1" "$ndk_archive" | sha1sum --check --status 2>/dev/null; then
+            curl --fail --location --retry 3 \
+              https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+              --output "$ndk_archive"
+          fi
+          printf '%s  %s\n' "$ndk_sha1" "$ndk_archive" | sha1sum --check -
           printf '%s\n' '5107f898313790e449e87eee2183d9a20602dee9' \
             > .deploy-tmp/source-build/ndk-archive-sha1.txt
           # 同上：`unzip` 无 -o，目录已在时会走交互式覆盖确认，非交互环境读到 EOF 即判死。
