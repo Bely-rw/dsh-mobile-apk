@@ -1208,3 +1208,9 @@
       **开发链绿 ≠ 发布链绿**——这里的差别只有一个 `--offline`。
 
 
+
+215. **来源链的两处 `git clone` 没有「已存在则复用」守卫，本地复跑必撞（2026-09-29，本地链实测）**：
+    **现象**：同一工作区第二次跑 `scripts/source-build/run-local-source-chain.mjs` 时，第 3 步直接报 `fatal: destination path '.deploy-tmp/deepseek-harness' already exists and is not an empty directory`，链在开头就停。
+    **真因**：CI 每轮全新检出，`.deploy-tmp/` 恒为空，故 `git clone` 从不失败；而本地复跑时目录还在。**同一类不可重入**此前已修过两处（`bootstrap-extracted` 解包目录、NDK 的 `unzip` 无 `-o`），但 clone 这两处漏了——它们与那两处的区别只是「失败得早且直白」。
+    **修法**：两处 clone 加 `if [ ! -d <dir>/.git ]; then ... fi`；其后的 `git fetch --depth=1`、`checkout --detach`、`rev-parse` 断言本身幂等，不动。CI 上是无操作。
+    **为什么记进坑位**：有了本地链运行器（`run-local-source-chain.mjs`）之后，「链的幂等性」从 CI 的隐含前提变成**本地可观测的判据**；每加一处 `clone`/`unzip`/`tar -x` 到已有目录都要想一遍。判据不是「CI 绿」，而是「同一工作区连跑两次都绿」。

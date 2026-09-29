@@ -125,7 +125,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp
-          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          # 已存在则复用：CI 每轮全新目录，本地复跑却会撞 `destination path already exists`。
+          # 下面几条 fetch/checkout 本身幂等，只有 clone 不是，故只守这一条。
+          if [ ! -d .deploy-tmp/deepseek-harness/.git ]; then
+            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          fi
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 477b4f420553e8a52c2fbccc464d7561b239c443
           git -C .deploy-tmp/deepseek-harness checkout --detach 477b4f420553e8a52c2fbccc464d7561b239c443
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
@@ -137,7 +141,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp/component-sources
-          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
+          # 同上：已存在则复用，本地复跑不再撞 clone。
+          if [ ! -d .deploy-tmp/component-sources/host-web-compat/.git ]; then
+            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
+          fi
           git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 2de902729e01eb3619aa50bdfa164c5231948848
           git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 2de902729e01eb3619aa50bdfa164c5231948848
           test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "2de902729e01eb3619aa50bdfa164c5231948848"
