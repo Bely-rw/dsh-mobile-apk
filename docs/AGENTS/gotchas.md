@@ -1211,4 +1211,6 @@
 
 216. **启动轮询的 401 也不能绕过所有权门禁（issue #295）**：WebView 的 main-frame 401 之外，启动线程直接探测到的 401 同样可能来自外部监听器；若直接调用 `EngineAuth.handleUnauthorized`，会清理/刷新壳侧 cookie 并把非本引擎当成认证失败。**修法**：启动轮询复用精确本地 origin + owned-process/current-generation proof + main-frame policy helper，未证明归属时只记录拒绝，不触发认证恢复。
 
+217. **自包含 release checkout 的 runtime asset 门禁不能靠目录猜测（2026-09-29，release run 36589913818）**：**现象**：release workflow 的 checkout 确实包含 `app/src/main/assets/patched/*.js`，快照双 ABI 也构建成功，但严格门禁报告 `/home/runner/work/dsh-mobile-apk/dsh-mobile-apk/dsh-mobile-apk/app/src/main/assets/patched` 不存在，双 ABI 均被拒，因而没有创建 draft Release。**真因**：`check-runtime-assets.mjs` 只用 `ROOT/dsh-mobile-apk` 是否存在来猜协调仓布局；自包含 checkout/本地来源链已通过 `DSH_APK_DIR` 明确传入 APK 根，却被忽略，布局探测把门禁指向 phantom nested path。**修法**：`DSH_APK_DIR` 存在时优先 `resolve()` 使用它，目录猜测只作兼容回退；不放宽 `--require`，不自动生成或绕过 `assets/patched`。**复验证据**：APK 仓 `node scripts/check-runtime-assets.mjs x86_64 --snapshot app/src/main/assets/snapshot.tar.xz --require` 通过（3 资产逐字节同源、2 行为回归）；协调仓 `check-patch-mirror.mjs` 通过。发布链修复后必须重新触发 workflow 并核验 draft Release 资产面。
+
 
