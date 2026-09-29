@@ -335,6 +335,9 @@ jobs:
             "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.json"
           corepack pnpm install --lockfile-only --no-frozen-lockfile
           corepack pnpm install --frozen-lockfile --ignore-scripts
+          # `pnpm deploy` 要求目标目录为空，否则 ERR_PNPM_DEPLOY_DIR_NOT_EMPTY；CI 每轮全新工作区
+          # 故从不暴露，本地复跑必撞。语义上这里要的就是「全新的部署树」，故清掉即忠实。
+          rm -rf "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           corepack pnpm@12.2.0 --pm-on-fail=ignore --filter @deepseek-ai/dsh deploy --prod "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           cp pnpm-lock.yaml "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml"
           restore_deploy_inputs
