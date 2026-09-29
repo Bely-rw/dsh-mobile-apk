@@ -107,6 +107,18 @@ class AndroidBridge(
   private val onResetShizukuConnection: () -> String =
     { """{"ok":false,"code":"shizuku-not-wired"}""" },
   /**
+   * issue #262 免责门：打开 APK 内免责声明文档（[LocalDocs] 通道，页面不传路径）。
+   * 需要 Activity 弹对话框，故由 MainActivity 接线；默认实现结构化拒绝（fail-closed）。
+   */
+  private val onOpenRootDisclaimer: () -> String =
+    { """{"ok":false,"reason":"bridge not wired"}""" },
+  /**
+   * 2026-09-30：显式请求 Shizuku 授权（UI 线程 + 前台 Activity；需要 Activity 故由 MainActivity 接线）。
+   * 后台自动请求落不到用户眼前 ⇒ 管理器「应用管理」列表里根本没有本应用、状态恒 denied。
+   */
+  private val onRequestShizukuPermission: () -> String =
+    { """{"ok":false,"code":"shizuku-not-wired"}""" },
+  /**
    * 0.14.1 块J FIX-4：通知设置**读**面（key 为空 = 全量快照）。
    *
    * 默认实现与 [onGetImmersiveMode] 同款：**直接读壳侧单一真源**（`ShellAppContext` 由
@@ -447,6 +459,109 @@ class AndroidBridge(
    */
   @JavascriptInterface
   fun resetShizukuConnection(): String = onResetShizukuConnection()
+
+  /**
+   * issue #262 设置页「手机控制」：「AI root 权限」读面（写后回读同源）。
+   *
+   * 默认实现钉在真源上（[RootGrant.state] + [ShizukuTransport] 的通道 uid），
+   * 不依赖 MainActivity 传参——漏接线这一失效形态在结构上不可能（与通知设置读面同纪律）。
+   * 字段：`granted` / `consentValid` / `channelUid` / `channelRoot` / `canToggle` / `honesty`。
+   */
+  @JavascriptInterface
+  fun rootGrantState(): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context","canToggle":false,"channelRoot":false}"""
+    return RootGrant.state(app, RootGrant.channelUidNow(app)).put("ok", true).toString()
+  }
+
+  /**
+   * issue #262：开关写面。[RootGrant.setGranted] 判据（通道身份 root + 免责确认有效）全部
+   * 满足才写入；返回写后读回的状态 JSON，拒绝时带 `code`/`guidance`（页面据此说话，不静默）。
+   */
+  @JavascriptInterface
+  fun setRootGranted(on: Boolean): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context"}"""
+    return RootGrant.setGranted(app, on).toString()
+  }
+
+  /**
+   * issue #262：「已阅读」免责确认写面。取消勾选即撤销同意并**同时关闭开关**
+   * （不留矛盾态）；同意与 versionCode 绑定，升级后自动失效需重新确认。
+   */
+  @JavascriptInterface
+  fun setRootConsent(on: Boolean): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context"}"""
+    return RootGrant.setConsent(app, on).toString()
+  }
+
+  /**
+   * issue #262 免责门：打开本地免责声明（[LocalDocs.ROOT_DISCLAIMER]，APK assets，
+   * 离线/随版本/不可远端替换）。页面不传路径，只触发这一条登记过的文档。
+   */
+  @JavascriptInterface
+  fun openRootDisclaimer(): String = onOpenRootDisclaimer()
+
+  /**
+   * 2026-09-30：**显式请求 Shizuku 授权**（必须在 UI 线程 + 前台 Activity 上发起，
+   * 否则授权对话框落不到用户眼前；由 MainActivity 接线，见 `onRequestShizukuPermission`）。
+   */
+  @JavascriptInterface
+  fun requestShizukuPermission(): String = onRequestShizukuPermission()
+
+  /**
+   * 2026-09-30 主人定例：应用级 root 授权状态读面（**纯读，永不触发授权弹窗**）。
+   *
+   * 字段：`suExists` / `suPath` / `state`（unknown|requesting|granted|denied|timeout|no-su）/
+   * `uid` / `granted` / `requesting` / `manager{package,label,installed}` / `guidance`。
+   * 默认实现钉在真源上（[RootAccess.state]），不依赖 MainActivity 传参。
+   */
+  @JavascriptInterface
+  fun rootAccessState(): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context","state":"unknown","granted":false}"""
+    return RootAccess.state(app).put("ok", true).toString()
+  }
+
+  /**
+   * 2026-09-30 主人定例：**显式请求 root 授权**——后台跑 `su -c id`，触发 Root 管理器的授权弹窗。
+   *
+   * 非阻塞（后台线程 + 25s 有界超时）：立即返回 `{ok:true,code:request-started}`，
+   * 结果由页面既有 2s 轮询经 [rootAccessState] 看到；幂等（在飞时不重复起，避免弹窗连发）。
+   */
+  @JavascriptInterface
+  fun requestRootAccess(): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context"}"""
+    return RootAccess.requestGrant(app).toString()
+  }
+
+  /**
+   * 2026-09-30 主人定例：拉起 Root 管理器界面（KernelSU / Magisk / APatch），
+   * 供用户手动授予 root。未安装 → `{"ok":false,"reason":"not-installed"}`。
+   */
+  @JavascriptInterface
+  fun openRootManager(): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context"}"""
+    return RootAccess.openManagerFromContext(app)
+  }
+
+  /**
+   * 2026-09-30 主人定例（「Root 属主这种 bug 也得找一找修一修」）：root 通道写盘属主自愈。
+   *
+   * root 通道（Shizuku 以 root 启动）里 UserService 的 uid=0，它写的文件属主是 root:root；
+   * 落进应用数据目录（files/...）就是**应用自己读不回来**（0600）⇒ watcher / 插件更新 /
+   * 引擎读写失败。本方法做**有界抽查 + 有界修复**（只在通道身份为 root 时动作）。
+   * 返回 `{ok, channelUid, checked, healed, skipped?}`。
+   */
+  @JavascriptInterface
+  fun repairRootOwnership(): String {
+    val app = ShellAppContext.get()
+      ?: return """{"ok":false,"reason":"no-shell-context"}"""
+    return ShizukuTransport.autoHealOwnership(app).toString()
+  }
 
   /**
    * 0.14.1 块J FIX-4：通知设置读回（设置页「开发者选项」的初始态与写后读回）。

@@ -48,5 +48,23 @@ interface ShizukuUserService {
 
     /** v2：删除远端文件/目录（幂等，rm -f 语义）。仅限绝对路径。 */
     Bundle removePath(in String path) = 7;
+
+    /**
+     * v3（2026-09-30）：应用侧绑定后回填「本应用 uid + 数据目录」。
+     *
+     * 承重墙：root 通道（服务端以 root 启动）里 UserService 的 uid 是 0，它写的每个文件
+     * 属主都是 root:root —— 落到应用数据目录（files/...）里就是**应用自己读不回来**
+     * （0600 root 属主），watcher/插件更新/引擎读写随之失败。回填本方法后，
+     * [writeChunk] 与 [repairOwnership] 才知道「这些文件该属于谁」。
+     */
+    void configure(int appUid, String appDataDir) = 8;
+
+    /**
+     * v3：把 path 的属主归一到**已配置的应用 uid**（不接受任意 uid/gid —— 这不是通用 chown，
+     * 只是「把文件修回我自己的」这一件事）。有界遍历：maxEntries 上限、不跟随符号链接、
+     * 超限如实回报 truncated。未 configure 时结构化拒绝。
+     * @return {ok,scanned,fixed,truncated,error?}
+     */
+    Bundle repairOwnership(in String path, int maxEntries) = 9;
 }
 

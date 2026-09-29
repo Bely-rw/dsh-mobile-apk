@@ -1,5 +1,6 @@
 package com.dsharnessmobile.shell
 
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
@@ -62,6 +63,9 @@ object ShizukuTransport {
 
   @Volatile private var connectedAt = 0L
   private var bindLatch: CountDownLatch? = null
+
+  /** v3：本连接是否已把「应用 uid + 数据目录」回填给 UserService（按连接代次去重）。 */
+  @Volatile private var configuredForAge = -1L
 
   private val connection = object : ServiceConnection {
     override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -336,10 +340,138 @@ object ShizukuTransport {
     }
   }
 
+  /**
+   * v3（2026-09-30）：把「本应用 uid + 数据目录」回填给 UserService（每次连接一次）。
+   *
+   * 为什么必须做：root 通道里 UserService 的 uid=0，它写的文件属主是 root:root——落进应用
+   * 数据目录就是**应用自己读不回来**（0600），watcher / 插件更新 / 引擎读写随之失败。
+   * 回填后 UserService 才能把 [writeChunk] 的产物与 [repairOwnership] 的目标修回应用 uid。
+   * 旧服务（v2，没有该方法）会抛错——只记日志，不影响既有能力（归一化缺席而已）。
+   */
+  private fun configureIfNeeded(context: Context) {
+    val remote = service ?: return
+    val age = connectedAt
+    if (age <= 0L || configuredForAge == age) return
+    configuredForAge = age
+    val dataDir = runCatching { context.applicationContext.filesDir.parentFile?.canonicalPath }.getOrNull() ?: ""
+    runCatching { remote.configure(android.os.Process.myUid(), dataDir) }
+      .onFailure { Log.w(TAG, "configure failed (old service?): " + it.javaClass.simpleName) }
+  }
+
+  /**
+   * 属主归一（root 通道写盘污染的自愈原语，v3）。**不受 AI 授权门约束**——它不是模型能力，
+   * 而是应用修自己文件的自愈面：目标必须落在应用数据目录内、uid/gid 由 UserService 侧
+   * 固定为已配置的应用 uid（不接受任意 uid/gid）。
+   */
+  fun repairOwnership(context: Context, path: String, maxEntries: Int = 0): JSONObject {
+    // applyGate=false：这是应用自愈面（只修自己数据目录里文件的属主），不是模型能力。
+    val (remote, refusal) = readyService(context, applyGate = false)
+    if (remote == null) return refusal ?: unavailableShell()
+    return try {
+      val r = remote.repairOwnership(path, maxEntries)
+      JSONObject()
+        .put("ok", r.getBoolean("ok"))
+        .put("scanned", r.getInt("scanned"))
+        .put("fixed", r.getInt("fixed"))
+        .put("truncated", r.getBoolean("truncated"))
+        .put("error", r.getString("error") ?: "")
+    } catch (t: Throwable) {
+      // 旧服务（v2）没有这条 transaction：如实回报「通道不支持」，不假装修过。
+      JSONObject().put("ok", false).put("code", "repair-unsupported")
+        .put("guidance", "当前 UserService 协议不支持属主修复（旧服务）——到设置页「手机控制」点「重置链接」重建通道后再试。")
+    }
+  }
+
+  /**
+   * 启动期有界自愈（2026-09-30）：抽查热点路径的**顶层条目**属主，发现 root 属主就修。
+   *
+   * 为什么是抽查顶层而不是全树：应用数据目录里有几万个文件，全树 stat 是秒级到十秒级开销；
+   * 而污染的高发面是「root 通道刚写过的那几处」（home/.dsh、audit 等）——顶层扫描几十次
+   * stat 即可命中，命中后再对该子树做有界修复（UserService 侧 20k 条目上限）。
+   *
+   * 只在通道身份为 root 时才可能发生污染（uid 2000 写的文件属主是 shell，与旧行为一致）。
+   */
+  fun autoHealOwnership(context: Context): JSONObject {
+    val app = context.applicationContext
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    val myUid = android.os.Process.myUid()
+    // 2026-09-30（主人定例「我们是做 root 适配」）：两条 root 路径任一可用即可自愈——
+    // ①应用自身获 Root 管理器授权（su 直连，不依赖 Shizuku）；②Shizuku 通道身份为 root。
+    val suRoot = RootAccess.isGranted(app)
+    val summary = JSONObject().put("ok", true).put("channelUid", uid)
+      .put("transport", if (suRoot) "su" else "shizuku").put("checked", 0).put("healed", 0)
+    if (uid != RootGrant.ROOT_UID && !suRoot) return summary.put("skipped", "no-root-path")
+    // 扫描面 = **启动必需路径**（2026-09-30 主人一问修正：「root 属主会导致无法启动，你在设置里
+    // 弄真有用吗」——只扫数据目录顶层是不够的：引擎要读 usr/bin/node、引擎包、profile 包，
+    // 这些被 root 属主污染同样启动即挂，而那时用户进不到设置页）。每条命中的顶层条目会被
+    // 有界地整棵修复（UserService/su 侧 20k 条目上限）。
+    val roots = buildList {
+      add(app.filesDir)
+      add(java.io.File(app.filesDir, "home/.dsh"))
+      add(java.io.File(app.filesDir, "audit"))
+      add(java.io.File(app.filesDir, "usr/bin"))
+      add(java.io.File(app.filesDir, "usr/lib/node_modules"))
+      // profile 树：每个 profile 的 node_modules 顶层（插件包所在）
+      runCatching {
+        java.io.File(app.filesDir, "home/.dsh/profiles").listFiles()?.forEach { profile ->
+          add(java.io.File(profile, "node_modules"))
+        }
+      }
+    }.filter { it.isDirectory }
+    var checked = 0
+    var healed = 0
+    var failures = 0
+    for (root in roots) {
+      val entries = runCatching { root.listFiles() }.getOrNull() ?: continue
+      for (entry in entries) {
+        checked++
+        val owner = runCatching { android.system.Os.lstat(entry.path).st_uid }.getOrDefault(myUid)
+        if (owner == 0 && owner != myUid) {
+          // su 优先（不依赖 Shizuku 的授权/运行状态）；不可用时回退 Shizuku 通道。
+          val r = if (suRoot) RootAccess.repairOwnership(app, entry.path) else repairOwnership(app, entry.path)
+          if (r.optBoolean("ok")) {
+            healed += r.optInt("fixed")
+          } else {
+            // 逐项失败必须计数并在汇总里如实暴露（旧版只累加成功项 ⇒ 全失败也报 ok:true 的静默形态）。
+            failures++
+          }
+        }
+      }
+    }
+    return summary.put("checked", checked).put("healed", healed).put("failures", failures)
+      // 2026-09-30 复核补：逐项失败必须反映到**顶层 ok**——否则页面（只读 ok/healed）会把
+      // 「全失败、修了 0 条」渲染成「已检查 N 个顶层条目，修复 0 个属主条目」的正常态。
+      .put("ok", failures == 0)
+      .put("reason", if (failures == 0) "" else "repair-item-failed")
+      .put("guidance", if (failures == 0) "" else "有 $failures 个条目修复失败——请检查 root 授权后重试。")
+  }
+
+  /**
+   * 显式请求 Shizuku 授权（**必须在 UI 线程 + 有前台 Activity**）。
+   *
+   * 为什么单独成方法（2026-09-30 实测）：`ensureBound` 里的自动请求跑在**后台线程**
+   * （repairOwnership / kickBind 的路径），Shizuku 的 `requestPermission` 需要当前 Activity
+   * 才能把授权对话框落到用户眼前——后台调用静默失败，结果是「管理器列表里根本没有本应用」
+   * 且状态恒为 denied（用户看不到任何可点的授权入口）。
+   *
+   * 返回写后回读的 [status]，并带 `requested` 说明这次是否真的发起了请求。
+   */
+  fun requestPermission(activity: Activity): JSONObject {
+    val requested = runCatching {
+      activity.runOnUiThread { runCatching { Shizuku.requestPermission(REQUEST_CODE_VDISPLAY) } }
+      true
+    }.getOrDefault(false)
+    return status(activity).put("requested", requested)
+  }
+
   /** Native-only fixed argv execution. Never pass user/model-controlled shell text here. */
   fun runController(context: Context, argv: Array<String>): JSONObject {
+    // issue #262 方案 A 策略门：通道身份为 root 且「AI root 权限」未授权时，执行面整体
+    // fail-closed（含虚拟屏控制器命令——它们同样以通道身份执行，无豁免）。
+    rootGateRefusal(context)?.let { return it }
     val ready = ensureBound(context)
     if (!ready.optBoolean("ok")) return ready
+    configureIfNeeded(context)
     val remote = service ?: return status(context)
       .put("ok", false).put("code", "shizuku-user-service-not-bound")
     return try {
@@ -377,7 +509,15 @@ object ShizukuTransport {
   private const val SHELL_PATH_PREFIX = "export PATH=/system/bin:/system/xbin:\$PATH; "
 
   /** v2 协议面就绪判定：返回 (service, refusal)——refusal 非空即结构化拒绝，调用方直接透传。 */
-  private fun readyService(context: Context): Pair<ShizukuUserService?, JSONObject?> {
+  private fun readyService(context: Context, applyGate: Boolean = true): Pair<ShizukuUserService?, JSONObject?> {
+    // issue #262 方案 A 策略门（runShell/pullFile/pushFile/removeRemote 四个执行面的共同入口）：
+    // 通道身份为 root 且未授权时，在**发起任何绑定/执行之前**拒绝——不是按 op 分类放行，
+    // uid 0 下 shExec 是任意 shell，分类隔离不存在（诚实性要求），故整体关闭。
+    //
+    // applyGate=false 仅供**应用自愈面**（repairOwnership）使用：它只把应用自己数据目录里的文件
+    // 属主修回应用自己的 uid，不是模型能力、也不构成权限放大；被自己的策略门挡住会让
+    // 「root 通道 + AI 未授权」这一组合失去自愈能力（文档已如此承诺，实现必须一致）。
+    if (applyGate) rootGateRefusal(context)?.let { return null to it }
     val ready = ensureBound(context)
     if (!ready.optBoolean("ok")) return null to ready
     val remote = service
@@ -391,12 +531,27 @@ object ShizukuTransport {
         .put("guidance", "Shizuku UserService 协议为 v$pv，本机需要 v2（0.14.0 大输出 / 文件取回面）；" +
           "在设置页「手机控制」重新连接 Shizuku 会重启 UserService（无需重装）。")
     }
+    // v3：把应用身份回填给 UserService（属主归一的前提；每次连接一次，旧服务静默跳过）。
+    configureIfNeeded(context)
     return remote to null
   }
 
   /**
    * 特权 shell 执行（uid 2000）：`sh -c <command>`，PATH 前置系统目录（F3 远端 PATH 污染修复同源）。
    * capture=true 时大输出落 shell 侧 spool 文件，只回报前 8 KiB 与文件坐标（filePath/size）。
+   *
+   * ── issue #262「命令面引号逃逸」在本方案下的处置（2026-09-30 对账登记）──────────────
+   * issue 原文点名：`argv = [sh, -c, PREFIX+command]` 形态下，模型传 `'; id -u; '` 会**逃逸回 root**，
+   * 并规定「任何**降权/包装**方案必须走 argv（命令作为单个 argv 元素）」。
+   *
+   * 本仓现状 = issue 的**方案 A**（策略门 + 免责门 + 通道身份探测，**不做降权包装**）：
+   * 命令本就按通道身份（uid 0 或 2000）执行，不存在「被包装后逃逸出去」的对象 ⇒ 该向量在 A 下
+   * **不成立**，故此处不改为 argv 形态（改了也只是同一件事换个写法，不增加任何隔离）。
+   *
+   * ⚠️ **硬约束（留给将来）**：一旦引入任何降权/包装（如 `su -c "setuidgid N ..."` 形态），
+   * 必须把待执行命令作为**单个 argv 元素**传入（`ProcessBuilder(listOf(wrapper, "sh", "-c", command))`
+   * 或 AIDL 的 argv 数组），**绝不把 command 拼进被包装的 shell 字符串里**——否则模型可用引号
+   * 逃出包装、以包装者的身份执行（issue 已实测该逃逸）。
    */
   fun runShell(context: Context, command: String, timeoutMs: Int = SHELL_TIMEOUT_MS, capture: Boolean = false): JSONObject {
     if (command.isBlank()) {
@@ -539,6 +694,27 @@ object ShizukuTransport {
     .put("ok", false)
     .put("code", "shell-transport-failed")
     .put("guidance", "Shizuku shell 通道失败：" + t.javaClass.simpleName + ": " + (t.message ?: ""))
+
+  /**
+   * issue #262 方案 A：root 通道授权门（策略门 + 知情同意，**不是技术沙箱**）。
+   *
+   * 判据用**通道身份**而不是「设备是否 root」：只有 Shizuku 服务端以 root 启动（uid=0）
+   * 时本门才生效；uid=2000（ADB 启动）或读不到 uid 的通道维持既有语义，不受影响。
+   * uid 0 且未授权 ⇒ 特权执行面整体拒绝——uid 0 下任意 shell 本就无限制，
+   * 「按 op 分类只关掉 root 级 op」是做不到的假隔离（issue 已确证），故不装样子。
+   *
+   * @return `null` = 放行（非 root 通道，或已授权）；非空 = 结构化拒绝 JSON。
+   */
+  internal fun rootGateRefusal(context: Context): JSONObject? {
+    if (RootGrant.isGranted(context)) return null
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    if (uid != RootGrant.ROOT_UID) return null
+    return JSONObject()
+      .put("ok", false)
+      .put("code", "root-grant-required")
+      .put("guidance", "Shizuku 通道正以 root（uid 0）运行，而「AI root 权限」未授权：特权通道已按策略关闭。" +
+        "到设置页「手机控制」查看免责声明、勾选「已阅读」并开启「AI root 权限」。")
+  }
 
   private fun unavailableShell(): JSONObject = JSONObject()
     .put("ok", false).put("code", "shizuku-user-service-not-bound")

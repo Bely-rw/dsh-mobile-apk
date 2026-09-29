@@ -102,6 +102,23 @@ internal object ShellOps {
       timeoutMs = args.optInt("timeoutMs", 20_000),
       capture = args.optBoolean("capture", false),
     )
+    // 2026-09-30（主人定例「我们不是做 root 适配吗」）：**su 直连回退**。
+    //
+    // 为什么：Shizuku 通道的可用性押在「Shizuku 已安装 + 在运行 + 已授权 + 服务端以 root 启动」
+    // 四件事上，任一不成立整条链就死（本机实测：服务端判 denied ⇒ 通道恒不可用 ⇒ 连属主自愈
+    // 都跑不了）。而本机 su 是好的 ⇒ 应用自身获 Root 管理器授权即可执行 root 命令。
+    // 判据：只在**通道级失败**（code 以 shizuku- 开头 / root-grant-required / 未绑定）时回退——
+    // 命令自身跑失败（exitCode≠0）不重跑（那是命令的事实，不是通道的问题）。
+    val code = result.optString("code")
+    val channelBroken = !result.optBoolean("ok") &&
+      (code.startsWith("shizuku-") || code == "root-grant-required" || code.startsWith("shell-transport"))
+    if (channelBroken && RootAccess.isGranted(context)) {
+      val viaSu = RootAccess.execRoot(context, command, args.optInt("timeoutMs", 20_000))
+      if (viaSu.optBoolean("ok") || viaSu.optString("code") != "no-su") {
+        audit(context, "shExec", command, resultOf(viaSu))
+        return viaSu.put("op", "shExec").put("transport", "su")
+      }
+    }
     audit(context, "shExec", command, resultOf(result))
     return result.put("op", "shExec").put("transport", "shizuku")
   }
