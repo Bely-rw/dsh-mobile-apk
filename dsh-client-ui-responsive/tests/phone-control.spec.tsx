@@ -10,6 +10,12 @@ import {
   settleUnlockCall,
   shizukuStateLabel,
   shizukuStepHint,
+  rootGrantStateLabel,
+  canToggleRootGrant,
+  rootGrantChannelHint,
+  rootAccessStateLabel,
+  canRequestRoot,
+  ROOT_GRANT_NOT_ROOT_TEXT,
 } from '../src/client/dev-section/phone-control.tsx'
 import { describeCallReason } from '../src/client/user-copy.ts'
 import { DEV_SECTION_CSS } from '../src/client/dev-section/dev-section.css.ts'
@@ -436,5 +442,289 @@ describe('手机控制纯函数（文案口径）', () => {
     expect(settleLinkCall(undefined, '成功', '打开失败').ok).toBe(false)
     expect(settleUnlockCall(JSON.stringify({ ok: true, message: '已解锁' }))).toEqual({ ok: true, text: '已解锁' })
     expect(settleUnlockCall(JSON.stringify({ ok: false, message: '解锁失败（权限不足）' })).text).toContain('权限不足')
+  })
+})
+
+/** 壳侧 rootGrantState() 的样本（字段与 RootGrant.state 一致）。 */
+function rootGrantJson(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    ok: true,
+    granted: false,
+    consentValid: false,
+    consentVersionCode: 0,
+    currentVersionCode: 100,
+    channelUid: 0,
+    channelRoot: true,
+    canToggle: true,
+    rootGranted: true,
+    rootState: 'granted',
+    honesty: '本开关是策略门与知情同意门，不是技术沙箱。',
+    ...over,
+  })
+}
+
+/** 壳侧 rootAccessState() 的样本（字段与 RootAccess.state 一致）。 */
+function rootAccessJson(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    ok: true,
+    suExists: true,
+    suPath: '/system/bin/su',
+    state: 'unknown',
+    uid: -1,
+    granted: false,
+    requesting: false,
+    manager: { package: 'me.weishu.kernelsu', label: 'KernelSU', installed: true },
+    guidance: '尚未检测——点「请求 root 授权」会弹出 Root 管理器的授权框。',
+    ...over,
+  })
+}
+
+describe('AI root 权限开关（issue #262 方案 A）', () => {
+  const grantedInput = (el: HTMLElement) =>
+    el.querySelector('input[aria-label="授权 AI 使用 root"]') as HTMLInputElement
+  const consentInput = (el: HTMLElement) =>
+    el.querySelector('input[aria-label="已阅读免责声明"]') as HTMLInputElement
+
+  it('真未 root（通道读不到/非 shell）：开关置灰 + 红字文案逐字在场（用户指定文案）', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({ channelUid: -1, channelRoot: false, canToggle: false }),
+    })
+    expect(grantedInput(el).disabled).toBe(true)
+    expect(consentInput(el).disabled).toBe(true)
+    const red = el.querySelector('.dsh-dev-error[data-code="not-root-channel"]')
+    expect(red, '红字必须在场').toBeTruthy()
+    expect(red!.textContent).toBe(ROOT_GRANT_NOT_ROOT_TEXT)
+    expect(ROOT_GRANT_NOT_ROOT_TEXT).toBe('无法在未 root 的设备上赋予该权限')
+  })
+
+  it('Shizuku 以 ADB 启动（uid 2000）：置灰 + 引导「以 root 启动」（不是未 root 红字）', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({ channelUid: 2000, channelRoot: false, canToggle: false }),
+    })
+    expect(grantedInput(el).disabled).toBe(true)
+    const hint = el.querySelector('[data-code="shizuku-shell-identity"]')
+    expect(hint, 'shell 身份引导必须在场').toBeTruthy()
+    expect(hint!.textContent).toContain('以 root 启动')
+    expect(el.querySelector('.dsh-dev-error[data-code="not-root-channel"]')).toBe(null)
+  })
+
+  it('root 通道 + 未确认：开关在场但不可开启（issue：未勾选时不可开启）', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({ consentValid: false }),
+    })
+    expect(grantedInput(el).disabled).toBe(true)
+    expect(grantedInput(el).checked).toBe(false)
+    expect(consentInput(el).disabled).toBe(false)
+    expect(el.querySelector('.dsh-dev-error[data-code="not-root-channel"]')).toBe(null)
+  })
+
+  it('root 通道 + 已确认：开关可点，切换走桥并回读', async () => {
+    const state = { granted: false, consent: true }
+    const setRootGranted = vi.fn((on: boolean) => { state.granted = on })
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({
+        granted: state.granted,
+        consentValid: state.consent,
+      }),
+      setRootGranted,
+    })
+    expect(grantedInput(el).disabled).toBe(false)
+    // jsdom + React：checkbox 的 onChange 由 click 派发（change 只对 select 生效）。
+    await act(async () => { grantedInput(el).click() })
+    expect(setRootGranted).toHaveBeenCalledWith(true)
+  })
+
+  it('已授权态：开关显示为已开启', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({ granted: true, consentValid: true }),
+    })
+    expect(grantedInput(el).checked).toBe(true)
+    expect(grantedInput(el).disabled).toBe(false)
+  })
+
+  it('勾选/取消「已阅读」走桥；取消即撤销（壳侧连带关开关）', async () => {
+    const setRootConsent = vi.fn()
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson(),
+      setRootConsent,
+    })
+    await act(async () => { consentInput(el).click() })
+    expect(setRootConsent).toHaveBeenCalledWith(true)
+  })
+
+  // ── 2026-09-30 用户实测缺陷的回归钉（撤销同意显示「失败：原因未在本版登记」）──
+  // 真因：壳侧 setConsent 回包缺 ok 字段 ⇒ settleLinkCall 判失败；拒收码又不在
+  // CALL_REASON 表 ⇒ describeCallReason 落兜底。两条桩各自钉一面：
+  it('结算只认 ok===true：壳侧回包缺 ok 时如实报失败（不假装成功）', () => {
+    const parsed = JSON.parse(rootGrantJson({ consentValid: true, consentVersionCode: 100 })) as Record<string, unknown>
+    delete parsed.ok
+    const settled = settleLinkCall(JSON.stringify(parsed), '已撤销同意', '撤销同意失败')
+    expect(settled.ok).toBe(false)
+    expect(settled.text).toContain('撤销同意失败')
+  })
+
+  it('勾选/撤销的成功回执与拒收翻译都走真源（不再出现「未在本版登记」）', () => {
+    // 成功形状（壳侧 setConsent 修后）：state + ok:true
+    const ok = settleLinkCall(rootGrantJson({ ok: true, consentValid: true }), '已记录「已阅读」', '记录失败')
+    expect(ok.ok).toBe(true)
+    expect(ok.text).toBe('已记录「已阅读」')
+    // 拒收形状（setRootGranted 未确认就开）：ok:false + reason=consent-required → 人话翻译
+    const refused = settleLinkCall(
+      rootGrantJson({ ok: false, reason: 'consent-required' }),
+      '已开启', '开启 AI root 权限失败',
+    )
+    expect(refused.ok).toBe(false)
+    expect(refused.text).toContain('免责声明')
+    expect(refused.text).not.toContain('未在本版登记')
+    // 非 root 通道拒收同理
+    const notRoot = settleLinkCall(
+      rootGrantJson({ ok: false, reason: 'not-root-channel', channelRoot: false }),
+      '已开启', '开启 AI root 权限失败',
+    )
+    expect(notRoot.text).toContain('root 身份')
+    expect(notRoot.text).not.toContain('未在本版登记')
+  })
+
+  it('免责声明链接点开走本地文档通道', async () => {
+    const openRootDisclaimer = vi.fn(() => JSON.stringify({ ok: true }))
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson(),
+      openRootDisclaimer,
+    })
+    const link = buttonByText(el, '《AI root 权限免责声明》')
+    await act(async () => { link.click() })
+    expect(openRootDisclaimer).toHaveBeenCalled()
+  })
+
+  it('状态不可读：开关置灰且不冒充任何状态（fail-closed 呈现）', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      // 壳桥缺席 → readRootGrant 回落 ROOT_GRANT_UNREADABLE
+    })
+    expect(grantedInput(el).disabled).toBe(true)
+    expect(el.textContent).toContain('状态不可读')
+  })
+})
+
+describe('AI root 权限纯函数（文案与判据口径）', () => {
+  const base = {
+    readable: true, granted: false, consentValid: false, channelUid: 0, channelRoot: true,
+    rootGranted: false, rootState: 'unknown', honesty: '',
+  }
+
+  it('rootGrantStateLabel 各态互不相同，顺序即判据顺序', () => {
+    expect(rootGrantStateLabel({ ...base, readable: false })).toBe('状态不可读')
+    expect(rootGrantStateLabel({ ...base, channelRoot: false })).toBe('通道不是 root，无法授权')
+    expect(rootGrantStateLabel(base)).toBe('未授权')
+    expect(rootGrantStateLabel({ ...base, granted: true })).toBe('已授权（AI 可用 root）')
+  })
+
+  it('canToggleRootGrant 只认通道身份：读不到或非 root 一律不可点', () => {
+    expect(canToggleRootGrant(base)).toBe(true)
+    expect(canToggleRootGrant({ ...base, readable: false })).toBe(false)
+    expect(canToggleRootGrant({ ...base, channelRoot: false, channelUid: 2000 })).toBe(false)
+  })
+
+  // issue #262 对账补（2026-09-30）：非 root 通道要**按通道身份分流**引导——
+  // uid 2000 = Shizuku 以 ADB 启动（设备可能已 root）⇒ 引导「在 Shizuku 内以 root 启动」；
+  // 其它 = 真未 root ⇒ 用户指定红字（逐字）。
+  it('rootGrantChannelHint 按通道身份分流（2000 → 引导重启为 root；其它 → 指定红字）', () => {
+    expect(rootGrantChannelHint({ ...base, channelRoot: true }).kind).toBe('none')
+    const shell = rootGrantChannelHint({ ...base, channelRoot: false, channelUid: 2000 })
+    expect(shell.kind).toBe('shell-identity')
+    expect(shell.text).toContain('以 root 启动')
+    expect(shell.text).not.toContain(ROOT_GRANT_NOT_ROOT_TEXT)
+    const notRoot = rootGrantChannelHint({ ...base, channelRoot: false, channelUid: -1 })
+    expect(notRoot.kind).toBe('not-root')
+    expect(notRoot.text).toBe(ROOT_GRANT_NOT_ROOT_TEXT)
+    expect(rootGrantChannelHint({ ...base, readable: false, channelRoot: false }).kind).toBe('none')
+  })
+})
+
+describe('应用级 Root 授权面（2026-09-30 主人定例）', () => {
+  it('各态状态词与判据（含 no-su / requesting / denied / timeout）', () => {
+    const base = {
+      readable: true, suExists: true, state: 'unknown', uid: -1, granted: false,
+      requesting: false, managerLabel: 'KernelSU', managerInstalled: true, guidance: '',
+    }
+    expect(rootAccessStateLabel({ ...base, readable: false })).toBe('状态不可读')
+    expect(rootAccessStateLabel(base)).toBe('未检测')
+    expect(rootAccessStateLabel({ ...base, state: 'granted', uid: 0, granted: true })).toBe('已授权（uid 0）')
+    expect(rootAccessStateLabel({ ...base, state: 'requesting', requesting: true })).toContain('允许')
+    expect(rootAccessStateLabel({ ...base, state: 'denied' })).toBe('已拒绝')
+    expect(rootAccessStateLabel({ ...base, state: 'timeout' })).toBe('授权框未响应')
+    expect(rootAccessStateLabel({ ...base, state: 'no-su', suExists: false })).toContain('su')
+  })
+
+  it('请求按钮判据：有 su 且无请求在飞才可点', () => {
+    const base = {
+      readable: true, suExists: true, state: 'unknown', uid: -1, granted: false,
+      requesting: false, managerLabel: '', managerInstalled: true, guidance: '',
+    }
+    expect(canRequestRoot(base)).toBe(true)
+    expect(canRequestRoot({ ...base, suExists: false })).toBe(false)
+    expect(canRequestRoot({ ...base, requesting: true })).toBe(false)
+    expect(canRequestRoot({ ...base, readable: false })).toBe(false)
+  })
+
+  it('页面渲染：授权行 + 三个入口在场，未检测时显示引导', async () => {
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson({ rootGranted: false, rootState: 'unknown' }),
+      rootAccessState: () => rootAccessJson(),
+    })
+    expect(el.textContent).toContain('Root 授权（应用自身）')
+    expect(el.textContent).toContain('未检测')
+    expect(el.textContent).toContain('KernelSU')
+    expect(buttonByText(el, '请求 root 授权')).toBeTruthy()
+    expect(buttonByText(el, '打开 Root 管理器')).toBeTruthy()
+    expect(buttonByText(el, '修复文件属主')).toBeTruthy()
+  })
+
+  it('请求授权走桥；管理器未装时按钮禁用', async () => {
+    const requestRootAccess = vi.fn(() => JSON.stringify({ ok: true, code: 'request-started' }))
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson(),
+      rootAccessState: () => rootAccessJson({ state: 'denied' }),
+      requestRootAccess,
+    })
+    await act(async () => { buttonByText(el, '请求 root 授权').click() })
+    expect(requestRootAccess).toHaveBeenCalled()
+
+    const el2 = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson(),
+      rootAccessState: () => rootAccessJson({
+        state: 'no-su', suExists: false,
+        manager: { package: '', label: '', installed: false },
+      }),
+    })
+    expect(buttonByText(el2, '请求 root 授权').disabled).toBe(true)
+    expect(buttonByText(el2, '打开 Root 管理器').disabled).toBe(true)
+    expect(el2.textContent).toContain('未检测到 Root 管理器')
+  })
+
+  it('修复文件属主回执带真实计数（不谎报「已修复」）', async () => {
+    const repairRootOwnership = vi.fn(() => JSON.stringify({
+      ok: true, channelUid: 0, checked: 42, healed: 3,
+    }))
+    const el = await render({
+      shizukuStatus: () => shizukuJson(),
+      rootGrantState: () => rootGrantJson(),
+      rootAccessState: () => rootAccessJson({ state: 'granted', granted: true, uid: 0 }),
+      repairRootOwnership,
+    })
+    await act(async () => { buttonByText(el, '修复文件属主').click() })
+    expect(repairRootOwnership).toHaveBeenCalled()
+    expect(el.textContent).toContain('已检查 42 个顶层条目')
+    expect(el.textContent).toContain('修复 3 个属主条目')
   })
 })

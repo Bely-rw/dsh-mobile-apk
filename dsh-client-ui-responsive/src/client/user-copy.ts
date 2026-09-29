@@ -42,6 +42,28 @@ const CALL_REASON: Readonly<Record<string, string>> = {
   'no-handler': '设备上没有能打开它的应用——请先安装浏览器或文件管理器',
   'not-installed': '还没安装 Shizuku——请先点「下载 Shizuku」',
 
+  // ── 壳侧：AI root 权限授权门（RootGrant，issue #262 / 0.14.2-fx-2-root.1）──
+  'consent-required': '先勾选「已阅读」并查看《AI root 权限免责声明》，才能开启 AI root 权限（升级后需重新确认）',
+  'not-root-channel': 'Shizuku 通道不是 root 身份（无法在未 root 的设备上赋予该权限）——请让 Shizuku 以 root 启动后再来开启',
+  'missing-asset': '应用内文档缺失（安装包不完整）——请重新安装应用后再试',
+  'ui-thread-timeout': '应用界面正忙——请稍后重试；多次失败可复制日志反馈',
+  'root-not-granted': '尚未获得 root 授权——授权框已弹出，请在手机上点「允许」；若没有弹出，请点「打开 Root 管理器」手动允许本应用使用 root',
+  'no-su': '本机没有可用的 su（未 root 或未安装 Root 管理器）——请先在 Root 管理器中完成 root 后再试',
+  'already-requesting': 'root 授权框已经弹出，请在手机上点「允许」',
+  // ── 壳侧：root 执行面与属主自愈（RootAccess / ShizukuTransport）────────────
+  'request-started': '已弹出 root 授权框，请在手机上点「允许」——授权后本页会自动续开开关',
+  requesting: 'root 授权框已弹出，请先点「允许」再重试',
+  'su-timeout': 'root 命令超时后被终止——请重试或缩短命令',
+  'su-exec-failed': 'root 命令执行失败——请稍后重试；多次失败可复制日志反馈',
+  'empty-command': '命令为空',
+  'no-data-dir': '读不到应用数据目录（应用上下文异常）——请重启应用后再试',
+  'bad-path': '路径无法解析',
+  'out-of-app-data': '只允许修复应用数据目录内的文件',
+  'repair-unsupported': '当前通道不支持属主修复（旧服务）——请到「手机控制」点「重置链接」重建通道后再试',
+  'repair-item-failed': '有属主条目修复失败——请检查 root 授权后重试',
+  'repair-incomplete': '属主修复未完成（仍有条目属主不对）——请重试',
+  'repair-truncated': '目标目录过大，只修了一部分——请缩小范围后重试',
+
   // ── 壳侧：内置浏览器加载（BrowserHost 的 load-error:<code>）────────────
   'load-error': '内置浏览器加载失败——请检查网址，或换用系统浏览器打开',
 }
