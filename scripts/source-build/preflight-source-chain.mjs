@@ -111,6 +111,7 @@ function stepMarketplaceChain() {
 function stepSourceBuildTests() {
   console.log('[4/5] 来源链单测')
   const suites = [
+    'source-chain-rerun.test.mjs',
     'preset-carriers.test.mjs',
     'restore-overlay-pins.test.mjs',
     'reconcile-engine-patch-copies.test.mjs',

@@ -40,6 +40,7 @@ jobs:
           node --test scripts/source-build/restore-overlay-pins.test.mjs
           node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
           node --test scripts/source-build/normalize-snapshot.test.mjs
+          node --test scripts/source-build/source-chain-rerun.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
@@ -125,8 +126,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp
-          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          # 已存在则复用：CI 每轮全新目录，本地复跑却会撞 `destination path already exists`。
+          # 下面几条 fetch/checkout 本身幂等，只有 clone 不是，故只守这一条。
+          if [ ! -d .deploy-tmp/deepseek-harness/.git ]; then
+            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          fi
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 477b4f420553e8a52c2fbccc464d7561b239c443
+          # A previous interrupted build may have modified tracked inputs before this checkout.
+          # Reset only this dedicated source checkout; preserve ignored dependency caches.
+          test "$(realpath .deploy-tmp/deepseek-harness)" = "$(realpath .)/.deploy-tmp/deepseek-harness"
+          git -C .deploy-tmp/deepseek-harness checkout -- .
+          git -C .deploy-tmp/deepseek-harness clean -fdq
           git -C .deploy-tmp/deepseek-harness checkout --detach 477b4f420553e8a52c2fbccc464d7561b239c443
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 7bedce822f2c6b076df167dff46eecf81bbd5de4
@@ -137,7 +147,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp/component-sources
-          git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
+          # 同上：已存在则复用，本地复跑不再撞 clone。
+          if [ ! -d .deploy-tmp/component-sources/host-web-compat/.git ]; then
+            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
+          fi
           git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 2de902729e01eb3619aa50bdfa164c5231948848
           git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 2de902729e01eb3619aa50bdfa164c5231948848
           test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "2de902729e01eb3619aa50bdfa164c5231948848"
@@ -210,7 +223,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.deploy-tmp/source-build"
+          # Previous stage interruption may leave the project overlay in its source-only form.
+          # Regenerate from the immutable audited project commit, not the previous run artifact.
+          git show "$GITHUB_SHA:scripts/snapshot-config/engine-overlay.json" > scripts/snapshot-config/engine-overlay.json
           cd .deploy-tmp/deepseek-harness
+          # 复跑安全：先把固定 checkout 复位到钉住状态。本步是「先全仓类型检查、再替换五个旧版
+          # Cordis 源码、再单独编译旧版包」；上一轮若在替换之后被杀，树会停在替换态，于是这一轮的
+          # **全仓检查**拿当前源码配旧版 loader，以 `loader/volatile-update` 之类报错假红（坑 187 的形态，
+          # 本地实测）。CI 每轮全新检出，本复位为无操作；`clean -fd` 不带 -x，不碰 node_modules 等忽略产物。
+          git checkout -- .
+          git clean -fdq
           corepack enable
           corepack pnpm install --frozen-lockfile
           corepack pnpm --version > "$GITHUB_WORKSPACE/.deploy-tmp/source-build/package-manager-versions.txt"
@@ -322,6 +344,12 @@ jobs:
             "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.json"
           corepack pnpm install --lockfile-only --no-frozen-lockfile
           corepack pnpm install --frozen-lockfile --ignore-scripts
+          # `pnpm deploy` 要求目标目录为空，否则 ERR_PNPM_DEPLOY_DIR_NOT_EMPTY；CI 每轮全新工作区
+          # 故从不暴露，本地复跑必撞。语义上这里要的就是「全新的部署树」，故清掉即忠实。
+          # Refuse an empty/misdirected workspace or symlinked staging parent before cleanup.
+          test -n "$GITHUB_WORKSPACE"
+          test "$(realpath "$GITHUB_WORKSPACE/.deploy-tmp")" = "$(realpath "$GITHUB_WORKSPACE")/.deploy-tmp"
+          rm -rf -- "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           corepack pnpm@12.2.0 --pm-on-fail=ignore --filter @deepseek-ai/dsh deploy --prod "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           cp pnpm-lock.yaml "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml"
           restore_deploy_inputs
@@ -430,9 +458,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp/source-build
-          curl --fail --location --retry 3 \
-            'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
-            --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          # Reuse only an authenticated cache hit; an interrupted curl may leave a partial ZIP.
+          # Read the canonical pin without importing/executing the bootstrap preparer.
+          bootstrap_sha256=$(python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          tree = ast.parse(Path("scripts/source-build/prepare-termux-bootstrap.py").read_text())
+          pins = [ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "BOOTSTRAP_SHA256" for target in node.targets)]
+          if len(pins) != 1 or len(pins[0]) != 64 or any(c not in "0123456789abcdef" for c in pins[0]):
+              raise ValueError("invalid bootstrap SHA-256 pin")
+          print(pins[0])
+          PY
+          )
+          if ! printf '%s  %s\n' "$bootstrap_sha256" .deploy-tmp/source-build/bootstrap-aarch64.zip | sha256sum --check --status 2>/dev/null; then
+            curl --fail --location --retry 3 \
+              'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
+              --output .deploy-tmp/source-build/bootstrap-aarch64.zip
+          fi
           # 先清空解包目标：本步对**同一目录**重跑不安全——上一轮按 SYMLINKS.txt 建出的符号链接
           # 会让这一轮的 safe_member 解析出界（报 `bootstrap path escaped staging root`）。
           # CI 每轮全新目录所以从不暴露，本地复跑必踩；清掉即幂等。
@@ -547,10 +590,15 @@ jobs:
         run: |
           set -euo pipefail
           ndk_archive=.deploy-tmp/source-build/android-ndk-r30-linux.zip
-          curl --fail --location --retry 3 \
-            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
-            --output "$ndk_archive"
-          printf '%s  %s\n' '5107f898313790e449e87eee2183d9a20602dee9' "$ndk_archive" | sha1sum --check -
+          ndk_sha1='5107f898313790e449e87eee2183d9a20602dee9'
+          # 已存在且钉死的哈希对得上就跳过下载：本地复跑省 704 MB（CI 每轮全新目录，无操作）。
+          # 跳过不等于放行——下面那条 sha1sum --check 无论下载与否都照跑。
+          if ! printf '%s  %s\n' "$ndk_sha1" "$ndk_archive" | sha1sum --check --status 2>/dev/null; then
+            curl --fail --location --retry 3 \
+              https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+              --output "$ndk_archive"
+          fi
+          printf '%s  %s\n' "$ndk_sha1" "$ndk_archive" | sha1sum --check -
           printf '%s\n' '5107f898313790e449e87eee2183d9a20602dee9' \
             > .deploy-tmp/source-build/ndk-archive-sha1.txt
           # 同上：`unzip` 无 -o，目录已在时会走交互式覆盖确认，非交互环境读到 EOF 即判死。

@@ -1218,3 +1218,28 @@
 219. **跨平台发布链不能假设 PowerShell 的 `$env:TEMP` 存在（2026-09-29，release run 36599977147）**：**现象**：两处 self-contained APK 根目录修复后，arm64 与 x86_64 均完成 runtime asset 门禁、快照指纹门禁和 `assembleDebug`；导出注入后快照时，`check-snapshot-asset.ps1` 在 `build-apk-013.ps1:485` 报 `Cannot bind argument to parameter 'Path' because it is null`，双 ABI 资产未归集，因而没有创建 draft Release。**真因**：Linux GitHub Actions 的 PowerShell 运行环境未提供 `$env:TEMP`，`Join-Path $env:TEMP ...` 生成 null 临时路径；Windows 本地环境有 TEMP，因此问题此前未暴露。**修法**：用 `[IO.Path]::GetTempPath()` 获取平台运行时临时目录；不降低 APK 内嵌快照与发布快照的一致性门禁。**复验证据**：失败日志显示两 ABI 的 `SNAPSHOT-FINGERPRINT CHECK PASSED` 与 `BUILD SUCCESSFUL`，仅 snapshot asset checker 在临时路径绑定处失败；修复后必须重新触发 workflow 并核验双 ABI 资产、MANIFEST 和 draft Release。
 
 
+
+220. **来源链的两处 `git clone` 没有「已存在则复用」守卫，本地复跑必撞（2026-09-29，本地链实测）**：
+    **现象**：同一工作区第二次跑 `scripts/source-build/run-local-source-chain.mjs` 时，第 3 步直接报 `fatal: destination path '.deploy-tmp/deepseek-harness' already exists and is not an empty directory`，链在开头就停。
+    **真因**：CI 每轮全新检出，`.deploy-tmp/` 恒为空，故 `git clone` 从不失败；而本地复跑时目录还在。**同一类不可重入**此前已修过两处（`bootstrap-extracted` 解包目录、NDK 的 `unzip` 无 `-o`），但 clone 这两处漏了——它们与那两处的区别只是「失败得早且直白」。
+    **修法**：两处 clone 加 `if [ ! -d <dir>/.git ]; then ... fi`；保留显式 commit 的 `git fetch --depth=1`、`checkout --detach`、`rev-parse` 断言；detach 前先复位该专用源码树，避免上一轮改过的 tracked 输入提前阻断 checkout。CI 上是无操作。
+    **为什么记进坑位**：有了本地链运行器（`run-local-source-chain.mjs`）之后，「链的幂等性」从 CI 的隐含前提变成**本地可观测的判据**；每加一处 `clone`/`unzip`/`tar -x` 到已有目录都要想一遍。判据不是「CI 绿」，而是「同一工作区连跑两次都绿」。
+
+221. **两处大件下载没有「已存在则跳过」守卫：本地每轮白下 ~735 MB（2026-09-29，本地链实测）**：
+    **现象**：本地链复跑时，NDK R30 Linux 归档（**704 MB**）与 Termux bootstrap（31 MB）即便已躺在 `.deploy-tmp/source-build/` 里，也每轮重新下载——两条 `curl --output` 无条件覆盖。
+    **真因**：与坑 220 同源（CI 每轮全新工作区，下载步骤从未被要求幂等），属「本地跑同一条链」暴露的第二类隐含前提。
+    **修法**：两处加「验哈希后跳过」守卫——NDK 先按钉死的 sha1 `--status` 校验，过则跳过下载；bootstrap 从 `prepare-termux-bootstrap.py` 的唯一 SHA-256 常量读取 cache-hit 判据，只有哈希命中才跳过，半包/坏缓存重新下载；该 Python 准备器仍在解包前无条件核验。**跳过不等于放行**：原有的哈希校验无论下载与否都照跑。
+    **为什么用「验哈希」而不是「看文件在不在」**：这两个输入都钉了哈希，验过再跳过才既不重下也不放过坏文件；对没有独立校验的下载（如 17 KB 的市场产物）另说。
+    **量化**：本地每轮省 ~735 MB；CI 侧无操作。Gradle 侧的一次性成本另计（发行版 + Maven 依赖，之后长期复用）。
+
+222. **Harness 构建步不复位固定 checkout：中途被杀后复跑会在全仓类型检查处假红（2026-09-29，本地链实测）**：
+    **现象**：本地链复跑时 Harness 构建步报 `packages/llm/llm-deepseek/src/host.ts(41,10): error TS2345: ... '"loader/volatile-update"' ...`（`llm-pi-ai` 同型），看着像上游源码不兼容。
+    **真因**：该步的顺序是「先全仓 `tsc -b tsconfig.host.json` → 再替换五个旧版 Cordis 源码 → 再单独编译旧版包」（坑 187 定的口径）。上一轮若在**替换之后**被杀，工作区就停在替换态；这一轮的全仓检查于是拿**当前**源码去配**旧版** loader，`loader/volatile-update` 之类事件自然不在旧版 `Events` 里 ⇒ 假红。CI 每轮全新检出，所以从未暴露。
+    **修法**：取源 detach 前与构建步首都复位专用 checkout（`git checkout -- .` + `git clean -fdq`，不带 `-x`，保留忽略依赖缓存）；构建步同时从本次 `GITHUB_SHA` 恢复权威 overlay 输入，避免上轮停在第一方 pin 已摘除的阶段而无法续跑。清理前验证 realpath 未脱离专用工作区。
+    **为什么记进坑位**：与坑 220/221 同族——**「可被杀」是本地跑链的常态**（关机、换盘、手停），因此每个「先改后还原」的步骤都要自带复位；判据仍是「同一工作区连跑两次都绿」。此坑尤其阴：报错文本指向源码不兼容，容易误导人去查上游。
+
+223. **`pnpm deploy` 目标目录非空，本地复跑必判红（2026-09-29，本地链实测）**：
+    **现象**：Harness 构建步报 `ERR_PNPM_DEPLOY_DIR_NOT_EMPTY`，指向 `.deploy-tmp/engine-deploy`。
+    **真因**：`pnpm deploy --prod <dir>` 要求目标目录为空或不存在；CI 每轮全新工作区故从不暴露，本地复跑时上一轮的部署树还在。
+    **修法**：deploy 前验证非空 workspace 与 `.deploy-tmp` 的 realpath，再仅清理引号内的绝对 `engine-deploy` 目标（不清理源码、缓存或 provenance 兄弟目录）。语义上这里需要全新部署树，CI 侧为无操作。
+    **同族**：坑 220（clone 无守卫）、221（大件重下）、222（构建步不复位）。四处都是同一个前提——**「工作区干净」是 CI 的隐含条件，不是链的语义**；本地跑链把这四条一次性暴露出来。判据统一为「同一工作区连跑两次都绿」。
