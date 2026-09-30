@@ -40,6 +40,7 @@ jobs:
           node --test scripts/source-build/restore-overlay-pins.test.mjs
           node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
           node --test scripts/source-build/normalize-snapshot.test.mjs
+          node --test scripts/source-build/source-chain-rerun.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
@@ -131,6 +132,11 @@ jobs:
             git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
           fi
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 477b4f420553e8a52c2fbccc464d7561b239c443
+          # A previous interrupted build may have modified tracked inputs before this checkout.
+          # Reset only this dedicated source checkout; preserve ignored dependency caches.
+          test "$(realpath .deploy-tmp/deepseek-harness)" = "$(realpath .)/.deploy-tmp/deepseek-harness"
+          git -C .deploy-tmp/deepseek-harness checkout -- .
+          git -C .deploy-tmp/deepseek-harness clean -fdq
           git -C .deploy-tmp/deepseek-harness checkout --detach 477b4f420553e8a52c2fbccc464d7561b239c443
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 183f08e9c6dde7e36cd2318eaee70b0da08fb35e
           git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 7bedce822f2c6b076df167dff46eecf81bbd5de4
@@ -217,6 +223,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.deploy-tmp/source-build"
+          # Previous stage interruption may leave the project overlay in its source-only form.
+          # Regenerate from the immutable audited project commit, not the previous run artifact.
+          git show "$GITHUB_SHA:scripts/snapshot-config/engine-overlay.json" > scripts/snapshot-config/engine-overlay.json
           cd .deploy-tmp/deepseek-harness
           # 复跑安全：先把固定 checkout 复位到钉住状态。本步是「先全仓类型检查、再替换五个旧版
           # Cordis 源码、再单独编译旧版包」；上一轮若在替换之后被杀，树会停在替换态，于是这一轮的
@@ -337,7 +346,10 @@ jobs:
           corepack pnpm install --frozen-lockfile --ignore-scripts
           # `pnpm deploy` 要求目标目录为空，否则 ERR_PNPM_DEPLOY_DIR_NOT_EMPTY；CI 每轮全新工作区
           # 故从不暴露，本地复跑必撞。语义上这里要的就是「全新的部署树」，故清掉即忠实。
-          rm -rf "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
+          # Refuse an empty/misdirected workspace or symlinked staging parent before cleanup.
+          test -n "$GITHUB_WORKSPACE"
+          test "$(realpath "$GITHUB_WORKSPACE/.deploy-tmp")" = "$(realpath "$GITHUB_WORKSPACE")/.deploy-tmp"
+          rm -rf -- "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           corepack pnpm@12.2.0 --pm-on-fail=ignore --filter @deepseek-ai/dsh deploy --prod "$GITHUB_WORKSPACE/.deploy-tmp/engine-deploy"
           cp pnpm-lock.yaml "$GITHUB_WORKSPACE/.deploy-tmp/source-build/pnpm-deploy-runtime-closure.lock.yaml"
           restore_deploy_inputs
@@ -446,9 +458,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .deploy-tmp/source-build
-          # 已存在则跳过下载：内容哈希由下一步的 prepare-termux-bootstrap.py 按固定值校验，
-          # 下载与否都验，故跳过不放过坏文件；本地复跑省一次 31 MB 往返（CI 无操作）。
-          if [ ! -f .deploy-tmp/source-build/bootstrap-aarch64.zip ]; then
+          # Reuse only an authenticated cache hit; an interrupted curl may leave a partial ZIP.
+          # Read the canonical pin without importing/executing the bootstrap preparer.
+          bootstrap_sha256=$(python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          tree = ast.parse(Path("scripts/source-build/prepare-termux-bootstrap.py").read_text())
+          pins = [ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "BOOTSTRAP_SHA256" for target in node.targets)]
+          if len(pins) != 1 or len(pins[0]) != 64 or any(c not in "0123456789abcdef" for c in pins[0]):
+              raise ValueError("invalid bootstrap SHA-256 pin")
+          print(pins[0])
+          PY
+          )
+          if ! printf '%s  %s\n' "$bootstrap_sha256" .deploy-tmp/source-build/bootstrap-aarch64.zip | sha256sum --check --status 2>/dev/null; then
             curl --fail --location --retry 3 \
               'https://github.com/termux/termux-packages/releases/download/bootstrap-2026.09.20-r1%2Bapt.android-7/bootstrap-aarch64.zip' \
               --output .deploy-tmp/source-build/bootstrap-aarch64.zip
