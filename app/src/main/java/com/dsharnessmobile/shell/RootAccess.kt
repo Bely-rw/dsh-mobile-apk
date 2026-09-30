@@ -3,7 +3,6 @@ package com.dsharnessmobile.shell
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
-import java.util.concurrent.TimeUnit
 
 /**
  * 应用级 root 授权面（2026-09-30 主人定例：「这个开关应该调用一下 root 弹窗，并且检测 root
@@ -131,6 +130,7 @@ object RootAccess {
         .put("installed", mgr != null),
     )
     out.put("guidance", guidance(effective, mgr?.second))
+    out.put("ownership", RootOwnershipJobs.state(context))
     return out
   }
 
@@ -156,7 +156,7 @@ object RootAccess {
   }
 
   /**
-   * 显式请求 root 授权：后台跑 `su -c id`（**这一步会触发管理器的授权弹窗**），立即返回。
+   * 显式检测 root 授权：后台跑 `su -c id -u` 取真实 uid，立即返回；不保证管理器自动弹窗。
    *
    * 幂等：已有请求在飞时不重复起（否则用户会看到一堆弹窗）。
    * 结果（granted / denied / timeout）写回缓存，页面靠既有 2s 轮询看到。
@@ -176,15 +176,15 @@ object RootAccess {
       var state = STATE_DENIED
       var uid = -1
       try {
-        val process = ProcessBuilder(su, "-c", "id").redirectErrorStream(true).start()
+        val process = ProcessBuilder(su, "-c", "/system/bin/id -u").redirectErrorStream(true).start()
         // **有界读取**（门禁 `check-bounded-io.mjs` 强制）：裸 `inputStream.readText()` 会读到 EOF
         // 才返回 ⇒ 超时形同虚设（用户在弹窗上不点、进程不退出时永久阻塞）；且「先 waitFor 再读」
         // 还会被子进程写满管道缓冲（~64KB）反卡。`ProcIo.readBounded` 同时给出三态
         // （exitTimedOut / drainTimedOut / truncated），「弹窗没响应」与「拒绝」得以分开。
         val result = ProcIo.readBounded(process, REQUEST_TIMEOUT_MS / 1000, 64 * 1024)
         state = when {
-          result.exitTimedOut -> STATE_TIMEOUT
-          result.text.contains("uid=0") -> {
+          !result.complete -> STATE_TIMEOUT
+          !result.truncated && result.text.trim() == "0" -> {
             uid = 0
             STATE_GRANTED
           }
@@ -216,66 +216,63 @@ object RootAccess {
    * 每个失败分支都带 `reason`（= code）：页面对 `ok:false` 只读 `reason` 翻人话
    * （`user-copy.ts` 的 CALL_REASON 唯一真源），只带 code 会落「未在本版登记」兜底。
    */
-  fun execRoot(context: Context, command: String, timeoutMs: Int = 20_000): JSONObject {
+  fun execRoot(context: Context, command: String, timeoutMs: Int = 20_000): JSONObject =
+    RootExecutionFence.command(context) {
+      val app = context.applicationContext
+      RootMaintenanceLease.begin(app, "su-shell")?.let { return@command it }
+      val result = execPrivileged(app, command, timeoutMs, requireAiGrant = true)
+      val refusedBeforeDispatch = !result.has("exitCode") && result.optString("code") in
+        setOf("no-su", "root-not-granted", "requesting", "empty-command", "root-grant-required")
+      val acknowledged = result.has("exitCode") && !result.optBoolean("exitTimedOut") &&
+        !result.optBoolean("drainTimedOut") && !result.optBoolean("cleanupIncomplete") && result.optString("readError").isEmpty()
+      if (refusedBeforeDispatch || acknowledged) {
+        if (RootMaintenanceLease.finish(app)) result else RootMaintenanceLease.markUnknown(app, "lease-clear-failed")
+      } else RootMaintenanceLease.markUnknown(app, "su-command-settlement-unknown").put("noReplay", true)
+    }
+
+  // Only the fixed native ownership-maintenance operation may use this private primitive without AI consent.
+  private fun execPrivileged(context: Context, command: String, timeoutMs: Int, requireAiGrant: Boolean): JSONObject {
     if (command.isBlank()) return fail("empty-command", "命令为空。")
     val su = suPath() ?: return fail("no-su", "本机没有可用的 su。")
     if (!isGranted(context)) {
       // 授权请求在飞时如实说「等待中」，不要报成「未授权」——那会让用户在弹窗还开着时看到莫名错误。
       return if (requesting) {
-        fail("requesting", "root 授权框已弹出，请在手机上点「允许」后重试。")
+        fail("requesting", "root 授权检测进行中；若没有弹窗，请在你使用的 Root 管理器里允许本应用。")
       } else {
-        fail("root-not-granted", "应用尚未获得 root 授权——请到设置页「手机控制」点「请求 root 授权」并在弹窗上允许。")
+        fail("root-not-granted", "应用尚未获得 root 授权——请在你使用的 Root 管理器里允许本应用，再到设置页检测授权。")
       }
     }
     val timeout = timeoutMs.coerceIn(500, 600_000)
     return try {
-      val process = ProcessBuilder(su, "-c", command).redirectErrorStream(false).start()
-      // 双流各自在 **daemon** 读线程里收集；缓冲区在 join 之后才读，避免跨线程可见性问题。
-      val outRef = java.util.concurrent.atomic.AtomicReference("")
-      val errRef = java.util.concurrent.atomic.AtomicReference("")
-      val outThread = Thread { streamReaderBody(process.inputStream, outRef) }
-      outThread.isDaemon = true
-      outThread.start()
-      val errThread = Thread { streamReaderBody(process.errorStream, errRef) }
-      errThread.isDaemon = true
-      errThread.start()
-      val finished = process.waitFor(timeout.toLong(), TimeUnit.MILLISECONDS)
-      if (!finished) {
-        // destroy() 不保证杀掉 su 起的孙进程（shell 里带后台任务时管道仍被持住）⇒ 强杀 + 短等。
-        runCatching { process.destroyForcibly() }
-        runCatching { process.waitFor(1, TimeUnit.SECONDS) }
-        outThread.join(500)
-        errThread.join(500)
-        return JSONObject().put("ok", false).put("code", "su-timeout").put("reason", "su-timeout")
-          .put("transport", "su").put("stdout", outRef.get()).put("stderr", errRef.get())
-          .put("guidance", "root 命令超时（${timeout}ms）后被终止。")
+      if (requireAiGrant && !RootGrant.isGranted(context)) {
+        return fail("root-grant-required", "AI root 权限未开启或当前版本的免责确认已失效。")
       }
-      outThread.join(1_000)
-      errThread.join(1_000)
-      val exit = process.exitValue()
+      // Keep the same merged-output convention as the Shizuku shell route, with a hard byte cap.
+      val process = ProcessBuilder(su, "-c", command).redirectErrorStream(true).start()
+      val output = ProcIo.readBoundedMillis(process, timeout.toLong())
+      val exit = if (output.exitTimedOut) -1 else runCatching { process.exitValue() }.getOrDefault(-1)
+      val code = if (output.timedOut) "su-timeout" else if (exit != 0) "su-command-failed" else ""
       JSONObject()
-        .put("ok", exit == 0)
+        .put("ok", output.complete && exit == 0)
         .put("transport", "su")
         .put("exitCode", exit)
-        .put("stdout", outRef.get())
-        .put("stderr", errRef.get())
-        .put("error", if (exit == 0) "" else "exit=$exit")
+        .put("stdout", output.text)
+        .put("stderr", "")
+        .put("exitTimedOut", output.exitTimedOut)
+        .put("drainTimedOut", output.drainTimedOut)
+        .put("truncated", output.truncated)
+        .put("cleanupIncomplete", output.cleanupIncomplete)
+        .put("readError", output.readError ?: "")
+        .put("code", code)
+        .put("reason", code)
+        .put("error", if (output.timedOut) output.marker() else if (exit == 0) "" else "exit=$exit")
     } catch (t: Throwable) {
       // 异常只进日志，不上屏（页面文案一律来自 CALL_REASON 真源）。
-      android.util.Log.w("dsh-root", "execRoot failed: " + t.javaClass.simpleName + ": " + (t.message ?: ""))
+      android.util.Log.w("dsh-root", "execRoot failed: " + t.javaClass.simpleName)
       fail("su-exec-failed", "root 命令执行失败——请稍后重试；多次失败可复制日志反馈。")
     }
   }
 
-  /**
-   * 读一条子进程流到 [sink]（daemon 线程体）。**收集完才 set**：缓冲区不跨线程共享，
-   * 避免 StringBuilder 并发写（旧实现两线程共写一个非线程安全缓冲，超时后仍在写）。
-   */
-  private fun streamReaderBody(stream: java.io.InputStream, sink: java.util.concurrent.atomic.AtomicReference<String>) {
-    val buf = StringBuilder()
-    runCatching { stream.bufferedReader().forEachLine { buf.append(it).append('\n') } }
-    sink.set(buf.toString())
-  }
 
   /** 结构化失败（`ok:false` + `code` + `reason` 同码 + 人话 guidance）。 */
   private fun fail(code: String, guidance: String): JSONObject = JSONObject()
@@ -284,60 +281,64 @@ object RootAccess {
   /** shell 单引号安全包裹（路径可能含空格/引号；命令由本文件拼，不接受调用方原始拼接）。 */
   private fun shq(raw: String): String = "'" + raw.replace("'", "'\\''") + "'"
 
-  /**
-   * su 版属主修复（不依赖 Shizuku 通道）：把 [path] 子树里不属于本应用 uid 的条目 chown 回来，
-   * 再尽力 restorecon。路径必须在应用数据目录内（canonical 前缀，fail-closed）。
-   *
-   * @return `{ok, scanned, fixed, truncated, error?}`（与 Shizuku 版同构，调用方无感切换）
-   */
-  fun repairOwnership(context: Context, path: String, maxEntries: Int = 20_000): JSONObject {
-    if (!isGranted(context)) {
-      return JSONObject().put("ok", false).put("code", "root-not-granted")
-        .put("guidance", "应用尚未获得 root 授权——无法修复属主。")
+  /** Fixed signed-APK ownership maintenance; this private transport exception is not a model shell. */
+  fun repairOwnership(context: Context, path: String, maxEntries: Int = 20_000,
+    timeoutMs: Long = OwnershipRepair.DEFAULT_TIMEOUT_MS): JSONObject = RootExecutionFence.maintenance(context) {
+      repairOwned(context, path, maxEntries, timeoutMs)
     }
+
+  private fun repairOwned(context: Context, path: String, maxEntries: Int, timeoutMs: Long): JSONObject {
     val app = context.applicationContext
-    val dataDir = runCatching { app.filesDir.parentFile?.canonicalPath }.getOrNull()
-      ?: return fail("no-data-dir", "读不到应用数据目录。")
-    val target = runCatching { java.io.File(path).canonicalPath }.getOrNull()
-      ?: return fail("bad-path", "路径无法解析。")
-    if (target != dataDir && !target.startsWith(dataDir + "/")) {
-      return fail("out-of-app-data", "只修应用数据目录内的文件。")
+    if (!isGranted(app)) return fail("root-not-granted", "应用尚未获得 root 授权，无法修复属主。")
+    val uid = app.applicationInfo.uid
+    val dataDir = app.applicationInfo.dataDir
+    if (!OwnershipRepair.isTrustedAppDataAnchor(dataDir, uid)) return fail("invalid-app-data-anchor", "应用数据目录无法确认。")
+    val relative = when {
+      path == dataDir -> ""
+      path.startsWith(dataDir + "/") -> path.substring(dataDir.length + 1)
+      path.startsWith('/') -> return fail("out-of-app-data", "仅允许修复本应用数据目录。")
+      else -> path
     }
-    val uid = android.os.Process.myUid()
-    val cap = maxEntries.coerceIn(1, 200_000)
-    // 一趟脚本：先数、再改、再复查**残余**（REMAIN 才是「真修好了吗」的判据）。
-    // 退出码必须反映 chown 结果——以 `echo` 结尾会让退出码恒 0 ⇒ chown 全失败也报 ok（静默失败）。
-    // ⚠️ **不加 `-P`**：Android 的 toybox find 只认 `[-HL]`，`-P` 会被判 `bad arg`（2026-09-30 真机
-    // 实测：加了它整条修复脚本失败、属主一条没修）；而 find 的**默认行为本就不跟随符号链接**
-    // （等价于 GNU 的 -P）⇒ 不加参数即是想要的安全语义。`-xdev` 不跨文件系统。
-    // 注意 Kotlin 字符串里的 `\$` 是**转义**（`$P` 会被当成本文件的变量插值，编译期 Unresolved reference）。
-    val script = "P=" + shq(target) + "; " +
-      "N=\$(find \"\$P\" -xdev -not -user " + uid + " 2>/dev/null | wc -l); " +
-      "find \"\$P\" -xdev -not -user " + uid +
-      " -exec chown " + uid + ":" + uid + " {} + 2>/dev/null; C=\$?; " +
-      "restorecon -R \"\$P\" 2>/dev/null; " +
-      "R=\$(find \"\$P\" -xdev -not -user " + uid + " 2>/dev/null | wc -l); " +
-      "S=\$(find \"\$P\" -xdev 2>/dev/null | wc -l); " +
-      "echo \"SCANNED=\$S FIXED=\$N REMAIN=\$R CHOWN_RC=\$C\"; exit \$C"
-    val result = execRoot(app, script, 120_000)
-    val stdout = result.optString("stdout")
-    val scanned = Regex("SCANNED=(\\d+)").find(stdout)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-    val fixed = Regex("FIXED=(\\d+)").find(stdout)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-    val remain = Regex("REMAIN=(\\d+)").find(stdout)?.groupValues?.get(1)?.toIntOrNull() ?: -1
-    val truncated = scanned > cap
-    // 成功判据 = 命令成功 **且** 残余为 0 **且** 未截断（拿不到 REMAIN 时按未证实处理，fail-closed）。
-    // 截断时必须报失败：未扫到的条目还留着，报 ok 就是「修了一半当修好了」（静默失败形态）。
-    val ok = result.optBoolean("ok") && remain == 0 && !truncated
-    return JSONObject()
-      .put("ok", ok)
-      .put("transport", "su")
-      .put("scanned", scanned)
-      .put("fixed", fixed)
-      .put("remaining", remain)
-      .put("truncated", truncated)
-      .put("error", result.optString("error"))
-      .put("reason", if (ok) "" else result.optString("reason").ifBlank { if (truncated) "repair-truncated" else "repair-incomplete" })
-      .put("code", if (ok) "" else result.optString("code").ifBlank { if (truncated) "repair-truncated" else "repair-incomplete" })
-      .put("guidance", if (ok) "" else result.optString("guidance").ifBlank { "属主修复未完成（残余 $remain 项）" })
+    val cap = maxEntries.coerceIn(1, OwnershipRepairCore.MAX_ENTRIES)
+    val budget = timeoutMs.coerceIn(1, OwnershipRepairCore.MAX_TIMEOUT_MS)
+    val args = arrayOf(uid.toString(), dataDir, relative, cap.toString(), budget.toString())
+    if (RootRepairMain.parse(args) == null) return fail("invalid-repair-arguments", "属主修复参数不合法。")
+    // The system-provided installed APK path is never replaced by a writable snapshot dex/JAR.
+    val apk = app.applicationInfo.sourceDir
+    if (apk.isNullOrBlank() || !File(apk).isFile) return fail("installed-apk-unavailable", "无法读取已安装的应用代码。")
+    val command = "CLASSPATH=" + shq(apk) + " /system/bin/app_process /system/bin " +
+      "com.dsharnessmobile.shell.RootRepairMain " + args.joinToString(" ") { shq(it) }
+    RootMaintenanceLease.begin(app, "su-ownership")?.let { return it }
+    val transport = execPrivileged(app, command, budget.toInt(), requireAiGrant = false)
+    if (!transport.has("exitCode") && transport.optString("code") in setOf("no-su", "root-not-granted", "requesting", "empty-command")) {
+      return if (RootMaintenanceLease.finish(app)) transport else RootMaintenanceLease.markUnknown(app, "lease-clear-failed")
+    }
+    if (transport.optBoolean("exitTimedOut") || transport.optBoolean("drainTimedOut") || transport.optBoolean("truncated") ||
+      transport.optBoolean("cleanupIncomplete") || transport.optString("readError").isNotEmpty()) {
+      return RootMaintenanceLease.markUnknown(app, "repair-transport-incomplete").put("transport", "su")
+    }
+    val parsed = runCatching {
+      val text = transport.optString("stdout").trim()
+      if (!text.startsWith('{') || !text.endsWith('}')) throw IllegalArgumentException("non-json-helper-output")
+      JSONObject(text)
+    }.getOrNull() ?: return RootMaintenanceLease.markUnknown(app, "repair-helper-output-invalid").put("transport", "su")
+    // An acknowledged helper result (even a rejected/partial repair) proves it has completed its fixed work.
+    val completeEnvelope = parsed.opt("ok") is Boolean &&
+      listOf("checked", "healed", "failures", "unverifiedMutations").all { key ->
+        parsed.opt(key) is Int && parsed.optInt(key, -1) >= 0
+      } && parsed.opt("remaining") is Int && parsed.optInt("remaining", -2) in setOf(-1, 0) &&
+      parsed.opt("truncated") is Boolean && parsed.opt("deadlineExceeded") is Boolean &&
+      transport.optInt("exitCode", -1) in setOf(0, 2)
+    if (!completeEnvelope) return RootMaintenanceLease.markUnknown(app, "repair-helper-envelope-incomplete").put("transport", "su")
+    if (!RootMaintenanceLease.finish(app)) return RootMaintenanceLease.markUnknown(app, "lease-clear-failed").put("transport", "su")
+    val verified = transport.optInt("exitCode", -1) == 0 && parsed.optBoolean("ok") &&
+      parsed.has("checked") && parsed.has("healed") && parsed.optInt("failures", -1) == 0 &&
+      parsed.optInt("unverifiedMutations", -1) == 0 && parsed.optInt("remaining", -1) == 0 &&
+      !parsed.optBoolean("truncated") && !parsed.optBoolean("deadlineExceeded")
+    return parsed.put("ok", verified).put("transport", "su").apply {
+      if (!verified && optString("reason").isBlank()) {
+        put("reason", "repair-incomplete").put("code", "repair-incomplete").put("remaining", -1)
+      }
+    }
   }
 }

@@ -254,8 +254,9 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
         val text = when {
           result == null -> ""
           skipped.isNotEmpty() -> ""
+          result.optString("reason") == "repair-result-unknown" -> "属主维护结果仍不明，请等待结算；不要重复请求。"
+          !result.optBoolean("ok") -> "属主维护未完成（已修复 $healed 项 / 失败 $failures 项）——请复制诊断日志后重试。"
           healed > 0 -> "已自动修复 $healed 个 root 属主条目（root 通道写盘遗留）——点上方按钮重试启动。"
-          failures > 0 -> "发现需修复的属主条目但修复失败（$failures 项）——请检查 root 授权后重试。"
           else -> ""
         }
         if (text.isNotEmpty()) pushHint(text, HintSource.PHASE, sticky = true)
@@ -268,6 +269,10 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       activity,
       GuideCallbacks(
         onStartEngine = {
+          val pending = RootMaintenanceLease.outstanding(activity.applicationContext)
+          if (pending != null || RootExecutionFence.maintenanceActive) {
+            applyGuideHint(pending?.optString("guidance") ?: "已有特权工作尚未结算，暂不修改运行时；请等待。")
+          } else {
           // 缺陷 D（fx-2）：同一个主按钮在 **Error 相位**下语义不同——它变成「安全模式启动」。
           // 分叉放在这里而不是换控件：`GuideChrome` 只有一个 primaryButton，
           // 复用它的既有样式/锁态/无障碍面比新增按钮更少出事面（也避免用 Phase==Error 之外的判据）。
@@ -278,6 +283,7 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
             // 「再试一次刷新」；不清账的话降级闸门会让他永远拿不到那次刷新，按钮就成了摆设。
             activity.engineManager.clearRefreshLedger()
             activity.startEngineFlow()
+          }
           }
         },
         onOpenConsole = { activity.startActivity(Intent(activity, ConsoleActivity::class.java)) },
@@ -424,7 +430,8 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     )
     // 回执看一小会儿，然后真的以 safe 状态重启（见方法注释：为什么留延时、为什么用 View 的 postDelayed）。
     chrome.root.postDelayed({
-      if (lastGuidePhase != GuidePhase.Error) return@postDelayed
+      if (activity.isDestroyed || activity.isFinishing || lastGuidePhase != GuidePhase.Error ||
+        RootMaintenanceLease.outstanding(activity.applicationContext) != null || RootExecutionFence.maintenanceActive) return@postDelayed
       activity.engineFlow.engineRetryCount = 0
       activity.engineManager.clearRefreshLedger()
       activity.startEngineFlow()

@@ -7,7 +7,7 @@ import org.json.JSONObject
  * 「AI root 权限」授权门（issue #262 方案 A：策略门 + 免责确认门 + 通道身份探测）。
  *
  * ── 本开关**不授予任何能力**（诚实性要求，issue 原文）────────────────────────────
- * root 能力来自「Shizuku 服务端以 root 启动」（通道身份 uid=0），不是本开关给的。
+ * root 能力来自真实 root Shizuku 或显式授权的 su，不是本开关给的；两条路径是替代关系。
  * 本开关真实的作用只有两件：
  *  1. **策略门**：通道身份为 root 且未授权时，特权执行面整体拒绝（见 [ShizukuTransport]
  *     的 rootGateRefusal）——不是按 op 分类放行（uid 0 下 `shExec` 是任意 shell，
@@ -17,8 +17,7 @@ import org.json.JSONObject
  *
  * ── 通道身份 ≠ 设备是否 root（探测判据，issue 原文）────────────────────────────
  * 已 root 但 Shizuku 以 ADB（uid 2000）启动的设备，通道只有 shell 权限——此时本开关
- * **置灰**并显示红字「无法在未 root 的设备上赋予该权限」（用户指定文案，逐字保留），
- * 引导「在 Shizuku 内以 root 启动」。判据只认通道 uid，不猜设备。
+ * 若也没有显式授权 su，开关才置灰并给通道/管理器引导；不能据 uid2000 猜设备未 root。
  *
  * ── 纯逻辑与持久化分离（与 [ShizukuBindState] 同纪律）──────────────────────────
  * 决策核心 [decision] 是纯函数（JVM 可测，不需要 Robolectric）：
@@ -38,8 +37,7 @@ object RootGrant {
 
   /**
    * 拒绝码：应用自身尚未从 Root 管理器获得 root 授权（2026-09-30 主人定例）。
-   * 这一支会**顺带触发 Root 管理器的授权弹窗**（[RootAccess.requestGrant]），
-   * 引导语里如实说明「弹窗已弹出 / 请去管理器授予」。
+   * 应用 su 未授权时的拒绝词；检测只由用户显式请求，不保证管理器自动弹窗。
    */
   const val CODE_ROOT_NOT_GRANTED = "root-not-granted"
 
@@ -69,7 +67,7 @@ object RootGrant {
     wantOn: Boolean,
   ): JSONObject? {
     if (!wantOn) return null // 关闭永远允许（撤销不是需要资格的动作）
-    if (channelUid != ROOT_UID) {
+    if (channelUid != ROOT_UID && !rootGranted) {
       return JSONObject().put("ok", false).put("code", CODE_NOT_ROOT_CHANNEL)
         .put("guidance", "无法在未 root 的设备上赋予该权限")
     }
@@ -77,15 +75,8 @@ object RootGrant {
       return JSONObject().put("ok", false).put("code", CODE_CONSENT_REQUIRED)
         .put("guidance", "先勾选「已阅读」并查看免责声明，才能开启 AI root 权限（升级后需重新确认）。")
     }
-    // 主人定例（2026-09-30）：开关要真走 root 授权流程——未获 Root 管理器授权就不放行，
-    // 由调用方顺带发起一次检测（见 setGranted），页面据 RootAccess.state 显示进度与引导。
-    // ★主人同日指正：**多数管理器不会自动弹授权框**（除 Magisk 外得自己打开管理器授予）✗
-    // ⇒ 文案不承诺弹窗，只说「在你使用的管理器里允许本应用」✓。
-    if (!rootGranted) {
-      return JSONObject().put("ok", false).put("code", CODE_ROOT_NOT_GRANTED)
-        .put("guidance", "尚未获得 root 授权——请在你自己使用的 Root 管理器里允许本应用使用 root" +
-          "（多数管理器不会自动弹授权框），然后回到本页重试。")
-    }
+    // Shizuku-root and explicitly granted su are independent root transports.
+    // Neither route bypasses the effective current-version AI consent at dispatch.
     return null
   }
 
@@ -96,7 +87,14 @@ object RootGrant {
   }
 
   /** 当前开关位（默认 false——fail-closed：装完/升级后 root 通道保持关闭）。 */
-  fun isGranted(context: Context): Boolean = prefs(context).getBoolean(KEY_GRANTED, false)
+  internal fun effectiveGrant(granted: Boolean, consentVersionCode: Int, currentVersionCode: Int): Boolean =
+    granted && consentVersionCode > 0 && consentVersionCode == currentVersionCode
+
+  fun isGranted(context: Context): Boolean = effectiveGrant(
+    prefs(context).getBoolean(KEY_GRANTED, false),
+    prefs(context).getInt(KEY_CONSENT_VC, 0),
+    BuildConfig.VERSION_CODE,
+  )
 
   /**
    * 勾选/取消「已阅读」。
@@ -110,7 +108,10 @@ object RootGrant {
   fun setConsent(context: Context, on: Boolean): JSONObject {
     val app = context.applicationContext
     if (on) {
-      prefs(app).edit().putInt(KEY_CONSENT_VC, BuildConfig.VERSION_CODE).apply()
+      // Reconfirming an expired consent must not silently reactivate the persisted old switch.
+      val keepGranted = isGranted(app)
+      prefs(app).edit().putBoolean(KEY_GRANTED, keepGranted)
+        .putInt(KEY_CONSENT_VC, BuildConfig.VERSION_CODE).apply()
     } else {
       // 撤销同意必须连带关开关：只清同意而留着 granted=true 会让「未同意但已授权」
       // 成为可达状态，而那个状态正是免责门要杜绝的。
@@ -136,21 +137,6 @@ object RootGrant {
     )
     if (refusal == null) {
       prefs(app).edit().putBoolean(KEY_GRANTED, on).apply()
-    } else if (refusal.optString("code") == CODE_ROOT_NOT_GRANTED) {
-      // 主人定例：开关要「调用一下 root 弹窗」——被本门拦住时**当场触发授权请求**，
-      // 弹窗随即出现；页面靠既有 2s 轮询看到 requesting/granted，并在授权后自动续开
-      // （见 phone-control.tsx 的 pendingEnable）。
-      RootAccess.requestGrant(app)
-      // 2026-09-30 复核补：这一支**不是失败**，是「请求进行中」——回包必须如实这么说，
-      // 否则页面先弹「开启失败」红字、2 秒后又自己开起来（提示与实际结果自相矛盾）。
-      val started = RootAccess.state(app)
-      return state(app, uid)
-        .put("ok", false)
-        .put("code", "request-started")
-        .put("reason", "request-started")
-        .put("requesting", true)
-        .put("guidance", "root 授权框已弹出，请在手机上点「允许」——授权后本页会自动续开开关。")
-        .put("rootState", started.optString("state"))
     }
     // 拒绝回包同时带 `reason`（= code）：页面结算的人话翻译只读 reason（user-copy.ts 的
     // CALL_REASON 唯一真源），code 留给 data-code/grep。两个都不带会落「未在本版登记」兜底。
@@ -168,23 +154,24 @@ object RootGrant {
   /**
    * 设置页读面：授权位 + 同意有效性 + 通道身份三件事一次带出。
    *
-   * `channelRoot=false` ⇒ 界面把开关置灰并显示红字文案（[CODE_NOT_ROOT_CHANNEL] 同源）。
-   * 通道 uid 读不到（未装/未跑/未授权）按 -1 处理——同样置灰，不猜。
+   * `channelRoot=false` 不排除显式 su 授权；两条路径都不可用才禁止开启。
+   * 通道 uid 读不到按 -1，不猜 root；已开启的开关仍允许关闭，consent 始终可撤销。
    */
   fun state(context: Context, channelUid: Int): JSONObject {
     val consent = prefs(context).getInt(KEY_CONSENT_VC, 0)
     val valid = consent > 0 && consent == BuildConfig.VERSION_CODE
     return JSONObject()
-      .put("granted", prefs(context).getBoolean(KEY_GRANTED, false))
+      .put("granted", isGranted(context))
       .put("consentValid", valid)
       .put("consentVersionCode", consent)
       .put("currentVersionCode", BuildConfig.VERSION_CODE)
       .put("channelUid", channelUid)
       .put("channelRoot", channelUid == ROOT_UID)
-      .put("canToggle", channelUid == ROOT_UID)
+      .put("canToggle", channelUid == ROOT_UID || RootAccess.isGranted(context))
       // 应用级 root 授权（Root 管理器）——开关放行的第三道门，UI 单独一行展示进度与引导。
       .put("rootGranted", RootAccess.isGranted(context))
       .put("rootState", RootAccess.state(context).optString("state"))
+      .put("ownership", RootOwnershipJobs.state(context))
       // 诚实性说明（issue 要求：做不到技术隔离时不得把不成立的隔离写成事实）：
       .put(
         "honesty",

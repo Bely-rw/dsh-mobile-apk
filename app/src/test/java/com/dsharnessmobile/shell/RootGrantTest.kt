@@ -11,10 +11,9 @@ import java.io.File
 /**
  * 「AI root 权限」授权门（issue #262 方案 A）的决策回归。
  *
- * 测的是纯函数 [RootGrant.decision]——与 [ShizukuBindStateTest] 同纪律：
- * 生产面不存在测试注入点，持久化薄壳不进 JVM 测试（无 Robolectric）。
- * 判据全部来自 issue #262 的已确证前提：
- *  - 探测判据用**通道身份**（uid==0）而不是「设备是否 root」；
+ * 纯决策与执行面源码契约；SharedPreferences/Activity 薄壳不进 JVM 测试。
+ * 0.14.3：Shizuku-root 与显式授权的应用 su 是替代路径，不是叠加条件。
+ *  - Shizuku 路径只认真实通道 uid==0，应用 su 路径只认显式授权；
  *  - 打开前必须先过免责确认门（同意与 versionCode 绑定）；
  *  - 关闭永远允许（撤销不是需要资格的动作）。
  */
@@ -25,11 +24,12 @@ class RootGrantTest {
     consentVersionCode: Int,
     currentVersionCode: Int = 100,
     wantOn: Boolean = true,
-    rootGranted: Boolean = true,
+    rootGranted: Boolean = false,
+    granted: Boolean = false,
   ): JSONObject? = RootGrant.decision(
     channelUid = channelUid,
     rootGranted = rootGranted,
-    granted = false,
+    granted = granted,
     consentVersionCode = consentVersionCode,
     currentVersionCode = currentVersionCode,
     wantOn = wantOn,
@@ -41,7 +41,7 @@ class RootGrantTest {
   }
 
   @Test
-  fun `non-root channel is refused even with consent`() {
+  fun `non-root channel without alternate su is refused even with consent`() {
     // 通道身份 ≠ 设备是否 root：uid 2000（Shizuku 以 ADB 启动）与读不到（-1）都算非 root，
     // 假绿（已 root 设备上按设备判据放行）是 issue 点名的缺陷形态。
     for (uid in listOf(2000, -1, 10241)) {
@@ -71,21 +71,40 @@ class RootGrantTest {
     assertNull(decision(channelUid = 0, consentVersionCode = 100, wantOn = false, rootGranted = false))
   }
 
-  /**
-   * 第三道门（2026-09-30 主人定例）：应用自身未从 Root 管理器获得授权 ⇒ 开关不放行，
-   * 由调用方（[RootGrant.setGranted]）顺带弹出授权框，页面据 [RootAccess.state] 显示进度。
-   */
   @Test
-  fun `root channel with valid consent still requires app-level root grant`() {
-    val refusal = decision(channelUid = 0, consentVersionCode = 100, rootGranted = false)
-    assertNotNull("未获 Root 管理器授权时必须拒绝", refusal)
-    assertEquals(RootGrant.CODE_ROOT_NOT_GRANTED, refusal!!.opt("code"))
-    assertTrue(
-      "拒绝语必须说清「授权框已弹出 / 去管理器」",
-      refusal.optString("guidance").contains("授权框") && refusal.optString("guidance").contains("Root 管理器"),
-    )
-    // 三道门都过才放行
-    assertNull(decision(channelUid = 0, consentVersionCode = 100, rootGranted = true))
+  fun `root transports are alternatives not cumulative requirements`() {
+    assertNull(decision(channelUid = 0, consentVersionCode = 100, rootGranted = false))
+    assertNull(decision(channelUid = -1, consentVersionCode = 100, rootGranted = true))
+    assertNull(decision(channelUid = 2000, consentVersionCode = 100, rootGranted = true))
+    assertNotNull(decision(channelUid = -1, consentVersionCode = 100, rootGranted = false))
+    assertEquals(RootGrant.CODE_CONSENT_REQUIRED,
+      decision(channelUid = -1, consentVersionCode = 99, rootGranted = true)!!.opt("code"))
+  }
+
+  @Test
+  fun `effective execution grant rejects absent revoked and stale consent`() {
+    for (current in listOf(-1, 0, 1, 100)) {
+      for (granted in listOf(false, true)) {
+        for (consent in listOf(-1, 0, 1, 99, 100, 101)) {
+          assertEquals("grant=$granted consent=$consent current=$current",
+            granted && consent > 0 && consent == current,
+            RootGrant.effectiveGrant(granted, consent, current))
+        }
+      }
+    }
+  }
+
+  @Test
+  fun `fallback accepts only known pre-dispatch unavailability`() {
+    for (code in listOf("root-grant-required", "consent-required", "shell-transport-failed",
+      "shizuku-unknown", "shizuku-exec-failed", "shizuku-configuration-required",
+      "shizuku-identity-failed", "root-maintenance-busy", "repair-result-unknown", "", "exit=1")) {
+      assertEquals(code, false, ShellOps.canFallbackBeforeDispatch(code))
+    }
+    for (code in listOf("shizuku-absent", "shizuku-not-running", "shizuku-denied", "shizuku-prev11",
+      "shizuku-user-service-not-bound", "shizuku-user-service-too-old")) {
+      assertTrue(code, ShellOps.canFallbackBeforeDispatch(code))
+    }
   }
 
   @Test
@@ -98,31 +117,141 @@ class RootGrantTest {
 
   // ── 源码契约：门的接线不得被无声拆除 ────────────────────────────
 
-  /**
-   * [ShizukuTransport] 的**两个**执行面入口（readyService 覆盖 runShell/pull/push/remove，
-   * runController 覆盖虚拟屏控制器命令）都必须在进任何绑定/执行之前过 rootGateRefusal。
-   * 单边改动不会有编译错误——只能用源码契约钉住。
-   */
+  private fun source(name: String): String = listOf(
+    File("src/main/java/com/dsharnessmobile/shell", name),
+    File("app/src/main/java/com/dsharnessmobile/shell", name),
+  ).firstOrNull { it.isFile }?.readText()?.lineSequence()?.filterNot {
+    val line = it.trimStart()
+    line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")
+  }?.joinToString("\n") ?: throw AssertionError("找不到源码 $name")
+
+  private fun body(name: String, signature: String): String {
+    val text = source(name)
+    val start = text.indexOf(signature)
+    if (start < 0) throw AssertionError("找不到成员 $name: $signature")
+    val next = Regex("(?m)^  (?:(?:private|internal|override) )?fun ")
+      .find(text, start + signature.length)?.range?.first ?: text.length
+    return text.substring(start, next)
+  }
+
+  private fun assertBefore(text: String, first: String, second: String) {
+    val a = text.indexOf(first)
+    val b = text.indexOf(second)
+    assertTrue("$first 必须在 $second 前，且两处都必须在执行代码中", a >= 0 && b > a)
+  }
+
   @Test
-  fun `transport execution surfaces call the root gate`() {
-    val source = listOf(
-      File("src/main/java/com/dsharnessmobile/shell/ShizukuTransport.kt"),
-      File("app/src/main/java/com/dsharnessmobile/shell/ShizukuTransport.kt"),
-    ).firstOrNull { it.isFile }
-      ?: throw AssertionError("找不到 ShizukuTransport.kt")
-    val text = source.readText()
-    assertTrue(
-      "readyService 必须过 rootGateRefusal（runShell/pullFile/pushFile/removeRemote 的共同入口）",
-      Regex("readyService\\(context: Context, applyGate: Boolean = true\\)[\\s\\S]{0,700}?if \\(applyGate\\) rootGateRefusal").containsMatchIn(text),
-    )
-    assertTrue(
-      "策略门只许被应用自愈面（repairOwnership）以 applyGate=false 绕过——模型执行面一律带门",
-      Regex("readyService\\(context, applyGate = false\\)").findAll(text).count() == 1,
-    )
-    assertTrue(
-      "runController 必须过 rootGateRefusal（虚拟屏控制器命令入口）",
-      Regex("fun runController\\(context: Context, argv: Array<String>\\): JSONObject \\{[\\s\\S]{0,400}?rootGateRefusal").containsMatchIn(text),
-    )
+  fun enableRequiresEitherTransportAndCurrentConsentRegardlessOfOldSwitch() {
+    for (uid in listOf(-1, 0, 2000, 10241)) {
+      for (su in listOf(false, true)) {
+        for (oldGrant in listOf(false, true)) {
+          for (consent in listOf(-1, 0, 99, 100, 101)) {
+            val refusal = decision(uid, consent, rootGranted = su, granted = oldGrant)
+            val expectedCode = when {
+              uid != 0 && !su -> RootGrant.CODE_NOT_ROOT_CHANNEL
+              consent != 100 -> RootGrant.CODE_CONSENT_REQUIRED
+              else -> null
+            }
+            assertEquals("uid=$uid su=$su oldGrant=$oldGrant consent=$consent",
+              expectedCode, refusal?.optString("code"))
+            assertNull(decision(uid, consent, wantOn = false, rootGranted = su, granted = oldGrant))
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  fun allShizukuCommandSurfacesAreFencedAndGatedBeforeDispatch() {
+    val ready = body("ShizukuTransport.kt", "private fun readyService(")
+    assertBefore(ready, "if (applyGate) rootGateRefusal(context)", "ensureBound(context)")
+    assertBefore(ready, "if (pv < ShizukuUserServiceBridge.PROTOCOL_VERSION)", "configureIfNeeded(context)")
+    assertBefore(ready, "configureIfNeeded(context)", "if (applyGate) actualIdentityRefusal(context, remote)")
+    assertBefore(ready, "actualIdentityRefusal(context, remote)", "return remote to null")
+    for (name in listOf("runShell", "pullFile", "pushFile", "removeRemote", "runController")) {
+      val entry = body("ShizukuTransport.kt", "fun $name(")
+      assertTrue("$name 必须在命令 fence 内调用对应内部入口",
+        entry.contains("= RootExecutionFence.command(context) {") && entry.contains(name + "Internal(context,"))
+    }
+    val controller = body("ShizukuTransport.kt", "private fun runControllerInternal(")
+    assertBefore(controller, "rootGateRefusal(context)", "ensureBound(context)")
+    assertBefore(controller, "remote.protocolVersion()", "configureIfNeeded(context)")
+    assertTrue(controller.contains("< ShizukuUserServiceBridge.PROTOCOL_VERSION"))
+    assertBefore(controller, "configureIfNeeded(context)", "actualIdentityRefusal(context, remote)")
+    assertBefore(controller, "actualIdentityRefusal(context, remote)", "remote.exec(argv,")
+  }
+
+  @Test
+  fun v4ConfigurationAcknowledgementBindsExactAppIdentityBeforeReady() {
+    assertTrue(source("ShizukuUserService.kt").contains("const val PROTOCOL_VERSION = 4"))
+    val configure = body("ShizukuTransport.kt", "private fun configureIfNeeded(")
+    assertBefore(configure, "remote.protocolVersion() < ShizukuUserServiceBridge.PROTOCOL_VERSION", "remote.configure(uid, root)")
+    assertBefore(configure, "remote.configure(uid, root)", "val ack = remote.configuration()")
+    for (check in listOf("""ack.getBoolean("ok")""", """ack.getInt("appUid", -1) == uid""",
+      """ack.getString("appDataDir") == root""",
+      """ack.getInt("protocolVersion", -1) >= ShizukuUserServiceBridge.PROTOCOL_VERSION""")) {
+      assertBefore(configure, check, "if (valid) configuredForAge = age")
+    }
+    assertTrue("未确认或异常不得记为就绪", configure.contains("false"))
+  }
+
+  @Test
+  fun onlyFixedNativeOwnershipMaintenanceMayBypassAiGate() {
+    val text = source("ShizukuTransport.kt")
+    assertEquals(1, Regex("""readyService\(context, applyGate = false\)""").findAll(text).count())
+    val repair = body("ShizukuTransport.kt", "fun repairOwnership(")
+    assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false)")
+    assertBefore(repair, "configureIfNeeded(context)", "remote.repairOwnership(path, maxEntries)")
+    val direct = body("ShizukuTransport.kt", "internal fun autoHealOwnershipDirect(")
+    assertTrue(direct.contains("= RootExecutionFence.maintenance"))
+    assertTrue(direct.contains("""java.io.File(app.applicationInfo.dataDir, "files")"""))
+  }
+
+  @Test
+  fun effectiveCurrentConsentFeedsBothPrebindAndActualIdentityGates() {
+    val grant = body("RootGrant.kt", "fun isGranted(")
+    assertTrue(grant.contains("= effectiveGrant("))
+    assertTrue(grant.contains("KEY_GRANTED") && grant.contains("KEY_CONSENT_VC") && grant.contains("BuildConfig.VERSION_CODE"))
+    val state = body("RootGrant.kt", "fun state(")
+    assertTrue(state.contains(""".put("granted", isGranted(context))"""))
+    assertTrue(body("ShizukuTransport.kt", "internal fun rootGateRefusal(").contains("RootGrant.isGranted(context)"))
+    val actual = body("ShizukuTransport.kt", "private fun actualIdentityRefusal(")
+    assertTrue(actual.contains("remote.uid()") && actual.contains("!RootGrant.isGranted(context)"))
+    assertTrue(actual.contains("uid != 0 && uid != 2000"))
+  }
+
+  @Test
+  fun suModelDispatchIsFencedAndConsumesEffectiveAiConsentBeforeProcessStart() {
+    val entry = body("RootAccess.kt", "fun execRoot(")
+    assertTrue(entry.contains("RootExecutionFence.command(context) {"))
+    assertTrue(entry.contains("requireAiGrant = true"))
+    val dispatch = body("RootAccess.kt", "private fun execPrivileged(")
+    assertBefore(dispatch, "if (!isGranted(context))", "ProcessBuilder(su,")
+    assertBefore(dispatch, "if (requireAiGrant && !RootGrant.isGranted(context))", "ProcessBuilder(su,")
+    val repair = body("RootAccess.kt", "fun repairOwnership(")
+    assertTrue(repair.contains("= RootExecutionFence.maintenance"))
+  }
+
+  @Test
+  fun consentRevokeAndReconsentNeedNoRootAndCannotReviveExpiredGrant() {
+    val consent = body("RootGrant.kt", "fun setConsent(")
+    assertBefore(consent, "val keepGranted = isGranted(app)", "putBoolean(KEY_GRANTED, keepGranted)")
+    assertTrue(consent.contains("putInt(KEY_CONSENT_VC, 0).putBoolean(KEY_GRANTED, false)"))
+    assertTrue(consent.contains("""put("ok", true)"""))
+    assertTrue("同意记录不是资格探测或 root 执行", !consent.contains("decision(") &&
+      !consent.contains("RootAccess.requestGrant(") && !consent.contains("RootAccess.isGranted("))
+  }
+
+  @Test
+  fun nativeUiRepairSubmitsSingleFlightAndRootGrantReadsSharedSettlement() {
+    val bridge = body("AndroidBridge.kt", "fun repairRootOwnership(")
+    assertTrue(bridge.contains("RootOwnershipJobs.request(app)"))
+    assertTrue("UI 桥不能等 Binder 维护完成", !bridge.contains("runBlocking(") && !bridge.contains("autoHealOwnership("))
+    assertTrue(body("RootGrant.kt", "fun state(").contains(""".put("ownership", RootOwnershipJobs.state(context))"""))
+    val request = body("RootOwnershipJobs.kt", "fun request(")
+    assertTrue(request.contains("val started = start(context)"))
+    assertTrue(request.contains("\"repair-started\"") && request.contains("\"repair-running\""))
+    assertTrue(!request.contains("await(") && !request.contains("join("))
   }
 
   /**

@@ -142,7 +142,7 @@ class CallSiteContractTest {
   @Test
   fun engineServiceAlsoRunsTheRecoveryPrelude() {
     val code = codeOnly(source("EngineService.kt"))
-    val ensureEngine = memberBody(code, "private fun ensureEngine()")
+    val ensureEngine = memberBody(code, "private fun ensureEngine(epoch: ServiceEpoch)")
     val recoverAt = ensureEngine.indexOf("recoverInterruptedRefresh()")
     val watchdogAt = ensureEngine.indexOf("WatchdogV2.acquireWakeLock")
     assertTrue("FX-210.1：服务路径必须调恢复入口", recoverAt >= 0)

@@ -552,14 +552,15 @@ class AndroidBridge(
    *
    * root 通道（Shizuku 以 root 启动）里 UserService 的 uid=0，它写的文件属主是 root:root；
    * 落进应用数据目录（files/...）就是**应用自己读不回来**（0600）⇒ watcher / 插件更新 /
-   * 引擎读写失败。本方法做**有界抽查 + 有界修复**（只在通道身份为 root 时动作）。
-   * 返回 `{ok, channelUid, checked, healed, skipped?}`。
+   * 引擎读写失败。本方法异步启动单飞、有界深度修复（Shizuku root 或显式授权 su）。
+   * 立即返回 `{ok, code:repair-started|repair-running, running, startedAt, ...}`；
+   * `rootGrantState().ownership` 的既有轮询读取真实结算 `result`，提交成功不等于修复完成。
    */
   @JavascriptInterface
   fun repairRootOwnership(): String {
     val app = ShellAppContext.get()
       ?: return """{"ok":false,"reason":"no-shell-context"}"""
-    return ShizukuTransport.autoHealOwnership(app).toString()
+    return RootOwnershipJobs.request(app).toString()
   }
 
   /**

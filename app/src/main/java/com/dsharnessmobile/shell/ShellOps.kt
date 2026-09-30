@@ -110,9 +110,9 @@ internal object ShellOps {
     // 判据：只在**通道级失败**（code 以 shizuku- 开头 / root-grant-required / 未绑定）时回退——
     // 命令自身跑失败（exitCode≠0）不重跑（那是命令的事实，不是通道的问题）。
     val code = result.optString("code")
-    val channelBroken = !result.optBoolean("ok") &&
-      (code.startsWith("shizuku-") || code == "root-grant-required" || code.startsWith("shell-transport"))
-    if (channelBroken && RootAccess.isGranted(context)) {
+    // Policy refusals and ambiguous post-dispatch Binder failures must never replay a command.
+    val channelBroken = !result.optBoolean("ok") && !result.optBoolean("noReplay") && canFallbackBeforeDispatch(code)
+    if (channelBroken && RootGrant.isGranted(context) && RootAccess.isGranted(context)) {
       val viaSu = RootAccess.execRoot(context, command, args.optInt("timeoutMs", 20_000))
       if (viaSu.optBoolean("ok") || viaSu.optString("code") != "no-su") {
         audit(context, "shExec", command, resultOf(viaSu))
@@ -122,6 +122,11 @@ internal object ShellOps {
     audit(context, "shExec", command, resultOf(result))
     return result.put("op", "shExec").put("transport", "shizuku")
   }
+
+  internal fun canFallbackBeforeDispatch(code: String): Boolean = code in setOf(
+    "shizuku-absent", "shizuku-not-running", "shizuku-denied", "shizuku-prev11",
+    "shizuku-user-service-not-bound", "shizuku-user-service-too-old", "shizuku-identity-failed",
+  )
 
   private fun pull(context: Context, args: JSONObject): JSONObject {
     val remote = args.optString("remote", "")

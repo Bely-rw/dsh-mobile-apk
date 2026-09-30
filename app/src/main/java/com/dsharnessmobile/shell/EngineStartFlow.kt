@@ -19,9 +19,8 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   /** Minimum spacing between retries of a failed engine page (see the monitor below). */
   private val ENGINE_PAGE_RELOAD_INTERVAL_MS = 30_000L
 
-  private val flowRunning = java.util.concurrent.atomic.AtomicBoolean(false)
-  /** Invalidates stale startup work when the user closes or explicitly restarts the engine. */
-  private val flowGeneration = java.util.concurrent.atomic.AtomicLong(0)
+  private val flowOwnership = StartupFlowOwnership()
+  private val ownershipRetry = StartupOwnershipRetryBudget()
   private val updateRunning = java.util.concurrent.atomic.AtomicBoolean(false)
   /** 重启引擎 in-flight 守卫（防连点双杀双启）。 */
   private val engineRestarting = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -40,15 +39,20 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   @Volatile private var bootStallReported = false
   /** Throttles retries of an engine page that failed while the engine was still booting. */
   private var lastEnginePageReloadAt = 0L
+  @Volatile private var monitorGeneration = 0L
   private val engineMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private val engineMonitorRunnable = object : Runnable {
     override fun run() {
+      if (!canRunEngineWork()) return
+      if (!activity.pageUiActive || activity.userClosedEngine) return
+      val generation = monitorGeneration
       val monitor = this
       Thread {
         val probe = try { EngineProbe.check(1_500) } catch (_: Exception) { null }
         val httpAlive = probe?.optBoolean("running", false) == true
         val portAlive = EngineProbe.portReachable(500)
         activity.runOnUiThread {
+          if (generation != monitorGeneration || !activity.pageUiActive || !canRunEngineWork()) return@runOnUiThread
           if (activity.webViewReady && activity.guideViewReady && !activity.userClosedEngine) {
             if (httpAlive || portAlive) {
               engineMonitorFailures = 0
@@ -69,7 +73,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
                   // ERR_CONNECTION_REFUSED 上，而现场没有任何一行说明「我们试过重载但没成功」。
                   // 吞掉无害清理可以，吞掉用户正在等的那个恢复动作不行。
                   try {
-                    activity.webView.reload()
+                    activity.retryFailedEnginePage()
                   } catch (e: Exception) {
                     Log.w("dsh-shell", "engine page reload failed", e)
                   }
@@ -93,7 +97,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   // Android 12 仍卡「Loading plugins…」且页面无诊断层 = 渲染进程 JS 主线程冻结，
   // 页面内看门狗定时器也跑不动）。evaluateJavascript 的 JS 在渲染进程执行，App
   // 主线程不受影响：主线程周期发 JS 心跳，回调不再返回即判渲染进程失活 →
-  // Toast 提示 + 自动 reload 一次 + 记日志。 ——
+  // 前台静默 reload 一次 + 记日志；后台时间不参与冻结判定。 ——
   private val freezeHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private var jsAckAt = System.currentTimeMillis()
   private var pageLoadedAt = System.currentTimeMillis()
@@ -101,22 +105,17 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   private var freezeReloaded = false
   private val freezeRunnable = object : Runnable {
     override fun run() {
-      if (!activity.webViewReady || activity.userClosedEngine || activity.webView.visibility != View.VISIBLE) return
+      if (!canRunEngineWork()) return
+      if (!activity.pageUiActive || !activity.webViewReady || activity.userClosedEngine || activity.webView.visibility != View.VISIBLE) return
       val now = System.currentTimeMillis()
       if (now - pageLoadedAt > 45_000 && now - jsAckAt > 20_000) {
-        LogCollector.log("dsh-shell", "webview JS 无响应，渲染进程冻结（frozenMs=" + (now - jsAckAt) + "）")
-        try {
-          android.widget.Toast.makeText(
-            activity, "页面无响应，正在自动刷新…", android.widget.Toast.LENGTH_LONG,
-          ).show()
-        } catch (_: Exception) {
-        }
         if (!freezeReloaded) {
           freezeReloaded = true
+          LogCollector.log("dsh-shell", "webview JS 无响应，渲染进程冻结（frozenMs=" + (now - jsAckAt) + "）")
           // 0.14.1 D3：与上面的引擎页重载同族——冻结自愈的唯一动作失败时必须留下痕迹，
           // 否则日志里只有「检测到冻结」，看不出「自愈没生效」。
           try {
-            activity.webView.reload()
+            activity.reloadEnginePage()
           } catch (e: Exception) {
             Log.w("dsh-shell", "freeze recovery reload failed", e)
           }
@@ -126,7 +125,9 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       } else if (!pingOutstanding) {
         pingOutstanding = true
         try {
+          val generation = monitorGeneration
           activity.webView.evaluateJavascript("1") { _ ->
+            if (generation != monitorGeneration || !activity.pageUiActive) return@evaluateJavascript
             jsAckAt = System.currentTimeMillis()
             pingOutstanding = false
           }
@@ -140,9 +141,16 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** onResume 前台引擎监控启动（幂等移除后重投）。 */
   fun startMonitor() {
+    if (!canRunEngineWork()) return
+    if (!activity.pageUiActive || activity.userClosedEngine) return
+    monitorGeneration++
+    engineMonitorFailures = 0
+    // Background time is not evidence of a frozen renderer or stalled foreground boot.
+    bootStallStartAt = System.currentTimeMillis()
     engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
     engineMonitorHandler.post(engineMonitorRunnable)
     startBootStallWatchdog()
+    startFreezeWatchdog()
   }
 
   // ── 块L：boot 卡住诊断（「engineHttp=200 却一直 loading」可诊断）────────────
@@ -176,6 +184,8 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   private val bootStallHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private val bootStallRunnable = object : Runnable {
     override fun run() {
+      if (!activity.pageUiActive || !canRunEngineWork()) return
+      val generation = monitorGeneration
       try {
         val stalledMs = System.currentTimeMillis() - bootStallStartAt
         // 判据三合一：①页面**未**自报就绪（真信号）；②该 epoch 未报过；③页面可见、未被用户关闭、
@@ -196,7 +206,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
             }
             // 页面仍未就绪且引擎健康 ⇒ 这才是真卡住。pageReadyReported 必须再查一次
             // （后台线程可能已收到 ready；竞态下宁可少报也不少报——误报正是本次要修的缺陷）。
-            if (pageReadyReported) { bootStallReported = false; return@Thread }
+            if (pageReadyReported || generation != monitorGeneration || !activity.pageUiActive || !canRunEngineWork()) { bootStallReported = false; return@Thread }
             val detail = "stalledMs=" + stalled +
               " engineHttp=ok pageReady=false pageClosed=false" +
               " hint=page-side-fiber-state-unavailable-from-shell"
@@ -222,6 +232,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
    * 但**置位本身是永久的**——一旦页面就绪，本 epoch 不再有 stall 判定。
    */
   fun onPageReadyReported(rawLine: String) {
+    if (!canRunEngineWork()) return
     pageReadyReported = true
     if (pageReadyLogged) return
     pageReadyLogged = true
@@ -239,6 +250,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
    * 直接落 pageSideRuntime（不再是 unavailable）。
    */
   fun onPageStallReported(rawLine: String) {
+    if (!canRunEngineWork()) return
     try {
       val runtime = extractPageSideRuntime(rawLine)
       LogCollector.writeBootDiag(
@@ -283,15 +295,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     bootStallHandler.postDelayed(bootStallRunnable, 5_000)
   }
 
-  /** onDestroy 兜底：停止前台监控与页面冻结看门狗。 */
+  /** Pause/destroy/renderer-loss: stop Activity page monitoring, never the EngineService task watchdog. */
   fun stopMonitoring() {
+    monitorGeneration++ // Reject HTTP/JS callbacks already in flight at pause or renderer loss.
+    engineMonitorFailures = 0
+    pingOutstanding = false
     engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
     freezeHandler.removeCallbacks(freezeRunnable)
     bootStallHandler.removeCallbacks(bootStallRunnable)
   }
 
   fun startFreezeWatchdog() {
-    if (activity.userClosedEngine || !activity.webViewReady || activity.webView.visibility != View.VISIBLE) return
+    if (!canRunEngineWork()) return
+    if (!activity.pageUiActive || activity.userClosedEngine || !activity.webViewReady || activity.webView.visibility != View.VISIBLE) return
     val now = System.currentTimeMillis()
     pageLoadedAt = now
     jsAckAt = now
@@ -347,7 +363,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   /** 开发者选项「关闭」：停止引擎并回退到初始化（启动/测试）界面，不自动重启。 */
   fun shutdownToGuide() {
     activity.userClosedEngine = true
-    flowGeneration.incrementAndGet()
+    flowOwnership.invalidate()
     EngineService.setUserShutdown(activity, true)
     engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
     freezeHandler.removeCallbacks(freezeRunnable)
@@ -367,9 +383,11 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** 引擎启动超时/失败后进入自动回撤流程：UndoGate 幂等，安全多次调用。 */
   private fun maybeAutoUndo(generation: Long) {
-    if (activity.userClosedEngine) return
-    Thread {
+    if (!isCurrentEngineFlow(generation)) return
+    val token = flowOwnership.tokenFor(generation) ?: return
+    val caller = Thread {
       try {
+        requireCurrentEngineFlow(generation)
         // 引擎全死时先决门槛：急救 CLI 存在 + 快照非空 + 幂等窗口。
         // 0.14.1：阈值必须用 effectiveFailureCount（半死与 DEAD 共用计数），与看门狗侧
         // EngineService.kt 的 undoReady 同口径。旧实现只读 consecutiveFailures —— 而该计数在
@@ -377,10 +395,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 永远达不到阈值，自动回撤静默不可达（与 planTick 的熔断锁存同族盲区）。
         // DEAD 路径不受影响：DEAD 下 consecutiveDegradedHttp 恒 0，两个计数相等。
         if (!UndoGate.onProbeFailure(activity, WatchdogV2.effectiveFailureCount())) return@Thread
+        requireCurrentEngineFlow(generation)
         activity.runOnUiThread {
+          if (!isCurrentEngineFlow(generation)) return@runOnUiThread
           activity.applyGuidePhase(GuidePhase.Undoing, "正在执行回撤…", "正在恢复到崩溃前的最后良好快照。")
         }
+        requireCurrentEngineFlow(generation)
         val result = UndoGate.execute(activity, activity.engineManager)
+        requireCurrentEngineFlow(generation)
         if (result.executed) {
           // 恢复配置文件后重启引擎（冷却窗复位由 UndoGate 完成后置零）。
           // 0.14.1：undo 成功即解除熔断锁存（与 EngineService 的 UNDO 分支同口径）——tripped 一旦
@@ -393,6 +415,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
             LogCollector.log("dsh-guide", "undo applied snapshot=" + (result.snapshotId ?: "?"))
             activity.applyGuidePhase(GuidePhase.Recovering, "回撤完成，正在重启引擎…", "已恢复到上一次可用的运行时状态。")
           }
+          requireCurrentEngineFlow(generation)
           activity.engineManager.resetCooldown()
           if (isCurrentEngineFlow(generation)) activity.engineManager.startEngine()
         } else {
@@ -402,9 +425,13 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           }
         }
       } catch (t: Throwable) {
-        Log.e("dsh-shell", "auto-undo failed", t)
+        if (isCurrentEngineFlow(generation)) Log.e("dsh-shell", "auto-undo failed", t)
+      } finally {
+        token.detach(Thread.currentThread())
       }
-    }.start()
+    }
+    token.attach(caller)
+    caller.start()
   }
 
   /** 引擎启动超时（startEngineFlow 轮询失败后调用）：触发自动回撤。 */
@@ -436,41 +463,71 @@ internal class EngineStartFlow(private val activity: MainActivity) {
    * engine, then poll until the web service answers.
    */
   fun start() {
-    // onCreate and the following onResume can both request startup. Acquire the
-    // flow before mutating lifecycle state so a duplicate cannot invalidate the
-    // actual starter.
-    if (!flowRunning.compareAndSet(false, true)) return
-    val generation = flowGeneration.incrementAndGet()
+    if (!canRunEngineWork()) return
+    // The owner and generation change in one CAS; an obsolete finally cannot
+    // clear a replacement, and duplicate lifecycle callbacks change neither.
+    val token = flowOwnership.begin() ?: return
+    val generation = token.generation
+    if (!isCurrentEngineFlow(generation)) { flowOwnership.finish(token); return }
     // 新启动世代 = boot-stall 的新 epoch：在此复位（**不在** onPageFinished。
     // onPageFinished 只代表文档加载完，在那里复位会造成同 epoch 重复报，见 L-1）。
     resetBootStall()
-    activity.userClosedEngine = false
-    EngineService.setUserShutdown(activity, false)
-    engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
-    engineMonitorHandler.post(engineMonitorRunnable)
-    Thread {
+    startMonitor()
+    val caller = Thread {
       try {
+      if (!isCurrentEngineFlow(generation)) return@Thread
+      // Repair before any transaction reads: root-owned marker/stage leaves can break recovery too.
+      val ownership = ShizukuTransport.prepareStartupOwnership(activity.applicationContext)
+      if (!isCurrentEngineFlow(generation)) return@Thread
+      if (startupOwnershipPending(ownership.optString("reason"))) {
+        // Pending is not startup failure: no undo, toast, fresh/read or worker replay.
+        activity.runOnUiThread {
+          if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+          activity.applyGuidePhase(GuidePhase.Recovering, "正在等待属主维护完成…", "维护结果尚未结算，暂不读取或更新运行时；服务会有限次静默重试。")
+        }
+        ownershipRetry.nextDelayMs()?.let { delay ->
+          engineMonitorHandler.postDelayed({
+            if (isCurrentEngineFlow(generation) && activity.pageUiActive) start()
+          }, delay)
+        }
+        return@Thread
+      }
+      if (!ownership.optBoolean("ok")) LogCollector.log("dsh-root", "preboot ownership repair incomplete: " + ownership.optString("reason"))
       if (!isCurrentEngineFlow(generation)) return@Thread
       // FX-210.1（源文档 §3.3 B1 顺序约束）：恢复入口是「服务路径与 Activity 路径」的
       // 共同前置——引擎已被前台服务拉起时重开 app 也要消费 .snapshot-transaction 判据，
       // 因此它必须排在「引擎已在跑」早退之前（顺序由 startupRecoverThenProbe 保证）。
       val engineAlreadyRunning = startupRecoverThenProbe(
         recover = {
+          requireCurrentEngineFlow(generation)
           activity.engineManager.recoverInterruptedRefresh()
+          requireCurrentEngineFlow(generation)
           // 0.14.2-fx-2 缺口：恢复期**拒绝回滚**此前只有 logcat/诊断面，没有任何界面提示，
           // 用户数据被保护了却不知情。这里落结构化码 + 一次性标记 + 诊断包；可见面由
           // MainActivity 在引擎页面就绪后注入 DOM（引导页会被 showWeb 盖掉，故不切引导页相位）。
           // 不阻断启动：恢复失败只意味着「这棵树还没收敛」，引擎仍可能正常起。
-          reportRecoveryRejectionIfAny(activity, activity.engineManager.pendingRecoveryFailure)
+          reportRecoveryRejectionIfAny(activity, activity.engineManager.pendingRecoveryFailure) { isCurrentEngineFlow(generation) }
         },
         // Health `running` intentionally includes arbitrary 401s for watchdog semantics; startup
         // early-exit needs ownership proof and must not treat an unrelated local listener as ours.
         probeRunning = {
+          requireCurrentEngineFlow(generation)
           val ownership = activity.engineManager.probeAvailability()
           ownership == EngineProbe.EngineAvailability.OUR_PROCESS ||
             ownership == EngineProbe.EngineAvailability.OUR_HTTP
         },
       )
+      requireCurrentEngineFlow(generation)
+      activity.engineManager.snapshotFingerprintProblem()?.let { problem ->
+        requireCurrentEngineFlow(generation)
+        LogCollector.writeBootFail(activity, problem.failureCode.orEmpty(), problem.detail.orEmpty())
+        activity.runOnUiThread {
+          if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+          activity.applyGuidePhase(GuidePhase.Error, "安装包运行时指纹不可用", problem.detail)
+          activity.showGuide()
+        }
+        return@Thread
+      }
       if (engineAlreadyRunning) {
         // P-AC-04：这条早退路径不经过 spawn 观察线程，补一次 listen 标记（幂等；本进程没记过
         // t_boot_start 时按「未知」记 -1 落盘，而不是让三字段整行缺失）。
@@ -490,18 +547,6 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       }
       // 中断事务已由启动前置（startupRecoverThenProbe）恢复——此处只做新鲜度判定。
       if (!isCurrentEngineFlow(generation)) return@Thread
-      // 2026-09-30（主人一问换来：「root 属主会导致无法启动，你在设置里弄真有用吗」）：
-      // **启动前置属主自愈**——必须在快照判定与引擎启动**之前**跑。
-      //
-      // 为什么不能在设置页等用户点：root 通道写盘留下的 root:root 属主会让引擎/快照事务
-      // 读不了自己的文件（usr/bin/node、引擎包、profile 包）⇒ **启动即挂**，而启动挂了的用户
-      // 根本进不到设置页，修复按钮形同虚设。放在这里 = 污染在咬人之前被清掉。
-      //
-      // 有界且不阻塞判定：无 root 路径（su 未授权且 Shizuku 非 root）时立即返回；
-      // 有 root 路径时做有界抽查 + 有界修复（顶层几十次 stat，命中才整棵修）。失败静默——
-      // 自愈不是启动路径的前置条件，它的失败不能把启动也拖死。
-      runCatching { ShizukuTransport.autoHealOwnership(activity.applicationContext) }
-      if (!isCurrentEngineFlow(generation)) return@Thread
       if (!activity.engineManager.snapshotFresh()) {
         if (!isCurrentEngineFlow(generation)) return@Thread
         // 0.14.1 D2（issue #240 建议 2）：**降级闸门**。同一份快照上刷新已连续失败达阈、
@@ -513,6 +558,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 出口：换快照（App 升级 → fingerprint 变 → 账本自然失配）或用户手动点「重试」
         // （GuidePageRenderer 的 onStartEngine 会 clearRefreshLedger，见那里）。
         if (activity.engineManager.shouldDegradeRefresh()) {
+          requireCurrentEngineFlow(generation)
           LogCollector.writeBootFail(
             activity, "snapshot-refresh-degraded",
             "自动刷新连续失败达阈且 live 运行时完整：跳过本次自动刷新，以现有运行时启动"
@@ -536,6 +582,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           // 于是文案以毫秒级频率换句 -> 用户现场「一直在闪」。
           // 本次刷新开始前复位一次，使第一句立刻可见、时间窗从此刻起算。
           activity.guideRenderer.resetRuntimeStageRotation()
+          requireCurrentEngineFlow(generation)
           val ok = activity.engineManager.refreshSnapshot(
             onProgress = { _, _ ->
               activity.runOnUiThread {
@@ -562,6 +609,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
               }
             },
           )
+          requireCurrentEngineFlow(generation)
           if (!ok) {
             // 任务 19：失败终态落盘（快照解压失败是「启动起不来」的已知成因之一）。
             // 【0.14.1 升级路径 P0】必须带上**真因**：`refreshSnapshot` 只回布尔值，真因挂在
@@ -609,7 +657,9 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       if (!isCurrentEngineFlow(generation)) return@Thread
       // 急救 CLI 随 App 版本部署（内容比对幂等）：下探失败时自动回撤的前置依赖。
       activity.engineManager.deployUndoCli()
+      requireCurrentEngineFlow(generation)
       if (!activity.engineManager.startEngine()) {
+        requireCurrentEngineFlow(generation)
         // 任务 19：失败终态落盘（此前这条路径**零落盘**——用户反馈第一条的真因）。
         //
         // issue #271 ④：区分「被前置条件拒绝」与「spawn 真失败」。半搬态（live 树缺 node）
@@ -648,11 +698,13 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 必须触发重新认证，**不能**当成「已就绪」放行（旧实现正是这样把用户留在 401 页面且无出口），
         // 也**不能**当成「引擎死亡」（`running` 仍含 401 ⇒ engineProcessAlive 路径不变，D3/W2 不受影响）。
         val probe = EngineProbe.check()
+        requireCurrentEngineFlow(generation)
         if (probe.optString("auth") == "required") {
           // A startup probe is not ownership evidence by itself: an unrelated local
           // listener can also answer 401. Reuse the same exact-origin/main-frame
           // policy before clearing or refreshing any cookie state.
           val availability = activity.engineManager.probeAvailability()
+          requireCurrentEngineFlow(generation)
           if (EngineProbe.shouldAutoRecoverAuth(401, true, EngineProbe.ENGINE_URL, availability)) {
             LogCollector.log("dsh-engine-start", "owned engine answered 401 during boot: re-authenticating (cookie rejected)")
             runCatching { EngineAuth.handleUnauthorized(activity) }
@@ -675,6 +727,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           LogCollector.markFirstHttp(activity)
           // 0.13.8 #174：引擎就绪钩子——补投冷启动期间待发的来件通知（拷贝完成时
           // 引擎尚未 listen 的竞态路径；fail-soft，失败留在待发清单等下一轮）。
+          requireCurrentEngineFlow(generation)
           try { FileIncoming.flushPending(activity) } catch (_: Throwable) {}
           break
         }
@@ -714,9 +767,11 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // ── task-79（Bug A）：动态链接失败 ⇒ 判定运行时树损坏并触发一次重抽取 ──────────
         // 必须在**当拍**读 engine.log：`rotateEngineLog` 每次 spawn 都把 engine.log 截断重写，
         // 而真机上引擎每 4-10 秒就被拉起一次 ⇒ 等下一拍再读，现场已经被下一次启动冲掉。
-        maybeSelfHealDamagedRuntimeTree(activity)
+        requireCurrentEngineFlow(generation)
+        maybeSelfHealDamagedRuntimeTree(activity) { isCurrentEngineFlow(generation) }
         // 0.13.1 W3：进程死亡现场镜像到共享目录（含退出码），用户可直接取包反馈。
         // review C5：文案按实际落点回填（共享不可写时回落私有目录）。
+        requireCurrentEngineFlow(generation)
         val dir = activity.engineManager.mirrorDiagnosticsToShared("engine-died-during-boot")
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
@@ -735,9 +790,10 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       }
       if (booted) {
         // task-79：启动成功 ⇒ 清掉「运行时树损坏」标记（若不成功，标记留着供诊断与后续决策）。
-        clearRuntimeTreeDamageMarker(activity)
+        clearRuntimeTreeDamageMarker(activity) { isCurrentEngineFlow(generation) }
+        requireCurrentEngineFlow(generation)
         startEngineService()
-        applyShizukuKeepAlive()
+        applyShizukuKeepAlive(generation)
         activity.runOnUiThread { if (isCurrentEngineFlow(generation)) activity.showWeb() }
       } else {
         // 进程还活着但 90s 内未就绪（异常慢）：灰色提示而非红色错误，不触发回退——
@@ -759,6 +815,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       }
       return@Thread
       } catch (t: Throwable) {
+        if (!isCurrentEngineFlow(generation) || t is java.util.concurrent.CancellationException || t is InterruptedException) return@Thread
         // **任务 19 的根因之一（关键）**：本 try **此前没有 catch**（只有 finally），于是启动线程里
         // 任何异常（NoSuchMethodError / OOM / 空指针等）都被抛到线程默认处理器——**壳侧零落盘**，
         // logcat 里也可能什么都没有。这正是用户反馈「启动失败时几乎不留任何诊断日志」的直接成因：
@@ -775,14 +832,32 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           activity.showGuide()
         }
       } finally {
-        flowRunning.set(false)
+        token.detach(Thread.currentThread())
+        flowOwnership.finish(token)
       }
-    }.start()
+    }
+    token.attach(caller)
+    caller.start()
   }
 
-  /** True only for the active startup request and while the user has not closed it. */
+  private fun canRunEngineWork(): Boolean =
+    !flowOwnership.destroyed && !activity.isDestroyed && !activity.isFinishing && !activity.userClosedEngine &&
+      !EngineService.userShutdown && !Thread.currentThread().isInterrupted
+
+  /** Also rejects completion callbacks after destruction or global user shutdown. */
   private fun isCurrentEngineFlow(generation: Long): Boolean =
-    !activity.userClosedEngine && flowGeneration.get() == generation
+    canRunEngineWork() && flowOwnership.isCurrent(generation)
+
+  private fun requireCurrentEngineFlow(generation: Long) {
+    if (!isCurrentEngineFlow(generation)) throw java.util.concurrent.CancellationException("obsolete engine startup caller")
+  }
+
+  /** Cancel this Activity's callers, never the process-wide root maintenance worker. */
+  fun destroy() {
+    flowOwnership.invalidate(destroy = true)
+    stopMonitoring()
+    engineMonitorHandler.removeCallbacksAndMessages(null)
+  }
 
   /** Run the runtime snapshot update; status mirrored to a file for adb verification. */
   fun runUpdate() {
@@ -810,6 +885,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** Start the foreground service (engine keep-alive + watchdog). */
   fun startEngineService() {
+    if (!canRunEngineWork() || flowOwnership.destroyed) return
     try {
       activity.startForegroundService(Intent(activity, EngineService::class.java))
     } catch (_: Exception) {
@@ -818,12 +894,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   }
 
   /** Best-effort Shizuku keep-alive boost; outcome logged only. */
-  private fun applyShizukuKeepAlive() {
+  private fun applyShizukuKeepAlive(generation: Long) {
+    val token = flowOwnership.tokenFor(generation) ?: return
+    if (!isCurrentEngineFlow(generation)) return
     try {
-      Thread {
-        val result = ShizukuSupport.status(activity)
-        Log.i("dsh-shizuku", result)
-      }.start()
+      val caller = Thread {
+        try {
+          if (!isCurrentEngineFlow(generation)) return@Thread
+          val result = ShizukuSupport.status(activity)
+          if (isCurrentEngineFlow(generation)) Log.i("dsh-shizuku", result)
+        } finally { token.detach(Thread.currentThread()) }
+      }
+      token.attach(caller)
+      caller.start()
     } catch (_: Throwable) {
     }
   }
@@ -833,30 +916,44 @@ internal class EngineStartFlow(private val activity: MainActivity) {
    * left untouched and the subsequent spawn is not attempted.
    */
   fun restart(): Boolean {
+    if (activity.isDestroyed || activity.isFinishing || flowOwnership.destroyed) return false
     if (!engineRestarting.compareAndSet(false, true)) return false
-    activity.userClosedEngine = false
-    flowGeneration.incrementAndGet()
+    flowOwnership.invalidate()
+    val token = flowOwnership.begin()
+    if (token == null) { engineRestarting.set(false); return false }
+    val generation = token.generation
+    activity.userClosedEngine = false // Explicit user restart, not a lifecycle callback.
     EngineService.setUserShutdown(activity, false)
-    Thread {
+    val caller = Thread {
       try {
+        if (!isCurrentEngineFlow(generation)) return@Thread
         if (!activity.engineManager.stopOwnedEngine()) {
           activity.runOnUiThread {
+            if (!isCurrentEngineFlow(generation)) return@runOnUiThread
             activity.showTestNotification("未重启引擎", activity.engineManager.lastStartRefusal ?: "端口监听未归属到本壳，未执行停止或启动")
           }
           return@Thread
         }
+        if (!isCurrentEngineFlow(generation)) return@Thread
         EngineManager.lastStartAttemptAt = 0
-        flowRunning.set(false)
         LogCollector.log("dsh-shell", "restart engine requested (tracked child only)")
         Thread.sleep(1000)
         activity.runOnUiThread {
+          if (!isCurrentEngineFlow(generation)) return@runOnUiThread
           activity.showTestNotification("引擎重启中", "已停止本壳托管进程，正在重新启动…")
+          flowOwnership.finish(token)
           start()
         }
+      } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
       } finally {
+        token.detach(Thread.currentThread())
+        flowOwnership.finish(token)
         engineRestarting.set(false)
       }
-    }.start()
+    }
+    token.attach(caller)
+    caller.start()
     return true
   }
 }
@@ -867,6 +964,61 @@ internal class EngineStartFlow(private val activity: MainActivity) {
  */
 internal fun diagnosticsLocationHint(dir: java.io.File?): String =
   if (dir == null) "诊断包落盘失败（共享与私有目录均不可写）" else "诊断包已存至 " + dir.absolutePath
+
+/** Ownership preparation cannot authorize snapshot reads until maintenance has settled. */
+internal fun startupOwnershipPending(reason: String): Boolean =
+  reason == "root-maintenance-busy" || reason == "repair-result-unknown"
+
+/** Pure generation/owner gate; cancellation targets only caller threads, never shared root workers. */
+internal class StartupFlowOwnership {
+  internal class Token(val generation: Long) {
+    private val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val callers = java.util.concurrent.ConcurrentHashMap.newKeySet<Thread>()
+    fun attach(caller: Thread) {
+      callers.add(caller)
+      if (cancelled.get()) caller.interrupt()
+    }
+    fun detach(caller: Thread) { callers.remove(caller) }
+    fun cancel() {
+      cancelled.set(true)
+      for (caller in callers) caller.interrupt()
+    }
+  }
+  private data class State(val generation: Long = 0, val token: Token? = null, val running: Boolean = false, val destroyed: Boolean = false)
+  private val state = java.util.concurrent.atomic.AtomicReference(State())
+  val destroyed: Boolean get() = state.get().destroyed
+
+  fun begin(): Token? {
+    while (true) {
+      val before = state.get()
+      if (before.destroyed || before.running) return null
+      val token = Token(before.generation + 1)
+      if (state.compareAndSet(before, State(token.generation, token, running = true))) {
+        before.token?.cancel()
+        return token
+      }
+    }
+  }
+
+  fun finish(token: Token) {
+    while (true) {
+      val before = state.get()
+      if (before.token !== token || !before.running) return
+      if (state.compareAndSet(before, before.copy(running = false))) return
+    }
+  }
+
+  fun isCurrent(generation: Long): Boolean = state.get().let { !it.destroyed && it.generation == generation }
+  fun tokenFor(generation: Long): Token? = state.get().token?.takeIf { it.generation == generation }
+
+  fun invalidate(destroy: Boolean = false) {
+    while (true) {
+      val before = state.get()
+      val after = State(before.generation + 1, destroyed = before.destroyed || destroy)
+      if (state.compareAndSet(before, after)) { before.token?.cancel(); return }
+    }
+  }
+}
 
 /**
  * 启动前置（FX-210.1，JVM 单测的顺序契约）：先执行恢复入口，再做探活分流。
@@ -908,10 +1060,11 @@ internal fun startupRecoverThenProbe(recover: () -> Unit, probeRunning: () -> Bo
  *
  * @param activity 宿主（用其 filesDir 与 engineManager）。
  */
-private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity) {
+private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity, current: () -> Boolean) {
+  if (!current()) return
   // 当拍读：engine.log 由 redirectOutput 每次 spawn 截断重写，晚一拍就读不到现场了。
   val tail = try { PluginMounts.readEngineLogTail(activity, 4_096) } catch (_: Throwable) { "" }
-  if (!RuntimeTree.snapshotLinkFailure(tail)) return
+  if (!current() || !RuntimeTree.snapshotLinkFailure(tail)) return
   LogCollector.log("dsh-engine-start", "engine died from a dynamic-link failure; runtime tree is damaged")
   if (!RuntimeTree.maySelfHeal(runtimeTreeHealedThisRun)) {
     // 预算用尽：不再删指纹/重抽取，停在可读错误页（既有 UI 已展示诊断包路径）。
@@ -920,13 +1073,16 @@ private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity) {
   }
   runtimeTreeHealedThisRun = true
   try {
+    if (!current()) return
     // ① 壳侧标记（不被引擎截断），供后续启动与诊断读取。
     java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
       .writeText(System.currentTimeMillis().toString() + (0x0A).toChar())
     // ② 删指纹 ⇒ 下次刷新走完整重抽取。
     val fp = java.io.File(activity.filesDir, ".snapshot-fingerprint")
-    if (fp.exists()) fp.delete()
+    if (!current()) return
+    if (fp.exists() && current()) fp.delete()
     // ③ 清账本（避免降级闸门在新局面下与新判据打架）。
+    if (!current()) return
     activity.engineManager.clearRefreshLedger()
     LogCollector.log("dsh-engine-start", "runtime tree damage: fingerprint cleared, refresh ledger reset; next start will re-extract the runtime")
   } catch (t: Throwable) {
@@ -953,7 +1109,8 @@ private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity) {
  *   · 因此可见面唯一可靠的落点是**页面 DOM 注入**（引擎起来、页面 onPageFinished 之后）。
  *   若引擎最终没起来，既有 boot-fail 错误页已经展示了失败，本条仍完整落在诊断面。
  */
-private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?) {
+private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?, current: () -> Boolean) {
+  if (!current()) return
   val notice = SnapshotRecoveryNotice.forRejection(detail) ?: return
   // ① 结构化落盘。
   LogCollector.writeBootFail(
@@ -962,8 +1119,10 @@ private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?
     "快照恢复期拒绝回滚（code=" + notice.code + "）：" + (detail ?: ""),
   )
   // ② 一次性标记（注入成功后由 MainActivity consume）。
+  if (!current()) return
   SnapshotRecoveryNotice.markPending(activity.filesDir, detail)
   // ③ 诊断包镜像（不切界面相位，理由见上方注释）。
+  if (!current()) return
   activity.engineManager.mirrorDiagnosticsToShared(notice.code)
 }
 
@@ -974,10 +1133,11 @@ private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?
  * 标记留着会让后续诊断误判、也可能让将来新增的读取方做出错误决策。
  * 只删文件，不改预算变量——预算按「每次 app 运行」计，不因成功而重置（同一次运行内不重复自愈）。
  */
-private fun clearRuntimeTreeDamageMarker(activity: MainActivity) {
+private fun clearRuntimeTreeDamageMarker(activity: MainActivity, current: () -> Boolean) {
+  if (!current()) return
   try {
     val marker = java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
-    if (marker.exists()) {
+    if (marker.exists() && current()) {
       marker.delete()
       LogCollector.log("dsh-engine-start", "runtime tree damage marker cleared after a successful boot")
     }

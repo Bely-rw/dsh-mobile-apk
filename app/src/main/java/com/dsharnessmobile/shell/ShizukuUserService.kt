@@ -6,13 +6,10 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.Keep
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStreamReader
 import java.io.RandomAccessFile
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -29,7 +26,7 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
     private const val OUTPUT_LIMIT = 16 * 1024
 
     /** v3（2026-09-30）：新增 [configure] / [repairOwnership]——root 通道写盘的属主归一。 */
-    private const val PROTOCOL_VERSION = 3
+    const val PROTOCOL_VERSION = 4
     private const val MAX_TIMEOUT_MS = 600_000
     private const val MIN_TIMEOUT_MS = 250
     private const val CHUNK_LIMIT = 512 * 1024
@@ -70,139 +67,76 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
 
   override fun protocolVersion(): Int = PROTOCOL_VERSION
 
-  // ── v3：属主归一（root 通道写盘污染的自愈面）────────────────────────────────────
-
+  // v4 configuration is one-time and acknowledged. Keep full Android UIDs, including work profiles.
+  @Synchronized
   override fun configure(appUid: Int, appDataDir: String) {
-    // 校验（fail-closed，2026-09-30 复核补）：本方法的唯一调用者是本应用的 transport，
-    // 但 AIDL 面不因此免除自证——uid 必须是应用区间、目录必须是应用数据目录前缀，
-    // 且**一次性生效**（已配置则拒绝改写，杜绝「先配好后被换成任意路径」）。
+    if (android.os.Binder.getCallingUid() != appUid || !OwnershipRepair.isTrustedAppDataAnchor(appDataDir, appUid)) {
+      Log.w(TAG, "configure rejected: invalid application anchor/uid")
+      return
+    }
     if (this.appUid > 0) {
-      Log.w(TAG, "configure ignored: already configured (appUid=${this.appUid})")
+      if (this.appUid != appUid || this.appDataDir != appDataDir)
+        Log.w(TAG, "configure rejected: identity already fixed")
       return
     }
-    if (appUid < 10_000 || appUid > 19_999) {
-      Log.w(TAG, "configure rejected: implausible app uid $appUid")
-      return
-    }
-    val canonical = runCatching { File(appDataDir).canonicalPath }.getOrNull()
-    if (canonical == null || (!canonical.startsWith("/data/user/") && !canonical.startsWith("/data/data/"))) {
-      Log.w(TAG, "configure rejected: data dir outside app data roots ($appDataDir)")
-      return
-    }
+    this.appDataDir = appDataDir
     this.appUid = appUid
-    this.appDataDir = canonical.trimEnd('/')
-    Log.i(TAG, "configured appUid=$appUid dataDir=$canonical")
   }
 
-  /** 应用数据目录内的路径判据（两侧都走 canonical；`/data/data` 与 `/data/user/0` 是同一棵树）。 */
+  override fun configuration(): Bundle = Bundle().apply {
+    putBoolean("ok", appUid > 0 && OwnershipRepair.isTrustedAppDataAnchor(appDataDir, appUid))
+    putInt("appUid", appUid)
+    putString("appDataDir", appDataDir)
+    putInt("protocolVersion", PROTOCOL_VERSION)
+  }
+
+  /** Lexical classification only; the shared FD adapter enforces every mutation's actual target. */
   private fun isUnderAppData(file: File): Boolean {
-    if (appDataDir.isEmpty()) return false
-    val target = runCatching { file.canonicalPath }.getOrNull() ?: return false
-    return target == appDataDir || target.startsWith(appDataDir + "/")
+    val root = appDataDir
+    return root.isNotEmpty() && (file.path == root || file.path.startsWith(root + "/"))
   }
 
-  /**
-   * 把单个条目的属主修回应用 uid（**lchown，绝不跟随符号链接**——否则会把链接目标也改掉）。
-   * @return true = 本次确实改动了属主。
-   */
-  private fun repairOne(file: File): Boolean = try {
-    val st = android.system.Os.lstat(file.path)
-    if (st.st_uid == appUid) {
-      false
-    } else {
-      android.system.Os.lchown(file.path, appUid, appUid)
-      true
-    }
-  } catch (t: Throwable) {
-    // 单个条目失败不中断整批（可能是并发删除/无权限的特殊节点）；失败即不算 fixed。
-    Log.w(TAG, "repair failed ${file.name}: ${t.javaClass.simpleName}")
-    false
-  }
-
-  /** 修复后尽力恢复 SELinux 上下文（chown 与 context 是两件事；restorecon 缺席就跳过）。 */
-  private fun restoreconBestEffort(path: String) {
-    runCatching {
-      ProcessBuilder("/system/bin/restorecon", "-R", path).redirectErrorStream(true).start().waitFor()
-    }
-  }
-
-  /**
-   * v3：把 path 子树里**不属于应用 uid** 的条目修回去（有界遍历、不跟随符号链接）。
-   *
-   * 只认「已配置的应用 uid」——这不是通用 chown 面（AIDL 不接受任意 uid/gid），
-   * 且路径必须在应用数据目录内（越界结构化拒绝）。未 configure 时同样拒绝。
-   */
+  @Synchronized
   override fun repairOwnership(path: String, maxEntries: Int): Bundle {
-    val out = Bundle()
-    val uid = appUid
-    if (uid <= 0 || appDataDir.isEmpty()) {
-      out.putBoolean("ok", false)
-      out.putString("error", "not-configured")
-      return out
-    }
-    if (!isAbsolute(path)) {
-      out.putBoolean("ok", false)
-      out.putString("error", "requires absolute path")
-      return out
-    }
-    val target = File(path)
-    if (!isUnderAppData(target)) {
-      out.putBoolean("ok", false)
-      out.putString("error", "out-of-app-data")
-      return out
-    }
-    val cap = (if (maxEntries > 0) maxEntries else DEFAULT_REPAIR_ENTRIES).coerceAtMost(MAX_REPAIR_ENTRIES)
-    var scanned = 0
-    var fixed = 0
-    var truncated = false
-    val stack = ArrayDeque<File>()
-    stack.addLast(target)
-    while (stack.isNotEmpty()) {
-      if (scanned >= cap) {
-        truncated = true
-        break
-      }
-      val file = stack.removeLast()
-      scanned++
-      if (repairOne(file)) fixed++
-      if (file.isDirectory && !SnapshotFs.isSymbolicLink(file)) {
-        runCatching { file.listFiles()?.forEach { stack.addLast(it) } }
-      }
-    }
-    if (fixed > 0) restoreconBestEffort(target.path)
-    // 截断 = 没修完（未扫到的条目还留着）⇒ **报失败**，不让上层把它计入成功。
-    out.putBoolean("ok", !truncated)
-    if (truncated) out.putString("error", "repair-truncated: entry cap reached, part of the tree was not scanned")
-    out.putInt("scanned", scanned)
-    out.putInt("fixed", fixed)
-    out.putBoolean("truncated", truncated)
-    return out
+    if (appUid <= 0 || appDataDir.isEmpty()) return OwnershipRepair.toBundle(
+      OwnershipRepairCore.rejected("not-configured"))
+    val cap = if (maxEntries <= 0) DEFAULT_REPAIR_ENTRIES else maxEntries.coerceAtMost(MAX_REPAIR_ENTRIES)
+    return OwnershipRepair.toBundle(OwnershipRepair.repair(appDataDir, path, appUid, cap, 20_000L))
   }
 
-  /**
-   * 写盘后自愈：把刚写的文件与 mkdirs 出来的父目录（一路到应用数据目录为止）修回应用 uid。
-   * 只在路径落在应用数据目录内且已 configure 时动作；任何失败都不影响写入结果本身。
-   *
-   * 守卫（2026-09-30 复核补）：**目标本身不得等于应用数据目录根**——否则一次
-   * `writeChunk("/data/user/0/<pkg>", …)` 会把整个数据目录（含系统建的 `databases/`、
-   * `shared_prefs/`）一并 chown；范围放大不是越界，但没有任何调用方需要它。
-   */
-  private fun repairAfterWrite(file: File) {
-    if (appUid <= 0 || !isUnderAppData(file)) return
-    val canon = runCatching { file.canonicalPath }.getOrNull() ?: return
-    if (canon == appDataDir) return
-    var fixedAny = repairOne(file)
-    var parent = file.parentFile
-    while (parent != null && isUnderAppData(parent)) {
-      if (parent.path == appDataDir) break
-      if (repairOne(parent)) fixedAny = true
-      parent = parent.parentFile
+  /** Fixed in-app repair only. No pathname lchown, recursive restorecon or swallowed listing errors. */
+  private fun repairAfterWrite(file: File): Bundle {
+    if (appUid <= 0 || !isUnderAppData(file)) return OwnershipRepair.toBundle(
+      OwnershipRepairCore.rejected("not-configured"))
+    var current: File? = file
+    var checked = 0
+    var healed = 0
+    var failures = 0
+    val deadline = SystemClock.elapsedRealtime() + 20_000L
+    while (current != null && current.path != appDataDir && isUnderAppData(current)) {
+      val remaining = deadline - SystemClock.elapsedRealtime()
+      if (remaining <= 0 || checked >= OwnershipRepairCore.MAX_DEPTH + 1) { failures++; break }
+      val result = OwnershipRepair.repair(appDataDir, current.path, appUid, 1, remaining, recursive = false)
+      checked += result.checked
+      healed += result.healed
+      if (!result.ok) failures++
+      current = current.parentFile
     }
-    if (fixedAny) restoreconBestEffort(file.path)
+    return Bundle().apply {
+      putBoolean("ok", failures == 0)
+      putInt("checked", checked); putInt("healed", healed); putInt("failures", failures)
+      if (failures > 0) putString("error", "ownership-not-repaired")
+    }
   }
 
+
+  @Synchronized
   override fun exec(argv: Array<String>, timeoutMs: Int): Bundle {
-    val out = Bundle()
+    val out = Bundle().apply {
+      putBoolean("resultComplete", false); putInt("exitCode", -1); putString("stdout", "")
+      putBoolean("exitTimedOut", false); putBoolean("drainTimedOut", false)
+      putBoolean("cleanupIncomplete", false); putBoolean("truncated", false); putString("readError", "")
+    }
     if (argv.isEmpty() || argv.any { it.isEmpty() }) {
       out.putBoolean("ok", false)
       out.putString("error", "empty argv")
@@ -210,19 +144,20 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
     }
     return try {
       val process = ProcessBuilder(argv.toList()).redirectErrorStream(true).start()
-      val text = StringBuilder()
-      BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8)).useLines { lines ->
-        for (line in lines) {
-          if (text.length >= OUTPUT_LIMIT) break
-          text.append(line).append('\n')
-        }
-      }
-      val completed = process.waitFor(timeoutMs.coerceIn(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS).toLong(), TimeUnit.MILLISECONDS)
-      if (!completed) process.destroyForcibly()
-      out.putBoolean("ok", completed && process.exitValue() == 0)
-      out.putInt("exitCode", if (completed) process.exitValue() else -1)
-      out.putString("stdout", text.toString().take(OUTPUT_LIMIT))
-      if (!completed) out.putString("error", "controller command timed out")
+      val result = ProcIo.readBoundedMillis(process,
+        timeoutMs.coerceIn(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS).toLong(), OUTPUT_LIMIT)
+      val exit = if (result.exitTimedOut) -1 else runCatching { process.exitValue() }.getOrDefault(-1)
+      out.putBoolean("ok", result.complete && !result.truncated && exit == 0)
+      out.putInt("exitCode", exit)
+      out.putString("stdout", result.text)
+      out.putBoolean("exitTimedOut", result.exitTimedOut)
+      out.putBoolean("drainTimedOut", result.drainTimedOut)
+      out.putBoolean("truncated", result.truncated)
+      out.putBoolean("cleanupIncomplete", result.cleanupIncomplete)
+      out.putString("readError", result.readError ?: "")
+      out.putBoolean("resultComplete", result.complete && !result.truncated && exit >= 0)
+      if (!result.complete || result.truncated) out.putString("error", "controller output incomplete: " + result.marker())
+      else if (exit != 0) out.putString("error", "exit=$exit")
       out
     } catch (t: Throwable) {
       out.putBoolean("ok", false)
@@ -233,71 +168,51 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
 
   /**
    * v2 large-output execution: stdout/stderr stream to a shell-side spool file while the first
-   * `inlineBytes` stay inline for small-output callers. The timeout is enforced on a reader thread
-   * so a silent hang is still reclaimed, and the spool file is capped to protect shell storage.
+   * `inlineBytes` stay inline for small-output callers. Reading runs concurrently with bounded exit/drain waits
+   * so a silent hang is reported incomplete; only a fully closed spool is published as ready.
    */
+  @Synchronized
   override fun execCapture(argv: Array<String>, timeoutMs: Int, inlineBytes: Int): Bundle {
-    val out = Bundle()
-    if (argv.isEmpty() || argv.any { it.isEmpty() }) {
-      out.putBoolean("ok", false)
-      out.putString("error", "empty argv")
-      return out
+    if (argv.isEmpty() || argv.any { it.isEmpty() }) return Bundle().apply {
+      putBoolean("ok", false); putBoolean("resultComplete", false); putBoolean("spoolReady", false)
+      putBoolean("exitTimedOut", false); putBoolean("drainTimedOut", false)
+      putBoolean("cleanupIncomplete", false); putBoolean("truncated", false); putString("readError", "")
+      putInt("exitCode", -1); putByteArray("inline", ByteArray(0)); putString("path", ""); putLong("size", 0L)
+      putString("error", "empty argv")
     }
-    val inlineLimit = inlineBytes.coerceIn(0, OUTPUT_LIMIT)
-    val file = spoolFile()
-    var total = 0L
-    var truncated = false
+    var launched = false
     return try {
+      val file = spoolFile()
       val process = ProcessBuilder(argv.toList()).redirectErrorStream(true).start()
-      val reader = Thread {
-        try {
-          FileOutputStream(file).use { sink ->
-            val inline = ByteArrayOutputStream()
-            process.inputStream.use { input ->
-              val buf = ByteArray(64 * 1024)
-              while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                if (total < MAX_CAPTURE_BYTES) {
-                  val room = (MAX_CAPTURE_BYTES - total).coerceAtMost(n.toLong()).toInt()
-                  sink.write(buf, 0, room)
-                  total += room
-                  if (room < n) truncated = true
-                } else {
-                  truncated = true
-                }
-                if (inline.size() < inlineLimit) {
-                  inline.write(buf, 0, minOf(n, inlineLimit - inline.size()))
-                }
-              }
-            }
-            sink.flush()
-            out.putByteArray("inline", inline.toByteArray())
-          }
-        } catch (t: Throwable) {
-          out.putString("readError", t.javaClass.simpleName + ": " + (t.message ?: ""))
-        }
-      }
-      reader.isDaemon = true
-      reader.start()
-      val completed = process.waitFor(
+      launched = true
+      val result = ShizukuCaptureIo.capture(process, file,
         timeoutMs.coerceIn(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS).toLong(),
-        TimeUnit.MILLISECONDS,
-      )
-      if (!completed) process.destroyForcibly()
-      reader.join(2_000)
-      out.putBoolean("ok", completed && process.exitValue() == 0)
-      out.putInt("exitCode", if (completed) process.exitValue() else -1)
-      out.putString("path", file.absolutePath)
-      out.putLong("size", total)
-      out.putBoolean("truncated", truncated)
-      if (!out.containsKey("inline")) out.putByteArray("inline", ByteArray(0))
-      if (!completed) out.putString("error", "command timed out after ${timeoutMs}ms")
-      out
-    } catch (t: Throwable) {
-      out.putBoolean("ok", false)
-      out.putString("error", t.javaClass.simpleName + ": " + (t.message ?: ""))
-      out
+        inlineBytes.coerceIn(0, OUTPUT_LIMIT), MAX_CAPTURE_BYTES)
+      // The writer never receives this Bundle. Inline bytes and all fields are return-time copies.
+      Bundle().apply {
+        putBoolean("ok", result.complete && result.exitCode == 0)
+        putBoolean("resultComplete", result.complete)
+        putInt("exitCode", result.exitCode)
+        putByteArray("inline", result.inline)
+        putString("path", result.path)
+        putLong("size", result.size)
+        putBoolean("spoolReady", result.spoolReady)
+        putBoolean("exitTimedOut", result.exitTimedOut)
+        putBoolean("drainTimedOut", result.drainTimedOut)
+        putBoolean("cleanupIncomplete", result.cleanupIncomplete)
+        putBoolean("truncated", result.truncated)
+        putString("readError", result.readError ?: "")
+        if (!result.complete) putString("error", "capture-incomplete")
+        else if (result.exitCode != 0) putString("error", "exit=" + result.exitCode)
+      }
+    } catch (failure: Throwable) {
+      Bundle().apply {
+        putBoolean("ok", false); putBoolean("resultComplete", false); putBoolean("spoolReady", false)
+        putBoolean("exitTimedOut", false); putBoolean("drainTimedOut", false)
+        putBoolean("cleanupIncomplete", launched); putBoolean("truncated", false); putString("readError", "")
+        putInt("exitCode", -1); putByteArray("inline", ByteArray(0)); putString("path", ""); putLong("size", 0L)
+        putString("error", ProcIo.errorText(failure))
+      }
     }
   }
 
@@ -326,36 +241,34 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
     }
   }
 
+  @Synchronized
   override fun writeChunk(path: String, data: ByteArray, append: Boolean): Bundle {
     val out = Bundle()
-    if (!isAbsolute(path)) {
-      out.putBoolean("ok", false)
-      out.putString("error", "requires absolute path")
-      return out
+    if (!isAbsolute(path)) return out.apply { putBoolean("ok", false); putString("error", "requires absolute path") }
+    val rootWrite = Process.myUid() == 0
+    if (rootWrite && (appUid <= 0 || appDataDir.isEmpty())) return out.apply {
+      putBoolean("ok", false); putString("error", "ownership-configuration-required")
     }
     return try {
       val file = File(path)
-      file.parentFile?.let { if (!it.exists()) it.mkdirs() }
+      file.parentFile?.let { if (!it.exists() && !it.mkdirs()) throw IllegalStateException("parent-create-failed") }
       FileOutputStream(file, append).use { sink -> sink.write(data) }
-      // v3（2026-09-30）：root 通道（本进程 uid=0）写进应用数据目录的文件，属主会变成 root:root
-      // ⇒ 应用侧 0600 读不回来（watcher/插件/引擎读写全崩）。写后立即自愈成应用 uid。
-      repairAfterWrite(file)
-      // **回读验证**（2026-09-30 复核补）：不回读就是「报成功、但应用仍读不回来」的静默失败——
-      // 只在路径确实落在应用数据目录内、且已 configure 时才要求属主已归位。
-      val ownerOk = appUid <= 0 || !isUnderAppData(file) ||
-        runCatching { android.system.Os.lstat(file.path).st_uid == appUid }.getOrDefault(false)
+      val inApp = isUnderAppData(file)
+      val repaired = if (rootWrite && inApp) repairAfterWrite(file) else null
+      val ownerOk = !rootWrite || !inApp || repaired?.getBoolean("ok") == true
       out.putBoolean("ok", ownerOk)
-      if (!ownerOk) out.putString("error", "ownership not repaired: file is still not owned by the app uid")
+      if (!ownerOk) out.putString("error", "ownership-not-repaired")
       out.putString("path", file.absolutePath)
       out.putLong("size", file.length())
       out
-    } catch (t: Throwable) {
+    } catch (failure: Throwable) {
       out.putBoolean("ok", false)
-      out.putString("error", t.javaClass.simpleName + ": " + (t.message ?: ""))
+      out.putString("error", failure.javaClass.simpleName)
       out
     }
   }
 
+  @Synchronized
   override fun removePath(path: String): Bundle {
     val out = Bundle()
     if (!isAbsolute(path)) {
@@ -391,4 +304,86 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
   }
 
   private fun isAbsolute(path: String): Boolean = path.startsWith("/") && path.length > 1
+}
+
+/** Private staging spool + immutable bounded snapshot; no live writer can own a published path. */
+internal object ShizukuCaptureIo {
+  internal class Result(
+    inline: ByteArray,
+    val path: String,
+    val size: Long,
+    val spoolReady: Boolean,
+    val exitCode: Int,
+    val exitTimedOut: Boolean,
+    val drainTimedOut: Boolean,
+    val cleanupIncomplete: Boolean,
+    val truncated: Boolean,
+    val readError: String?,
+  ) {
+    private val bytes = inline.copyOf()
+    val inline: ByteArray get() = bytes.copyOf()
+    val complete: Boolean get() = spoolReady && exitCode >= 0 && !exitTimedOut &&
+      !drainTimedOut && !cleanupIncomplete && !truncated && readError == null
+  }
+
+  private class State(private val inlineLimit: Int) {
+    private val inline = ByteArrayOutputStream()
+    private var size = 0L
+    private var truncated = false
+    private var readError: String? = null
+    private var closed = false
+    @Synchronized fun accept(buf: ByteArray, n: Int, written: Int) {
+      size += written
+      if (written < n) truncated = true
+      val take = minOf(n, inlineLimit - inline.size())
+      if (take > 0) inline.write(buf, 0, take)
+    }
+    @Synchronized fun fail(failure: Throwable) { readError = ProcIo.errorText(failure) }
+    @Synchronized fun closed() { closed = true }
+    @Synchronized fun snapshot(): Snapshot = Snapshot(inline.toByteArray(), size, truncated, readError, closed)
+  }
+  private class Snapshot(val inline: ByteArray, val size: Long, val truncated: Boolean,
+    val readError: String?, val closed: Boolean)
+
+  internal fun capture(process: java.lang.Process, file: File, timeoutMs: Long, inlineLimit: Int,
+    maxBytes: Long, drainMs: Long = 2_000L, cleanupMs: Long = 200L): Result {
+    val staging = File(file.parentFile, file.name + ".part")
+    val state = State(inlineLimit.coerceIn(0, 16 * 1024))
+    val cap = maxBytes.coerceIn(1, 256L * 1024 * 1024)
+    val reader = Thread({
+      try {
+        FileOutputStream(staging).use { sink ->
+          val input = process.inputStream
+          val buf = ByteArray(64 * 1024)
+          var size = 0L
+          while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            if (n == 0) continue
+            val take = minOf(n.toLong(), cap - size).coerceAtLeast(0).toInt()
+            if (take > 0) sink.write(buf, 0, take)
+            size += take
+            state.accept(buf, n, take)
+          }
+          sink.flush()
+        }
+        state.closed() // use/close may itself block; do not claim completion before it returns.
+      } catch (failure: Throwable) { state.fail(failure) }
+    }, "dsh-capture-drain").apply { isDaemon = true }
+    reader.start()
+    val wait = ProcIo.awaitCompletion(process, reader, timeoutMs, drainMs, drainMs, cleanupMs)
+    val snap = state.snapshot()
+    val exit = if (wait.exitTimedOut) -1 else runCatching { process.exitValue() }.getOrDefault(-1)
+    var error = snap.readError ?: wait.waitError
+    var ready = snap.closed && !reader.isAlive && !wait.exitTimedOut && !wait.drainTimedOut &&
+      !wait.cleanupIncomplete && !snap.truncated && error == null && exit >= 0
+    if (ready) {
+      // Rename only after writer death. Incomplete .part paths are NEVER returned as file results.
+      ready = try { staging.renameTo(file) }
+      catch (failure: Throwable) { error = ProcIo.errorText(failure); false }
+      if (!ready && error == null) error = "spool-publish-failed"
+    }
+    return Result(snap.inline, if (ready) file.absolutePath else "", snap.size, ready, exit,
+      wait.exitTimedOut, wait.drainTimedOut, wait.cleanupIncomplete, snap.truncated, error)
+  }
 }

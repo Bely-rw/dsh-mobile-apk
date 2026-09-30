@@ -66,5 +66,8 @@ interface ShizukuUserService {
      * @return {ok,scanned,fixed,truncated,error?}
      */
     Bundle repairOwnership(in String path, int maxEntries) = 9;
+
+    /** v4: confirm the one-time configured full UID and trusted data anchor. */
+    Bundle configuration() = 10;
 }
 
