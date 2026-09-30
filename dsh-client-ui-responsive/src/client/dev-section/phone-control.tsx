@@ -624,28 +624,22 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
     )
   }, [runRootAction, refreshRootGrant, refreshRootAccess])
 
-  /** 显式请求 root 授权（弹窗由壳侧后台 su 触发；本页 2s 轮询看到结果）。 */
+  /**
+   * 检测 / 尝试获取 root 授权（壳侧后台跑一次 `su -c id`；本页 2s 轮询看到结果）。
+   *
+   * ★口径（2026-09-30 主人指正）：**多数 Root 管理器不再自动弹授权框**（除 Magisk 外，
+   * 用户得自己打开管理器授予）✗ ⇒ 文案**不承诺"会弹窗"**，只承诺"取一次真实身份并如实回报" ✓。
+   */
   const requestRoot = useCallback(() => {
     runRootAction(
       window.androidBridge?.requestRootAccess
         ? () => window.androidBridge!.requestRootAccess!()
         : undefined,
-      '已发起 root 授权请求——请在手机的授权框上点「允许」（本页每 2 秒自动刷新）。',
-      '请求 root 授权失败',
+      '已取到 root 身份——授权已就绪（本页每 2 秒自动刷新）。',
+      '检测 root 授权未通过',
     )
     refreshRootAccess()
   }, [runRootAction, refreshRootAccess])
-
-  /** 打开 Root 管理器（KernelSU / Magisk / APatch）手动授予 root。 */
-  const openRootManager = useCallback(() => {
-    runRootAction(
-      window.androidBridge?.openRootManager
-        ? () => window.androidBridge!.openRootManager!()
-        : undefined,
-      '已打开 Root 管理器——请在其中允许本应用使用 root，然后回到本页点「请求 root 授权」。',
-      '打开 Root 管理器失败',
-    )
-  }, [runRootAction])
 
   /**
    * root 通道写盘属主自愈（2026-09-30 主人定例「Root 属主这种 bug 也得找一找修一修」）。
@@ -877,7 +871,10 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
         <p className={rootOk === true ? 'dsh-dev-hint' : 'dsh-dev-error'}>{rootMsg}</p>
       )}
 
-      {/* 2026-09-30 主人定例：应用级 root 授权面——检测 + 弹窗 + 管理器引导 + 属主自愈。 */}
+      {/* 2026-09-30 主人定例：应用级 root 授权面——检测 + 诚实引导 + 属主自愈。
+          ★主人指正（同日）：**不做「打开 Root 管理器」入口** ✗ —— 各家管理器包名/入口不一
+          （还可能根本没有管理器 App，如部分 ROM 内置 su），打开不保证成功 ✗；而能刷 root 的用户
+          自己会开管理器 ✓ ⇒ 只保留「检测 root 授权」＋ 把管理器名如实报出来 ✓。 */}
       <div className="dsh-screen-control-detail">
         <strong>Root 授权（应用自身）</strong>
         <span data-code={rootAccess.readable ? undefined : 'root-access-unreadable'}>
@@ -887,7 +884,7 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
       <p className="dsh-dev-hint">
         {rootAccess.guidance !== ''
           ? rootAccess.guidance
-          : '点「请求 root 授权」会弹出 Root 管理器的授权框；未授权时上面的开关不会开启。'}
+          : '点「检测 root 授权」会取一次真实 root 身份；未授权时上面的开关不会开启。'}
       </p>
       <div className="dsh-dev-row">
         <button
@@ -896,21 +893,13 @@ export function PhoneControlSection(_props: PropsRuntime<'settings.section'>) {
           disabled={!canRequestRoot(rootAccess)}
           onClick={requestRoot}
         >
-          请求 root 授权
-        </button>
-        <button
-          type="button"
-          className="dsh-dev-btn"
-          disabled={!rootAccess.managerInstalled}
-          onClick={openRootManager}
-        >
-          打开 Root 管理器
+          检测 root 授权
         </button>
       </div>
       <p className="dsh-dev-hint">
         {rootAccess.managerInstalled
-          ? 'Root 管理器：' + rootAccess.managerLabel + '。若授权框没有弹出，可点「打开 Root 管理器」手动允许本应用。'
-          : '未检测到 Root 管理器（KernelSU / Magisk / APatch）——本机可能尚未 root。'}
+          ? '检测到 Root 管理器：' + rootAccess.managerLabel + '。多数管理器不会自动弹授权框——请在它里面允许本应用使用 root。'
+          : '未检测到已知 Root 管理器（KernelSU / Magisk / APatch）——若你用的是别的管理器或 ROM 内置 su，请在它里面允许本应用。'}
       </p>
       <div className="dsh-dev-row">
         <button type="button" className="dsh-dev-link" onClick={repairOwnership}>
