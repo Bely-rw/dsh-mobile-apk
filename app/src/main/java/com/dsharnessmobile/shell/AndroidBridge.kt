@@ -525,7 +525,9 @@ class AndroidBridge(
   }
 
   /**
-   * 2026-09-30 主人定例：**显式请求 root 授权**——后台跑 `su -c id`，触发 Root 管理器的授权弹窗。
+   * 2026-09-30 主人定例：**显式检测/请求 root 授权**——后台跑一次 `su -c id` 取真实身份。
+   * ★主人同日指正：多数管理器**不会**因此自动弹授权框（除 Magisk 外得自己打开管理器授予）✗
+   * ⇒ 本方法只承诺「取一次真实身份并如实回报」，不承诺弹窗 ✓。
    *
    * 非阻塞（后台线程 + 25s 有界超时）：立即返回 `{ok:true,code:request-started}`，
    * 结果由页面既有 2s 轮询经 [rootAccessState] 看到；幂等（在飞时不重复起，避免弹窗连发）。
@@ -538,15 +540,12 @@ class AndroidBridge(
   }
 
   /**
-   * 2026-09-30 主人定例：拉起 Root 管理器界面（KernelSU / Magisk / APatch），
-   * 供用户手动授予 root。未安装 → `{"ok":false,"reason":"not-installed"}`。
+   * 2026-09-30 主人指正后**移除**了「打开 Root 管理器」入口（见 [RootAccess] 的类注释）：
+   * 各家管理器包名/入口不一（还可能根本没有管理器 App），打开不保证成功 ✗；而能刷 root 的用户
+   * 自己会开管理器 ✓ ⇒ 只保留「检测/请求 root 授权」＋诚实引导文案。
+   *
+   * 保留此注释是为了让后来者知道这里**曾经**有这个方法、以及为什么删掉（别再捡回来 ✗）。
    */
-  @JavascriptInterface
-  fun openRootManager(): String {
-    val app = ShellAppContext.get()
-      ?: return """{"ok":false,"reason":"no-shell-context"}"""
-    return RootAccess.openManagerFromContext(app)
-  }
 
   /**
    * 2026-09-30 主人定例（「Root 属主这种 bug 也得找一找修一修」）：root 通道写盘属主自愈。

@@ -78,11 +78,13 @@ object RootGrant {
         .put("guidance", "先勾选「已阅读」并查看免责声明，才能开启 AI root 权限（升级后需重新确认）。")
     }
     // 主人定例（2026-09-30）：开关要真走 root 授权流程——未获 Root 管理器授权就不放行，
-    // 由调用方顺带弹出授权框（见 setGranted），页面据 RootAccess.state 显示进度与引导。
+    // 由调用方顺带发起一次检测（见 setGranted），页面据 RootAccess.state 显示进度与引导。
+    // ★主人同日指正：**多数管理器不会自动弹授权框**（除 Magisk 外得自己打开管理器授予）✗
+    // ⇒ 文案不承诺弹窗，只说「在你使用的管理器里允许本应用」✓。
     if (!rootGranted) {
       return JSONObject().put("ok", false).put("code", CODE_ROOT_NOT_GRANTED)
-        .put("guidance", "尚未获得 root 授权——授权框已弹出，请在手机上点「允许」；" +
-          "若没有弹出，请点「打开 Root 管理器」手动允许本应用使用 root。")
+        .put("guidance", "尚未获得 root 授权——请在你自己使用的 Root 管理器里允许本应用使用 root" +
+          "（多数管理器不会自动弹授权框），然后回到本页重试。")
     }
     return null
   }

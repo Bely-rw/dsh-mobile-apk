@@ -108,9 +108,9 @@ export interface AndroidShellBridge {
    *  非阻塞（立即返回 `{ok:true,code:'request-started'}`，结果靠轮询 rootAccessState 收敛）；
    *  幂等（在飞时不重复起，避免弹窗连发）。 */
   requestRootAccess?: () => string
-  /** 2026-09-30 主人定例：拉起 Root 管理器（KernelSU / Magisk / APatch）手动授予 root；
-   *  未安装 → `{"ok":false,"reason":"not-installed"}`。 */
-  openRootManager?: () => string
+  /* 2026-09-30 主人指正后**移除**了 `openRootManager`：各家 Root 管理器包名/入口不一
+     （还可能根本没有管理器 App，如部分 ROM 内置 su），打开不保证成功 ✗；而能刷 root 的用户
+     自己会开管理器 ✓ ⇒ 只保留「检测/请求 root 授权」＋诚实引导文案。勿再加回来。 */
   /** 2026-09-30 主人定例：root 通道写盘**属主自愈**（有界抽查 + 有界修复，只在通道身份为 root 时动作）。
    *  root 写的文件属主是 root:root ⇒ 应用自己读不回来（0600）⇒ watcher/插件/引擎读写失败。
    *  返回 `{ok, channelUid, checked, healed, skipped?}`。 */

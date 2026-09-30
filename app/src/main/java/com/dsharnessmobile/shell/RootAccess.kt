@@ -1,8 +1,6 @@
 package com.dsharnessmobile.shell
 
-import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -12,22 +10,24 @@ import java.util.concurrent.TimeUnit
  * 是否授权，如果没有，请写好引导去 Root 管理器，授予 root」）。
  *
  * ── 与 [RootGrant] / [ShizukuTransport] 的分工（三层，别混）────────────────────
- *  1. **本对象** = 应用自身向 Root 管理器（KernelSU / Magisk / APatch）申请 root 授权：
- *     调 `su` 会触发管理器的授权弹窗，结果是「本应用有没有 root」的事实。
+ *  1. **本对象** = 应用自身有没有 root 的事实面：`su -c id` 取一次真实身份（uid 0 与否）。
  *  2. [RootGrant] = 「AI root 权限」开关位与免责确认（策略门 + 知情同意门）。
  *  3. [ShizukuTransport] = 特权执行通道；其身份（uid 0 / 2000）决定通道是不是 root。
  *
- * ── 为什么检测要「触发式」而不是静默轮询（关键设计，勿改成每次读状态都跑 su）──
- * 未被授权的应用每次调 `su` 都会**弹出授权框**（KernelSU 默认行为）。若把 su 调用放进
- * 状态读路径（2s 轮询），用户会被反复弹窗骚扰。故：
- *  - `state()` 是**纯读**（读缓存 + su 是否存在），永不触发弹窗；
- *  - `requestGrant()` 是**显式动作**（用户点按钮 / 用户尝试开开关时才调），后台线程跑 su，
- *    弹窗出现，结果写回缓存；页面靠既有 2s 轮询看到状态变化。
- *  - 超时（用户在弹窗上没点）如实回 `timeout`，**绝不把超时写成拒绝**（那是两种事实）。
+ * ── ★授权框的现实（2026-09-30 主人指正，别再假设统一行为）────────────────────
+ * **多数 Root 管理器（KernelSU / SukiSU 等）不再自动弹授权框** —— 除 Magisk 外，用户得
+ * 自己打开管理器授予 ✗。所以：
+ *  - 不承诺"点一下就会弹窗"（旧注释与旧文案这么写，是把管理器行为当成了统一的 ✗）；
+ *  - **不做「打开 Root 管理器」入口**：各家管理器包名/入口不一（还可能根本没管理器 App，
+ *    如部分 ROM 内置 su），打开不保证成功；而"能刷 root 的人自己会开管理器"（主人原话口径）⇒
+ *    只做**诚实引导**（识别到管理器就报它的名字，识别不到就说"你使用的 Root 管理器"）✓。
+ *  - 因此状态读面 `state()` 是**纯读**（读缓存 + su 是否存在），永不触发任何管理器交互；
+ *    `requestGrant()` 只在用户显式点按钮时跑一次 `su -c id`（成功即证明已授权 ✓，
+ *    失败/超时如实回报，绝不猜）✓。
  *
  * ── su 调用纪律 ──────────────────────────────────────────────────────────────
- *  - 后台线程执行 + 有界超时（[REQUEST_TIMEOUT_MS]，给用户点「允许」的时间）；
- *  - 超时即 `destroy()` 子进程，不留挂死进程；
+ *  - 后台线程执行 + 有界超时（[REQUEST_TIMEOUT_MS]，给用户在管理器上操作的时间）；
+ *  - 超时即 `destroyForcibly()`，不留挂死进程；
  *  - 判据是输出里的 `uid=0`（`su -c id` 的真实身份），不是退出码（各家 su 退出码语义不一）；
  *  - 任何异常都不抛出，一律落成结构化状态（fail-closed：未知就是未知）。
  */
@@ -134,17 +134,25 @@ object RootAccess {
     return out
   }
 
-  /** 每态都能说清「下一步做什么」（页面直接展示，不静默）。 */
+  /**
+   * 每态都能说清「下一步做什么」（页面直接展示，不静默）。
+   *
+   * 口径（2026-09-30 主人指正）：**多数 Root 管理器（KernelSU / SukiSU 等）不再自动弹授权框**
+   * ——除 Magisk 外，用户得自己打开管理器授予 ✗ ⇒ 引导语一律说「在你使用的 Root 管理器里允许本应用」，
+   * **不承诺"点一下就会弹窗"** ✗（旧文案这么写，是把管理器行为当成了统一的 ✗）。
+   * 管理器名只在**识别到时**作为提示带上（识别不到就说"你使用的 Root 管理器"，不猜 ✗）。
+   */
   private fun guidance(state: String, managerLabel: String?): String = when (state) {
     STATE_GRANTED -> "已获得 root 授权（uid 0）。"
-    STATE_REQUESTING -> "已弹出 Root 授权框，请在手机上点「允许」（本页每 2 秒自动刷新结果）。"
-    STATE_DENIED -> "root 授权被拒绝——请打开" + (managerLabel ?: "Root 管理器") +
-      "，在应用列表里允许本应用使用 root，然后回到本页点「请求 root 授权」。"
-    STATE_TIMEOUT -> "授权框没有响应（可能没点到）——请重试；或打开" + (managerLabel ?: "Root 管理器") +
-      "手动允许本应用。"
+    STATE_REQUESTING -> "正在等待 root 授权结果——若管理器没有弹出授权框，请自己打开" +
+      (managerLabel ?: "你使用的 Root 管理器") + "允许本应用。"
+    STATE_DENIED -> "root 授权被拒绝——请在" + (managerLabel ?: "你使用的 Root 管理器") +
+      "里允许本应用使用 root，然后回到本页重新检测。"
+    STATE_TIMEOUT -> "root 授权没有结果——请在" + (managerLabel ?: "你使用的 Root 管理器") +
+      "里允许本应用后重试。"
     STATE_NO_SU -> "本机没有可用的 su（未 root 或未安装 Root 管理器）——请先在" +
-      (managerLabel ?: "Root 管理器") + "中完成 root，再回到本页。"
-    else -> "尚未检测——点「请求 root 授权」会弹出 Root 管理器的授权框。"
+      (managerLabel ?: "你使用的 Root 管理器") + "中完成 root，再回到本页。"
+    else -> "尚未检测——点「检测 root 授权」会尝试取一次 root 身份（多数管理器不会自动弹授权框，需你在管理器里允许）。"
   }
 
   /**
@@ -331,32 +339,5 @@ object RootAccess {
       .put("reason", if (ok) "" else result.optString("reason").ifBlank { if (truncated) "repair-truncated" else "repair-incomplete" })
       .put("code", if (ok) "" else result.optString("code").ifBlank { if (truncated) "repair-truncated" else "repair-incomplete" })
       .put("guidance", if (ok) "" else result.optString("guidance").ifBlank { "属主修复未完成（残余 $remain 项）" })
-  }
-
-  /** 拉起 Root 管理器界面（用户手动授予 root 的落点）；未安装时结构化拒绝。 */
-  fun openManager(activity: Activity): String {
-    val mgr = manager(activity) ?: return JSONObject().put("ok", false).put("reason", "not-installed").toString()
-    val intent = activity.packageManager.getLaunchIntentForPackage(mgr.first)
-      ?: return JSONObject().put("ok", false).put("reason", "no-handler").toString()
-    return try {
-      activity.startActivity(intent)
-      JSONObject().put("ok", true).toString()
-    } catch (e: Exception) {
-      JSONObject().put("ok", false).put("reason", e.javaClass.simpleName).toString()
-    }
-  }
-
-  /** 从任意 Context 拉起管理器（默认桥实现用；无 Activity 时补 NEW_TASK 标志）。 */
-  fun openManagerFromContext(context: Context): String {
-    val mgr = manager(context) ?: return JSONObject().put("ok", false).put("reason", "not-installed").toString()
-    val intent = context.packageManager.getLaunchIntentForPackage(mgr.first)
-      ?: return JSONObject().put("ok", false).put("reason", "no-handler").toString()
-    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    return try {
-      context.startActivity(intent)
-      JSONObject().put("ok", true).toString()
-    } catch (e: Exception) {
-      JSONObject().put("ok", false).put("reason", e.javaClass.simpleName).toString()
-    }
   }
 }

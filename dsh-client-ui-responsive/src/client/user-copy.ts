@@ -47,12 +47,14 @@ const CALL_REASON: Readonly<Record<string, string>> = {
   'not-root-channel': 'Shizuku 通道不是 root 身份（无法在未 root 的设备上赋予该权限）——请让 Shizuku 以 root 启动后再来开启',
   'missing-asset': '应用内文档缺失（安装包不完整）——请重新安装应用后再试',
   'ui-thread-timeout': '应用界面正忙——请稍后重试；多次失败可复制日志反馈',
-  'root-not-granted': '尚未获得 root 授权——授权框已弹出，请在手机上点「允许」；若没有弹出，请点「打开 Root 管理器」手动允许本应用使用 root',
-  'no-su': '本机没有可用的 su（未 root 或未安装 Root 管理器）——请先在 Root 管理器中完成 root 后再试',
-  'already-requesting': 'root 授权框已经弹出，请在手机上点「允许」',
+  // ★2026-09-30 主人指正：**多数 Root 管理器不再自动弹授权框**（除 Magisk 外得自己打开管理器授予）✗
+  // ⇒ 这几条一律说「在你自己使用的 Root 管理器里允许本应用」，**不承诺"会弹窗"** ✓。
+  'root-not-granted': '尚未获得 root 授权——请在你自己使用的 Root 管理器里允许本应用使用 root（多数管理器不会自动弹授权框）',
+  'no-su': '本机没有可用的 su（未 root 或未安装 Root 管理器）——请先在你自己使用的 Root 管理器里完成 root 后再试',
+  'already-requesting': '正在等待 root 授权结果——若管理器没有弹出授权框，请自己打开它允许本应用',
   // ── 壳侧：root 执行面与属主自愈（RootAccess / ShizukuTransport）────────────
-  'request-started': '已弹出 root 授权框，请在手机上点「允许」——授权后本页会自动续开开关',
-  requesting: 'root 授权框已弹出，请先点「允许」再重试',
+  'request-started': '已开始检测 root 授权——若管理器没有弹出授权框，请自己打开它允许本应用；授权后本页会自动续开开关',
+  requesting: '正在等待 root 授权结果——若管理器没有弹出授权框，请自己打开它允许本应用',
   'su-timeout': 'root 命令超时后被终止——请重试或缩短命令',
   'su-exec-failed': 'root 命令执行失败——请稍后重试；多次失败可复制日志反馈',
   'empty-command': '命令为空',

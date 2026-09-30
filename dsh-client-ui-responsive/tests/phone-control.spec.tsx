@@ -66,6 +66,11 @@ function buttonByText(el: HTMLElement, text: string): HTMLButtonElement {
   return found as HTMLButtonElement
 }
 
+/** 不带断言的查询（查"某按钮**不该**在场"时必须用它——`buttonByText` 自带"必须在场"断言 ✗）。 */
+function queryButtonByText(el: HTMLElement, text: string): HTMLButtonElement | undefined {
+  return [...el.querySelectorAll('button')].find((item) => item.textContent === text) as HTMLButtonElement | undefined
+}
+
 function detailLine(el: HTMLElement, marker: string): string {
   const found = [...el.querySelectorAll('.dsh-screen-control-detail')]
     .map((node) => node.textContent ?? '')
@@ -474,7 +479,7 @@ function rootAccessJson(over: Record<string, unknown> = {}): string {
     granted: false,
     requesting: false,
     manager: { package: 'me.weishu.kernelsu', label: 'KernelSU', installed: true },
-    guidance: '尚未检测——点「请求 root 授权」会弹出 Root 管理器的授权框。',
+    guidance: '尚未检测——点「检测 root 授权」会尝试取一次 root 身份（多数管理器不会自动弹授权框，需你在管理器里允许）。',
     ...over,
   })
 }
@@ -683,12 +688,14 @@ describe('应用级 Root 授权面（2026-09-30 主人定例）', () => {
     expect(el.textContent).toContain('Root 授权（应用自身）')
     expect(el.textContent).toContain('未检测')
     expect(el.textContent).toContain('KernelSU')
-    expect(buttonByText(el, '请求 root 授权')).toBeTruthy()
-    expect(buttonByText(el, '打开 Root 管理器')).toBeTruthy()
+    expect(buttonByText(el, '检测 root 授权')).toBeTruthy()
     expect(buttonByText(el, '修复文件属主')).toBeTruthy()
+    // 2026-09-30 主人指正：**不做「打开 Root 管理器」入口**（各家管理器包名/入口不一，打开不保证成功）
+    expect(queryButtonByText(el, '打开 Root 管理器')).toBeUndefined()
+    expect(el.textContent).toContain('多数管理器不会自动弹授权框')
   })
 
-  it('请求授权走桥；管理器未装时按钮禁用', async () => {
+  it('检测授权走桥；无 su 时按钮禁用', async () => {
     const requestRootAccess = vi.fn(() => JSON.stringify({ ok: true, code: 'request-started' }))
     const el = await render({
       shizukuStatus: () => shizukuJson(),
@@ -696,7 +703,7 @@ describe('应用级 Root 授权面（2026-09-30 主人定例）', () => {
       rootAccessState: () => rootAccessJson({ state: 'denied' }),
       requestRootAccess,
     })
-    await act(async () => { buttonByText(el, '请求 root 授权').click() })
+    await act(async () => { buttonByText(el, '检测 root 授权').click() })
     expect(requestRootAccess).toHaveBeenCalled()
 
     const el2 = await render({
@@ -707,9 +714,9 @@ describe('应用级 Root 授权面（2026-09-30 主人定例）', () => {
         manager: { package: '', label: '', installed: false },
       }),
     })
-    expect(buttonByText(el2, '请求 root 授权').disabled).toBe(true)
-    expect(buttonByText(el2, '打开 Root 管理器').disabled).toBe(true)
-    expect(el2.textContent).toContain('未检测到 Root 管理器')
+    expect(buttonByText(el2, '检测 root 授权').disabled).toBe(true)
+    expect(el2.textContent).toContain('未检测到已知 Root 管理器')
+    expect(el2.textContent).toContain('若你用的是别的管理器或 ROM 内置 su')
   })
 
   it('修复文件属主回执带真实计数（不谎报「已修复」）', async () => {
