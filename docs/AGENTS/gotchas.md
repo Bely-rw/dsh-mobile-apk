@@ -1207,6 +1207,16 @@
     **同型提醒**：凡「两条链各写一份调用」的地方，都要问「是不是同一条命令、同一份缓存口径」。
       **开发链绿 ≠ 发布链绿**——这里的差别只有一个 `--offline`。
 
+215. **HTTP 状态不是引擎所有权证明（issue #295）**：本地 3080 上任意服务都可以返回 200、303、401 或 403；若壳侧只看状态码，会在 force/restart/update 路径把外部监听器当成自己的引擎，进而盲杀或反复 spawn。**真因**是健康探测与所有权证明混用。**修法**：`EngineProbe.check().running` 保留健康语义，但破坏性启动/停止/认证恢复必须只接受本壳托管子进程，或当前 generation 的 `engine.log` token 行；旋转日志、未知 generation、精确 origin 之外一律 fail closed。停止后及 spawn 前必须再次确认端口已释放；TOCTOU 抢占只记录一次 `PORT_FOREIGN`，不得用 `pkill -f bin.js` 兜底。
+
+216. **启动轮询的 401 也不能绕过所有权门禁（issue #295）**：WebView 的 main-frame 401 之外，启动线程直接探测到的 401 同样可能来自外部监听器；若直接调用 `EngineAuth.handleUnauthorized`，会清理/刷新壳侧 cookie 并把非本引擎当成认证失败。**修法**：启动轮询复用精确本地 origin + owned-process/current-generation proof + main-frame policy helper，未证明归属时只记录拒绝，不触发认证恢复。
+
+217. **自包含 release checkout 的 runtime asset 门禁不能靠目录猜测（2026-09-29，release run 36589913818）**：**现象**：release workflow 的 checkout 确实包含 `app/src/main/assets/patched/*.js`，快照双 ABI 也构建成功，但严格门禁报告 `/home/runner/work/dsh-mobile-apk/dsh-mobile-apk/dsh-mobile-apk/app/src/main/assets/patched` 不存在，双 ABI 均被拒，因而没有创建 draft Release。**真因**：`check-runtime-assets.mjs` 只用 `ROOT/dsh-mobile-apk` 是否存在来猜协调仓布局；自包含 checkout/本地来源链已通过 `DSH_APK_DIR` 明确传入 APK 根，却被忽略，布局探测把门禁指向 phantom nested path。**修法**：`DSH_APK_DIR` 存在时优先 `resolve()` 使用它，目录猜测只作兼容回退；不放宽 `--require`，不自动生成或绕过 `assets/patched`。**复验证据**：APK 仓 `node scripts/check-runtime-assets.mjs x86_64 --snapshot app/src/main/assets/snapshot.tar.xz --require` 通过（3 资产逐字节同源、2 行为回归）；协调仓 `check-patch-mirror.mjs` 通过。发布链修复后必须重新触发 workflow 并核验 draft Release 资产面。
+
+218. **自包含 release checkout 的 APK 打包路径不能在版本解析后重新硬编码（2026-09-29，release run 36596312313）**：**现象**：修复 `DSH_APK_DIR` 后，`CHECK-RUNTIME-ASSETS PASSED（abi=arm64，核对组合 3，SKIP=0）`，但随后构建阶段把快照写到被覆盖的 nested `$apkDir`；指纹门禁仍在正确 APK 根检查，报告 `SNAPSHOT-FINGERPRINT CHECK FAILED：快照 tar 不在场（app/src/main/assets/snapshot.tar.xz）`，整链在 `build-apk-013.ps1:455` 拒绝。**真因**：脚本开头已按布局把 `$apkDir` 正确解析为协调仓的 `Root\dsh-mobile-apk` 或自包含仓的 `Root`，但版本读取和输出目录计算后又无条件赋值 `$apkDir = Join-Path $Root "dsh-mobile-apk"`；同一脚本同时支持两种布局，却在中段丢弃了前置自检测结果。**修法**：删除覆盖，保留前置解析结果；不改变协调仓布局行为。**复验证据**：`check-patch-mirror.mjs` 与 `check-build-chain-abort.mjs --self-test` 均通过；失败日志中 runtime asset 门禁已通过，下一次 release workflow 必须验证双 ABI 继续通过。
+
+219. **跨平台发布链不能假设 PowerShell 的 `$env:TEMP` 存在（2026-09-29，release run 36599977147）**：**现象**：两处 self-contained APK 根目录修复后，arm64 与 x86_64 均完成 runtime asset 门禁、快照指纹门禁和 `assembleDebug`；导出注入后快照时，`check-snapshot-asset.ps1` 在 `build-apk-013.ps1:485` 报 `Cannot bind argument to parameter 'Path' because it is null`，双 ABI 资产未归集，因而没有创建 draft Release。**真因**：Linux GitHub Actions 的 PowerShell 运行环境未提供 `$env:TEMP`，`Join-Path $env:TEMP ...` 生成 null 临时路径；Windows 本地环境有 TEMP，因此问题此前未暴露。**修法**：用 `[IO.Path]::GetTempPath()` 获取平台运行时临时目录；不降低 APK 内嵌快照与发布快照的一致性门禁。**复验证据**：失败日志显示两 ABI 的 `SNAPSHOT-FINGERPRINT CHECK PASSED` 与 `BUILD SUCCESSFUL`，仅 snapshot asset checker 在临时路径绑定处失败；修复后必须重新触发 workflow 并核验双 ABI 资产、MANIFEST 和 draft Release。
+
 
 
 215. **来源链的两处 `git clone` 没有「已存在则复用」守卫，本地复跑必撞（2026-09-29，本地链实测）**：

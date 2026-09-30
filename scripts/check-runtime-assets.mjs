@@ -28,7 +28,7 @@
 import { readFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
 import { TAR } from './lib/shell.mjs'
 import { createHash } from 'node:crypto'
-import { join, dirname, basename } from 'node:path'
+import { join, dirname, basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync, spawnSync } from 'node:child_process'
 
@@ -46,9 +46,14 @@ for (let i = 0; i < args.length; i += 1) {
   if (!args[i].startsWith('--')) ABI = args[i]
 }
 
-const APK_DIR = existsSync(join(ROOT, 'dsh-mobile-apk'))
-  ? join(ROOT, 'dsh-mobile-apk')
-  : ROOT
+// CI/local source chains provide the exact APK root; prefer it over layout guessing.
+// Without this override, a self-contained checkout can be misread as a coordination
+// root when a same-named directory exists, sending the strict gate to a phantom path.
+const APK_DIR = process.env.DSH_APK_DIR
+  ? resolve(process.env.DSH_APK_DIR)
+  : existsSync(join(ROOT, 'dsh-mobile-apk'))
+    ? join(ROOT, 'dsh-mobile-apk')
+    : ROOT
 const SNAP = SNAP_OVERRIDE ? SNAP_OVERRIDE : join(ROOT, '.deploy-tmp', 'snapshot-013', ABI, 'snapshot.tar.xz')
 const SNAPSHOT_NAME = basename(SNAP)
 const ASSETS = join(APK_DIR, 'app', 'src', 'main', 'assets', 'patched')
