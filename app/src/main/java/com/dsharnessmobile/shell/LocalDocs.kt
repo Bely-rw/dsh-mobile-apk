@@ -63,7 +63,7 @@ object LocalDocs {
       ?: return answer(false, "missing-asset")
     val assetPath = (verdict as LocalDocVerdict.Openable).path
 
-    // ── 线程纪律（2026-09-30 用户实测闪退的修法，坑 217）──────────────────────────
+    // ── 线程纪律（2026-09-30 用户实测闪退的修法，坑 226）──────────────────────────
     // 本方法由 `@JavascriptInterface` 从 **JavaBridge 线程**调用；WebView 与 AlertDialog
     // 都是 UI 对象，**必须在主线程创建/显示**。旧实现在 JavaBridge 线程直接构造 WebView
     // 并 show()：bridge 回包能带回 IllegalStateException（被本函数的 catch 抓到），但随后
