@@ -180,6 +180,42 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 **计数**：`@JavascriptInterface` 方法数一律由 `scripts/check-bridge-symmetry.mjs` 从源码现取，本节不写死数字。
 **门禁面（已更新）**：`check-bridge-symmetry.mjs` 现扫**三个** surface —— `androidBridge`、`backGateBridge`、**`consoleBridge`（0.14.2 新纳入；此前该桥面的方法不在任何门禁面）**。各 surface 的方法与成员数一律由门禁从源码现取（`node scripts/check-bridge-symmetry.mjs` 的输出行），本节不写死。
 
+## 0.14.2-fx-2-root.1 增量（AI root 权限授权开关——issue #262 方案 A，2026-09-30，本地变体）
+
+> 背景：issue #262（feature 登记）——已 root 设备上把设备完全开放给 AI 前需要一个**策略门 + 免责确认门**。
+> 已确证前提：root 能力来自「Shizuku 服务端以 root 启动」（通道身份 uid=0），**开关不授予任何能力**；
+> 探测判据必须用**通道身份**而不是「设备是否 root」（已 root 但 Shizuku 以 ADB 启动 ⇒ 通道只有 uid 2000，置灰）。
+> 审计前置（`ControlAudit` result 三态化）已于 0.14.2 G-7 修复，本增量直接落地。
+
+| 方向 | 方法 | 位置 | 说明 |
+|---|---|---|---|
+| 页面 → 壳 | `rootGrantState()` | `AndroidBridge.kt`（默认实现钉真源）→ `RootGrant.state` | 开关读面 JSON：`granted/consentValid/consentVersionCode/currentVersionCode/channelUid/channelRoot/canToggle/honesty`。**判据 = 通道身份**（`Shizuku.getUid()==0`），读不到 uid 按 -1 处理（fail-closed，不猜）。`honesty` 字段如实说明「策略门+知情同意门，不是技术沙箱」 |
+| 页面 → 壳 | `setRootGranted(on)` | AndroidBridge → `RootGrant.setGranted` | 开关写面。[RootGrant.decision] 判据（通道 root + 同意有效）全满足才写入；关闭永远允许。返回写后读回 JSON，拒绝带 `code`（`not-root-channel` / `consent-required`）与 `guidance` |
+| 页面 → 壳 | `setRootConsent(on)` | AndroidBridge → `RootGrant.setConsent` | 「已阅读」确认写面。勾选 = 同意并**与 versionCode 绑定**（升级后自动失效需重新确认）；**取消勾选即撤销同意并同时关闭开关**（issue 用户指定语义，不留矛盾态） |
+| 页面 → 壳 | `openRootDisclaimer()` | AndroidBridge → MainActivity `onOpenRootDisclaimer` → `LocalDocs.open` | 免责声明文档通道：APK 内 assets（`docs/root-disclaimer.html`，离线/随版本/不可远端替换）。**不复用 [ExternalLinks]**（其 classify 只允许 https），新开同形本地通道：页面只传 key（固定 `root-disclaimer`），登记表在壳侧 `LocalDocs.kt`。应用内 AlertDialog+WebView 渲染 |
+| 同上（承重墙：策略门） | — | `ShizukuTransport.rootGateRefusal` + `readyService`/`runController` 入口 | 通道 uid==0 且未授权 ⇒ 特权执行面（runShell/pullFile/pushFile/removeRemote/runController）**整体 fail-closed**（code `root-grant-required`）。不做按 op 分类的假隔离（issue 已确证 uid 0 下 shExec 任意 shell，白名单挡不住引号逃逸） |
+| 同上（页面消费） | — | `dsh-client-ui-responsive` 手机控制 Shizuku 区块下方 | 开关 + 「已阅读」复选（带蓝色超链接开免责声明）；非 root 通道：开关置灰 + **红字「无法在未 root 的设备上赋予该权限」**（用户指定文案，逐字） |
+
+**计数**：方法数由 `scripts/check-bridge-symmetry.mjs` 从源码现取（四方法 Kotlin/TS 两侧同批声明，无需登记 kotlinOnly）。
+
+## 0.14.2-fx-2-root.2 增量（应用级 root 授权面 + 属主自愈，2026-09-30，本地变体）
+
+> 背景（主人两问换来）：①「这个开关应该调用一下 root 弹窗，并且检测 root 是否授权，如果没有，请写好引导去 Root 管理器，授予 root」；
+> ②「为什么要弄 shizuku 的事情我们不是做 root 适配吗？」——issue #262 的设计建立在 Shizuku 上（其测试机 su 不可达），
+> 而本机 **su 可用**（KernelSU）⇒ root 能力不该押在「Shizuku 已装+在跑+已授权+服务端为 root」四件事上。
+> 另有一条实测缺陷：**Shizuku 授权请求此前只在后台路径自动发起**，而 `requestPermission` 需要前台 Activity
+> ⇒ 静默失败（管理器「应用管理」列表里根本没有本应用、状态恒 denied，用户没有任何可点的授权入口）。
+
+| 方向 | 方法 | 位置 | 说明 |
+|---|---|---|---|
+| 页面 → 壳 | `rootAccessState()` | AndroidBridge（默认实现钉真源）→ `RootAccess.state` | 应用级 root 授权**纯读**面（**永不触发弹窗**）：`suExists/suPath/state(unknown\|requesting\|granted\|denied\|timeout\|no-su)/uid/granted/requesting/manager{package,label,installed}/guidance` |
+| 页面 → 壳 | `requestRootAccess()` | AndroidBridge → `RootAccess.requestGrant` | **显式检测/请求 root 授权**：后台 `su -c id` 取一次真实身份。★**多数管理器不会因此自动弹授权框**（除 Magisk 外得用户自己打开管理器授予，2026-09-30 主人指正）⇒ 本方法只承诺「取一次真实身份并如实回报」，不承诺弹窗。非阻塞（立即返回 `request-started`，结果靠 2s 轮询收敛）；**幂等**（在飞时不重复起）；25s 有界超时，超时如实回 `timeout`（**不是拒绝**） |
+| 页面 → 壳 | ~~`openRootManager()`~~ **已移除**（2026-09-30 主人指正） | — | **不做「打开 Root 管理器」入口**：各家管理器包名/入口不一（KernelSU / Magisk / APatch 之外还有 SukiSU 等分支，部分 ROM 甚至没有管理器 App）⇒ `getLaunchIntentForPackage` 不保证拿得到入口 ✗；而"能刷 root 的用户自己会开管理器" ✓ ⇒ 改为**诚实引导**（识别到管理器就报它的名字，识别不到就说"你使用的 Root 管理器"）。`rootAccessState` 保留 `manager{package,label,installed}` 只读字段供展示 |
+| 页面 → 壳 | `repairRootOwnership()` | AndroidBridge → `ShizukuTransport.autoHealOwnership` | **属主自愈**：root 通道写盘留下的 `root:root` 属主会让应用读不回来（watcher/插件/引擎读写连带失败）。有界抽查 + 有界修复，返回 `{ok,channelUid,transport,checked,healed,failures,skipped?}`。**不受 AI 授权门约束**（它是应用修自己文件的自愈面，不是模型能力） |
+| 页面 → 壳 | `requestShizukuPermission()` | AndroidBridge → MainActivity → `ShizukuTransport.requestPermission` | **显式请求 Shizuku 授权**（UI 线程 + 前台 Activity；后台自动请求落不到用户眼前——实测管理器列表里没有本应用）。返回写后回读 status + `requested` |
+| 同上（承重墙：su 直连） | — | `RootAccess.execRoot` + `ShellOps.exec` 回退 | 特权 shell 在 **Shizuku 通道级失败**（code 前缀 `shizuku-`/`root-grant-required`/`shell-transport`）时自动改走 su（命令自身 exit≠0 不重跑——那是命令的事实不是通道的问题）。**AIDL v3**：`configure(appUid, appDataDir)` + `writeChunk` 写后自愈 + `repairOwnership` 有界遍历（`lchown` 不跟随符号链接） |
+| 同上（启动路径） | — | `EngineStartFlow.start()` 前置自愈 + `GuidePageRenderer` 失败相位自动自愈 | 自愈**必须在启动路径上**：root 属主污染会让引擎/快照事务读不了自己的文件 ⇒ 启动即挂，而启动挂了的用户进不到设置页（按钮形同虚设）。实测：种污染 → 只启动应用（不碰 UI）→ 自动修回应用 uid |
+
 ## 0.14.1 增量（Shizuku 引导面与外部链接通道，2026-09-22）
 
 > 背景：0.14.1 UI 审查发现设置页「手机控制」的 Shizuku 区块**读的是 `vdisplayStatus()`**——

@@ -80,7 +80,15 @@ class MainActivity : ComponentActivity() {
   private val pickToken: String = EngineManager.ensurePickToken()
 
   /** 跨类 ::isInitialized 形式（EngineStartFlow 监控/冻结看门狗用；语义等价原 lambda 内检查）。 */
-  internal val webViewReady: Boolean get() = ::webView.isInitialized
+  private val pageRecovery = ForegroundPageRecoveryPolicy()
+  private var pendingWebPresentation = false
+  private var pendingAuthRejectedUrl: String? = null
+  private var pendingEngineCookie: String? = null
+  private var initialAuthRecoveryDeadline = 0L
+  @Volatile private var initialAuthRecoveryPending = false
+  private val initialAuthRecoveryInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+  internal val pageUiActive: Boolean get() = pageRecovery.foreground && !pageRecovery.rendererGone && !isFinishing && !isDestroyed
+  internal val webViewReady: Boolean get() = ::webView.isInitialized && !pageRecovery.rendererGone
   internal val guideViewReady: Boolean get() = ::guideView.isInitialized
 
   internal val guideRenderer by lazy { GuidePageRenderer(this) }
@@ -190,20 +198,100 @@ class MainActivity : ComponentActivity() {
   //    的调用面保持不变：onCreate/onResume/监控/WebViewClient/引导按钮共用入口）。 ——
 
   /** 引擎启动流（委托 EngineStartFlow.start）。 */
-  internal fun startEngineFlow() = engineFlow.start()
+  internal fun startEngineFlow() {
+    if (isFinishing || isDestroyed) return
+    // Automatic callers already exclude userClosedEngine. Only the explicit
+    // start outlet may clear a saved/persisted user shutdown.
+    if (userClosedEngine) {
+      userClosedEngine = false
+      EngineService.setUserShutdown(this, false)
+    }
+    if (EngineService.userShutdown) return
+    if (pageRecovery.rendererGone) {
+      pageRecovery.userReloadRequested()
+      recoverPageIfPending()
+    } else {
+      engineFlow.start()
+    }
+  }
 
   /** 引导页状态渲染（委托 GuidePageRenderer；EngineStartFlow/前台监控经此驱动）。 */
   internal fun applyGuidePhase(phase: GuidePhase, title: String, hint: String? = null) =
     guideRenderer.applyGuidePhase(phase, title, hint)
 
   /** 回退测试界面（委托 GuidePageRenderer）。 */
-  internal fun showGuide() = guideRenderer.showGuide()
+  internal fun showGuide() {
+    if (pageRecovery.rendererGone) {
+      if (guideViewReady) guideView.visibility = View.VISIBLE
+      return
+    }
+    guideRenderer.showGuide()
+  }
 
   /** 恢复 WebUI（委托 GuidePageRenderer）。 */
-  internal fun showWeb() = guideRenderer.showWeb()
+  internal fun showWeb() {
+    if (userClosedEngine || EngineService.userShutdown || isFinishing || isDestroyed || !webViewReady) return
+    if (engineManager.snapshotFingerprintProblem() != null) return
+    if (!pageUiActive) { pendingWebPresentation = true; return }
+    pendingWebPresentation = false
+    if (enginePageFailed) {
+      if (!pageRecovery.claimLoadErrorRetry()) {
+        applyGuidePhase(GuidePhase.Error, "页面加载失败", "前台自动重试后仍未恢复；可手动刷新界面或打开日志排查，不会循环重载。")
+        return
+      }
+      reloadEnginePage()
+    }
+    guideRenderer.showWeb()
+    engineFlow.startFreezeWatchdog()
+  }
+
+  /** Automatic page refreshes coalesce while paused and never issue background navigation. */
+  internal fun reloadEnginePage() {
+    if (userClosedEngine || isFinishing || isDestroyed) return
+    pageRecovery.requestReload()
+    recoverPageIfPending()
+  }
+
+  internal fun retryFailedEnginePage() {
+    if (enginePageFailed && pageRecovery.claimLoadErrorRetry()) reloadEnginePage()
+  }
+
+  private fun recoverPageIfPending(): Boolean {
+    if (isFinishing || isDestroyed) return false
+    return when (pageRecovery.takeRecovery()) {
+      ForegroundPageRecoveryPolicy.Recovery.NONE -> false
+      ForegroundPageRecoveryPolicy.Recovery.RELOAD -> {
+        if (!userClosedEngine && webViewReady) {
+          pendingEngineCookie?.let { cookie ->
+            try { android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie) } catch (e: Exception) { Log.w(TAG, "deferred auth cookie injection failed", e) }
+            pendingEngineCookie = null
+          }
+          enginePageFailed = false
+          try { webView.reload() } catch (e: Exception) { Log.w(TAG, "foreground page recovery reload failed", e) }
+        }
+        false
+      }
+      ForegroundPageRecoveryPolicy.Recovery.NATIVE_ERROR -> {
+        showGuide()
+        applyGuidePhase(GuidePhase.Error, "页面渲染失败", "自动重建已尝试一次；请在此手动重试或查看日志，不会循环重建页面。")
+        true // onResume must not access the dead WebView after exposing the native recovery outlet.
+      }
+      ForegroundPageRecoveryPolicy.Recovery.RECREATE -> {
+        // BrowserHost/VdisplayHost also retain this WebView; a new Activity rebinds all owners once.
+        pageRecovery.pause()
+        engineFlow.stopMonitoring()
+        recreate()
+        true
+      }
+    }
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    userClosedEngine = (savedInstanceState?.getBoolean("dsh.engine-user-closed", false) ?: false) ||
+      EngineService.userShutdown || EngineService.isUserShutdownPersisted(this)
+    if (userClosedEngine) EngineService.userShutdown = true
+    pageRecovery.restoreRecreationBudget(savedInstanceState?.getBoolean("dsh.renderer-recreation-attempted", false) ?: false)
     // 0.13.3 W2：引擎鉴权模块绑定应用上下文（EngineProbe 等 object 调用方的 cookie 来源）。
     EngineAuth.initContext(this)
     // 崩溃标记：进程级未捕获异常写入 filesDir/.crashed（下次启动测试界面
@@ -317,7 +405,7 @@ class MainActivity : ComponentActivity() {
       // 校验净化→后台拷贝临时工作区→待发清单投递引擎侧插件；拒绝/失败经 showTestNotification 提示。
       // 0.13.8 #174：startEngineFlow 提前——引擎启动是异步的，先拉起缩短
       // 「拷完 POST 早于引擎 listen」的竞态窗口（投递另有待发清单 + 引擎就绪钩子兜底）。
-      startEngineFlow()
+      if (!userClosedEngine) startEngineFlow()
       FileIncoming.processIncomingIntent(this, intent) { title, text -> showTestNotification(title, text) }
       // P0-1：冷启动路径的通知落点（热路径在 onNewIntent）。放在 startEngineFlow 之后：
       // 落点要等页面把会话列表装起来，故这里只登记，真正的投递由页面就绪/onNewIntent 触发。
@@ -355,12 +443,14 @@ class MainActivity : ComponentActivity() {
   /** 把待投递的通知落点交给页面；页面未就绪则留到 onPageFinished 再送一次。 */
   internal fun deliverNotifyRoute() {
     val session = pendingNotifySession ?: return
-    if (!webViewReady || webView.visibility != android.view.View.VISIBLE) return
+    if (!pageUiActive || !webViewReady || webView.visibility != android.view.View.VISIBLE) return
     pendingNotifySession = null
     val script = "(() => { try { return (typeof window.__dshOpenSession === 'function') && window.__dshOpenSession(" +
       jsString(session) + ") === true } catch (e) { return false } })()"
     try {
+      val generation = pageRecovery.generation
       webView.evaluateJavascript(script) { raw ->
+        if (!pageRecovery.accepts(generation)) { pendingNotifySession = session; return@evaluateJavascript }
         if (raw?.trim() != "true") {
           // 落点失败必须可见：会话可能已被删除，或页面还没装好会话视图。
           notifyRouteFailed()
@@ -374,6 +464,7 @@ class MainActivity : ComponentActivity() {
 
   private fun notifyRouteFailed() {
     runOnUiThread {
+      if (!pageUiActive) return@runOnUiThread
       try {
         Toast.makeText(this, "无法打开对应的会话（可能已被删除）——请从会话列表手动选择", Toast.LENGTH_LONG).show()
       } catch (_: Throwable) {
@@ -388,6 +479,17 @@ class MainActivity : ComponentActivity() {
 
   override fun onResume() {
     super.onResume()
+    pageRecovery.resume()
+    if (recoverPageIfPending()) {
+      if (!userClosedEngine) engineFlow.startEngineService() // Native fallback/recreation does not disable task protection.
+      return // A dead renderer is never reused, even by a liveness callback.
+    }
+    if (pendingWebPresentation) showWeb()
+    pendingAuthRejectedUrl?.let { url ->
+      pendingAuthRejectedUrl = null
+      scheduleEngineAuthRecovery(url)
+    }
+    if (initialAuthRecoveryPending) startInitialEngineAuthRecovery()
     if (::browserHost.isInitialized) browserHost.onActivityResumed()
     // 0.14.0：内置 adb 退役——原 ST-01「回前台同步 All Files Access 偏好」随 ADB 授权面一并移除
     // （特权面改由 Shizuku 承载，不再有需要回前台收敛的门1 prefs）。
@@ -418,7 +520,7 @@ class MainActivity : ComponentActivity() {
     OverlayService.frameConsumer = { js ->
       runOnUiThread {
         try {
-          if (::webView.isInitialized) webView.evaluateJavascript(js, null)
+          if (pageUiActive && webViewReady) webView.evaluateJavascript(js, null)
         } catch (_: Exception) {
         }
       }
@@ -448,6 +550,10 @@ class MainActivity : ComponentActivity() {
     if (::webView.isInitialized) {
       pushSystemDark(webView)
       pushWebInsets()
+      if (isEngineSource(webView.url ?: "")) {
+        deliverNotifyRoute()
+        deliverRecoveryNotice()
+      }
     }
     // M3：从系统授权页返回——上次 pick 因缺权限挂起时按授权结果续启/结算（迁至 DirectoryPickerController）。
     dirPickerController.settlePendingOnResume()
@@ -483,12 +589,15 @@ class MainActivity : ComponentActivity() {
    * （reason/latencyMs，不含任何令牌）。
    */
   private fun probeEngineOffMainThread(onResult: (Boolean) -> Unit) {
+    if (userClosedEngine || EngineService.userShutdown || isFinishing || isDestroyed) return
+    val generation = pageRecovery.generation
     Thread {
       val probe = try {
         EngineProbe.check()
       } catch (t: Throwable) {
         org.json.JSONObject().put("running", false).put("error", t.javaClass.simpleName)
       }
+      if (!pageRecovery.accepts(generation) || userClosedEngine || EngineService.userShutdown || isFinishing || isDestroyed) return@Thread
       val running = probe.optBoolean("running", false)
       if (!running) {
         LogCollector.log(
@@ -499,7 +608,7 @@ class MainActivity : ComponentActivity() {
       }
       runOnUiThread {
         try {
-          if (!isFinishing && !isDestroyed) onResult(running)
+          if (pageRecovery.accepts(generation) && !userClosedEngine && !EngineService.userShutdown && !isFinishing && !isDestroyed) onResult(running)
         } catch (_: Throwable) {
         }
       }
@@ -514,8 +623,9 @@ class MainActivity : ComponentActivity() {
   }
 
   override fun onPause() {
-    // BrowserHost owns a separate renderer. Pause only that WebView; never call the global
-    // WebView.pauseTimers(), which would suspend the trusted DSH page as well.
+    pageRecovery.pause()
+    engineFlow.stopMonitoring() // Only Activity page probes/heartbeats; EngineService task watchdog remains running.
+    // BrowserHost owns its independent background policy; do not pause global WebView timers.
     if (::browserHost.isInitialized) browserHost.onActivityPaused()
     super.onPause()
   }
@@ -567,12 +677,19 @@ class MainActivity : ComponentActivity() {
     super.onStop()
   }
 
+  override fun onSaveInstanceState(outState: Bundle) {
+    outState.putBoolean("dsh.engine-user-closed", userClosedEngine)
+    outState.putBoolean("dsh.renderer-recreation-attempted", pageRecovery.rendererRecreationAttempted)
+    super.onSaveInstanceState(outState)
+  }
+
   override fun onDestroy() {
+    engineFlow.destroy() // Invalidate and cancel startup callers before destroying their page owners.
+    pageRecovery.pause()
     // #128 L1：控制面不再持有已销毁 Activity 的 WebView。
-    webViewRef = null
+    if (::webView.isInitialized && webViewRef === webView) webViewRef = null
     // 悬浮球避让帧消费者清除（Service 侧持有引用，避免 Activity 泄漏）
     OverlayService.frameConsumer = null
-    engineFlow.stopMonitoring()
     dirPickerController.cancelTtl()
     guideRenderer.cancelPulse()
     // 兜底释放：Activity 销毁时清掉可能仍持有的屏幕常亮锁。
@@ -590,7 +707,7 @@ class MainActivity : ComponentActivity() {
       browserHost.destroy()
       if (BrowserHostHolder.host === browserHost) BrowserHostHolder.host = null
     }
-    if (::webView.isInitialized) {
+    if (webViewReady) {
       themeRetryRunnable?.let { webView.removeCallbacks(it) }
       webView.destroy()
     }
@@ -619,8 +736,8 @@ class MainActivity : ComponentActivity() {
   private fun installBackGate() {
     onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
       override fun handleOnBackPressed() {
-        val canGoBack = ::webView.isInitialized && webView.canGoBack()
-        val pageStack = backGateState.pageStackAvailable
+        val canGoBack = webViewReady && webView.canGoBack()
+        val pageStack = webViewReady && backGateState.pageStackAvailable
         val decision = BackGate.decide(canGoBack, pageStack)
         Log.i(
           BackGate.TAG,
@@ -649,7 +766,9 @@ class MainActivity : ComponentActivity() {
    */
   private fun pullBackGateState(view: WebView) {
     try {
+      val generation = pageRecovery.generation
       view.evaluateJavascript(BackGate.READ_DEPTH_SCRIPT) { raw ->
+        if (!pageRecovery.accepts(generation) || view !== webView) return@evaluateJavascript
         backGateState.onPageFinished(BackGate.parseDepth(raw))
       }
     } catch (t: Throwable) {
@@ -727,21 +846,8 @@ class MainActivity : ComponentActivity() {
         // Automatic recovery is intentionally narrower than diagnostics: only a main-frame 401 from
         // the exact local origin may proceed, and ownership is proved asynchronously before cookies change.
         // 403 is diagnostic-only: it must never clear, refresh, or reload authentication state.
-        if (errorResponse.statusCode == 401 && request.isForMainFrame && isEngineSource(request.url.toString()) &&
-          engineAuthReloadAttempts < ENGINE_AUTH_RELOAD_MAX && engineAuthRecoveryInFlight.compareAndSet(false, true)) {
-          val rejectedUrl = request.url.toString()
-          Thread {
-            try {
-              val availability = engineManager.probeAvailability()
-              if (EngineProbe.shouldAutoRecoverAuth(401, true, rejectedUrl, availability)) {
-                runOnUiThread { onEngineAuthRejected(rejectedUrl) }
-              } else {
-                LogCollector.log(TAG, "401 recovery refused: engine ownership not proven")
-              }
-            } finally {
-              engineAuthRecoveryInFlight.set(false)
-            }
-          }.apply { isDaemon = true; name = "engine-auth-ownership-probe" }.start()
+        if (errorResponse.statusCode == 401 && request.isForMainFrame && isEngineSource(request.url.toString())) {
+          scheduleEngineAuthRecovery(request.url.toString())
         }
       }
 
@@ -767,11 +873,12 @@ class MainActivity : ComponentActivity() {
       /**
        * §2.3：渲染进程被杀（低内存/OOM/厂商治理）此前主 WebView **零实现**（仅隔离
        * `BrowserHost.kt:634` 有）。不处理则 Activity 留在一个永不响应的 WebView 上——用户看到
-       * 「卡死」而不是「崩了」。这里落诊断并释放该 WebView 的渲染进程，交由既有引擎监控/引导页
-       * 路径恢复（不在此重建 WebView：重建属启动流程，避免在回调里引入第二套生命周期）。
+       * 「卡死」而不是「崩了」。这里落诊断并释放该 WebView；后台只登记一次待恢复，
+       * 前台经 Activity 重建重新绑定主页面、BrowserHost 与 VdisplayHost，不重启引擎。
        * @returns true = 已消费（WebView 不再被使用）。
        */
       override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+        if (pageRecovery.rendererGone) return true // Duplicate callbacks must not destroy or recreate twice.
         try {
           LogCollector.writeBootDiag(
             this@MainActivity,
@@ -782,8 +889,18 @@ class MainActivity : ComponentActivity() {
           Log.w(TAG, "render gone diag failed: " + (t.message ?: t.javaClass.simpleName))
         }
         enginePageFailed = true
+        pageRecovery.rendererLost()
+        engineFlow.stopMonitoring()
+        if (webViewRef === view) webViewRef = null
+        themeRetryRunnable?.let { view.removeCallbacks(it) }
+        backGateState.onPageStarted()
+        webFrameCommitted = false
+        webRevealPending = false
+        (view.parent as? ViewGroup)?.removeView(view)
         try { view.destroy() } catch (t: Throwable) { Log.w(TAG, "destroy after render-gone failed", t) }
-        showGuide()
+        // A background/OEM non-crash eviction is normal: record it, recover quietly on resume.
+        // Foreground crashes and foreground eviction also recreate once, without engine restart.
+        recoverPageIfPending()
         return true
       }
 
@@ -819,6 +936,7 @@ class MainActivity : ComponentActivity() {
 
       override fun onPageFinished(view: WebView, url: String) {
         super.onPageFinished(view, url)
+        if (!pageUiActive || view !== webView) return // Resume replays theme/insets/routes; do not restart background page probes.
         // 层栈缓存拉平（插件可能晚于首帧挂载，初始上行信号会漏）。
         if (isEngineSource(url)) pullBackGateState(view)
         pushSystemDark(view)
@@ -860,6 +978,7 @@ class MainActivity : ComponentActivity() {
         return try {
           when {
             LogCollector.isPageReadyMessage(text) -> {
+              pageRecovery.pageReady()
               engineFlow.onPageReadyReported(text)
               true
             }
@@ -935,8 +1054,8 @@ class MainActivity : ComponentActivity() {
         },
         onAllFilesAccessRequest = { dirPickerController.openAllFilesAccessSettings() },
 
-        onExportConfig = { ConfigTransfer(engineManager.homeDir, engineManager.dshDataDir).exportToShared() },
-        onImportConfig = { ConfigTransfer(engineManager.homeDir, engineManager.dshDataDir).importFromShared() },
+        onExportConfig = { engineManager.exportConfig() },
+        onImportConfig = { engineManager.importConfig() },
         onGetSystemDark = {
           (resources.configuration.uiMode and
             android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
@@ -951,8 +1070,11 @@ class MainActivity : ComponentActivity() {
         onRestartEngine = { engineFlow.restart() },  // S3-15：返回 Boolean，页面据此如实反馈
         onShutdownToGuide = { engineFlow.shutdownToGuide() },
         onReloadWebUI = {
-          webView.reload()
-          showTestNotification("界面已刷新", "Web UI 已重新加载")
+          runOnUiThread {
+            pageRecovery.userReloadRequested()
+            recoverPageIfPending()
+            if (pageUiActive) showTestNotification("界面已刷新", "Web UI 已重新加载")
+          }
         },
         onOpenConsole = { startActivity(Intent(this, ConsoleActivity::class.java)) },
         onGetDevLogEnabled = { DevLogControl.isEnabled(this) },
@@ -1021,9 +1143,15 @@ class MainActivity : ComponentActivity() {
         // （它会强制移除 Shizuku 侧 UserService），故不做任何自动触发；resetConnection 内部
         // 绝不同步等待新绑定（UI 路径），重置后的收敛交给既有 2s 轮询 + kickBind。
         onResetShizukuConnection = { ShizukuTransport.resetConnection(this).toString() },
+        // issue #262 免责门：免责声明走 APK 内 assets（LocalDocs 通道），页面不传路径。
+        onOpenRootDisclaimer = { LocalDocs.open(this, LocalDocs.ROOT_DISCLAIMER) },
+        // 2026-09-30：Shizuku 授权的**显式请求**入口（必须 UI 线程 + 前台 Activity，
+        // 后台自动请求落不到用户眼前 ⇒ 管理器列表里根本没有本应用、状态恒 denied）。
+        onRequestShizukuPermission = { ShizukuTransport.requestPermission(this).toString() },
       ),
       "androidBridge",
     )
+    // Startup ownership repair is owned by EngineStartFlow/EngineService before transaction recovery.
     // 返回策略（计划 §5.1 方案 1）：页面 → 壳的层栈上行接口。独立接口对象，只暴露
     // setAvailable/getBackAvailable 两个方法（授权面窄于 androidBridge 的 34 个方法）；
     // addJavascriptInterface 的方法调用是同步的——正是「同步决策」需要的形态。
@@ -1048,24 +1176,63 @@ class MainActivity : ComponentActivity() {
       val token = EngineAuth.tokenFromLog(this)
       webView.loadUrl(if (token != null) EngineProbe.ENGINE_URL + "/?token=" + token else EngineProbe.ENGINE_URL)
       // 全新安装首启竞态自愈（0.13.3 模拟器实测）：引擎冷启动期 token 行尚未打印，
-      // 首次 refresh/tokenFromLog 均落空 → WebView 载入 401 文案页。后台定期重试，
+      // 首次 refresh/tokenFromLog 均落空 → WebView 载入 401 文案页。仅前台定期重试，
       // 拿到 cookie 即注入 CookieManager 并重载一次（用户无感自愈，120s 预算封顶）。
-      Thread {
-        val deadline = System.currentTimeMillis() + 120_000L
+      initialAuthRecoveryPending = true
+      webView.post { startInitialEngineAuthRecovery() }
+    }
+  }
+
+  /** Stop the startup-cookie retry loop while paused; one pending refresh resumes in the foreground. */
+  private fun startInitialEngineAuthRecovery() {
+    if (!pageUiActive || userClosedEngine) return
+    if (!initialAuthRecoveryPending || !initialAuthRecoveryInFlight.compareAndSet(false, true)) return
+    initialAuthRecoveryPending = false
+    if (initialAuthRecoveryDeadline == 0L) initialAuthRecoveryDeadline = System.currentTimeMillis() + 120_000L
+    val deadline = initialAuthRecoveryDeadline
+    val generation = pageRecovery.generation
+    Thread {
+      try {
         while (System.currentTimeMillis() < deadline) {
-          // FX-210.5：refresh 在后台线程内同步执行（首个尝试不再延迟 5s）。
+          if (!pageRecovery.accepts(generation) || userClosedEngine || isFinishing || isDestroyed) {
+            initialAuthRecoveryPending = !userClosedEngine && !isFinishing && !isDestroyed
+            return@Thread
+          }
           val cookie = try { EngineAuth.refresh(this) } catch (_: Throwable) { null }
           if (cookie != null) {
-            try { android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie) } catch (_: Throwable) {}
             runOnUiThread {
-              try { if (!isFinishing && !isDestroyed) webView.reload() } catch (_: Throwable) {}
+              if (isFinishing || isDestroyed) return@runOnUiThread
+              pendingEngineCookie = cookie
+              reloadEnginePage() // Paused completions only arm one foreground navigation.
             }
             return@Thread
           }
           try { Thread.sleep(5_000) } catch (_: InterruptedException) { return@Thread }
         }
-      }.apply { isDaemon = true; name = "engine-auth-reload" }.start()
-    }
+      } finally {
+        initialAuthRecoveryInFlight.set(false)
+        // Cover pause→resume while a previous HTTP request was still settling.
+        if (initialAuthRecoveryPending && pageUiActive) runOnUiThread { startInitialEngineAuthRecovery() }
+      }
+    }.apply { isDaemon = true; name = "engine-auth-reload" }.start()
+  }
+
+  private fun scheduleEngineAuthRecovery(rejectedUrl: String) {
+    if (userClosedEngine || isFinishing || isDestroyed) return
+    if (!pageUiActive) { pendingAuthRejectedUrl = rejectedUrl; return }
+    if (engineAuthReloadAttempts >= ENGINE_AUTH_RELOAD_MAX || !engineAuthRecoveryInFlight.compareAndSet(false, true)) return
+    Thread {
+      try {
+        val availability = engineManager.probeAvailability()
+        if (EngineProbe.shouldAutoRecoverAuth(401, true, rejectedUrl, availability)) {
+          runOnUiThread { onEngineAuthRejected(rejectedUrl) }
+        } else {
+          LogCollector.log(TAG, "401 recovery refused: engine ownership not proven")
+        }
+      } finally {
+        engineAuthRecoveryInFlight.set(false)
+      }
+    }.apply { isDaemon = true; name = "engine-auth-ownership-probe" }.start()
   }
 
   /**
@@ -1073,6 +1240,8 @@ class MainActivity : ComponentActivity() {
    * @param url rejected exact local-engine URL (for diagnostics only).
    */
   private fun onEngineAuthRejected(url: String) {
+    if (userClosedEngine || isFinishing || isDestroyed) return
+    if (!pageUiActive) { pendingAuthRejectedUrl = url; return }
     val attempt = engineAuthReloadAttempts + 1
     engineAuthReloadAttempts = attempt
     LogCollector.log(TAG, "engine page rejected auth (attempt " + attempt + "): " + url)
@@ -1107,13 +1276,10 @@ class MainActivity : ComponentActivity() {
       // refresh 内含同步 HTTP（最长 8s）且持 EngineAuth 锁——绝不在主线程调用。
       val cookie = try { EngineAuth.handleUnauthorized(this) } catch (_: Throwable) { null }
       if (cookie == null) return@Thread
-      try {
-        android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie)
-      } catch (_: Throwable) {
-        return@Thread
-      }
       runOnUiThread {
-        try { if (!isFinishing && !isDestroyed) webView.reload() } catch (_: Throwable) {}
+        if (isFinishing || isDestroyed) return@runOnUiThread
+        pendingEngineCookie = cookie
+        reloadEnginePage()
       }
     }.apply { isDaemon = true; name = "engine-auth-selfheal" }.start()
   }
@@ -1165,7 +1331,7 @@ class MainActivity : ComponentActivity() {
     webRevealPending = true
     wv.alpha = 0f
     wv.postDelayed({
-      if (!webRevealPending) return@postDelayed
+      if (!webViewReady || wv !== webView || !webRevealPending) return@postDelayed
       webRevealPending = false
       wv.alpha = 1f
       LogCollector.log("dsh-web-reveal", "首帧在 ${WEB_REVEAL_FALLBACK_MS}ms 内未提交，按诊断底色直接显形")
@@ -1180,6 +1346,8 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun pushSystemDark(view: android.webkit.WebView) {
+    if (!pageUiActive || view !== webView) return
+    val generation = pageRecovery.generation
     val dark = (resources.configuration.uiMode and
       android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
       android.content.res.Configuration.UI_MODE_NIGHT_YES
@@ -1189,6 +1357,7 @@ class MainActivity : ComponentActivity() {
       )
       themeRetryRunnable?.let { view.removeCallbacks(it) }
       val runnable = Runnable {
+        if (!pageRecovery.accepts(generation) || view !== webView) return@Runnable
         try {
           view.evaluateJavascript(
             "window.__dshThemeBridge && window.__dshThemeBridge.setDark(" + dark + ")", null,
@@ -1216,7 +1385,7 @@ class MainActivity : ComponentActivity() {
    *   · 注入失败只记 trace，不抛、不阻塞页面。
    */
   private fun deliverRecoveryNotice() {
-    if (!::webView.isInitialized) return
+    if (!pageUiActive || !webViewReady) return
     // 本轮已注入过：直接重注内存里的文案（页面重载场景），不再碰文件标记。
     val remembered = SnapshotRecoveryNotice.inProcessText
     if (remembered != null) {
@@ -1261,7 +1430,7 @@ class MainActivity : ComponentActivity() {
    * onPageFinished. The seat CSS consumes the greater of system and IME inset.
    */
   private fun scheduleWebInsetsPush() {
-    if (!::webView.isInitialized || webInsetsPushScheduled) return
+    if (!pageUiActive || !webViewReady || webInsetsPushScheduled) return
     webInsetsPushScheduled = true
     webView.post {
       webInsetsPushScheduled = false
@@ -1270,6 +1439,7 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun pushWebInsets(view: WebView = webView) {
+    if (!pageUiActive || view !== webView) return
     try {
       view.evaluateJavascript(
         "(function(){var root=document.documentElement;if(!root)return;var top='" + webSystemTopInset +

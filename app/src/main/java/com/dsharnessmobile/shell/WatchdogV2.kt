@@ -188,14 +188,17 @@ object WatchdogV2 {
   var lastLogTail: String = ""
     private set
 
-  fun assessProbe(context: Context): ProbeState {
+  fun assessProbe(context: Context, callerCurrent: () -> Boolean = { true }): ProbeState {
+    if (!callerCurrent()) return ProbeState.DEAD
     val probe = EngineProbe.check(2_500)
+    if (!callerCurrent()) return ProbeState.DEAD
     // 「超时」与「拒绝」是两种病因：前者是慢，后者是死。记下来供证据面使用。
     lastProbeTimedOut = probe.optString("error", "") == "timeout"
     // 日志尾部**必须在任何早退之前读**：证据门关心的正是 DEGRADED_HTTP 这一支
     // （它就在下面那个 `if (!base)` 里提前返回）。旧写法把读取放在健康分支之后，
     // 于是最需要证据的时刻 lastLogTail 恒为空 —— 判据形同虚设。
     val tail = readEngineLogTail(context)
+    if (!callerCurrent()) return ProbeState.DEAD
     lastLogTail = tail
     lastLogSignature = logSignatureOf(tail)
     val base = probe.optBoolean("running", false)
@@ -239,12 +242,17 @@ object WatchdogV2 {
     consumeMarkers: () -> Unit,
     refreshWake: () -> Unit,
     undoReady: () -> Boolean,
+    callerCurrent: () -> Boolean = { true },
   ): TickPlan {
+    if (!callerCurrent()) return TickPlan(TickAction.HOLD)
     // ── 前置副作用（#210.3/#210.4）：与状态分类无关，先于一切早退 ──
     feedProbe(state == ProbeState.HEALTHY)
+    if (!callerCurrent()) return TickPlan(TickAction.HOLD)
     recordProbe(state, logSignature)
     consumeMarkers()
+    if (!callerCurrent()) return TickPlan(TickAction.HOLD)
     refreshWake()
+    if (!callerCurrent()) return TickPlan(TickAction.HOLD)
 
     val logs = ArrayList<String>(2)
     val degradedLadderTripped = state == ProbeState.DEGRADED_HTTP && degradedHttpTripped()
@@ -525,46 +533,63 @@ object WatchdogV2 {
     }
   }
 
-  /** 前台唤醒锁（标准档位；获取失败降级尽力模式并记录审计日志）。 */
-  private var wakeLock: PowerManager.WakeLock? = null
+  /** A terminal owner belongs to one Service epoch; no process-global wake handle exists. */
+  internal data class WakeAcquisition(val lock: PowerManager.WakeLock, val renewAt: Long)
+  internal class WakeLockOwner {
+    internal val acquisition = EpochResourceOwner<WakeAcquisition> { held ->
+      try { if (held.lock.isHeld) held.lock.release() } catch (_: Throwable) {}
+    }
+  }
 
-  fun acquireWakeLock(context: Context) {
-    if (wakeLock?.isHeld == true) return
+  internal fun acquireWakeLock(context: Context, owner: WakeLockOwner) {
     try {
-      val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dsh:engine").also {
-        it.setReferenceCounted(false)
-        it.acquire(30 * 60 * 1000L)
-      }
-      LogCollector.log(TAG, "wake lock acquired (30min standard)")
+      owner.acquisition.install(
+        acquire = {
+          val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+          val candidate = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dsh:engine")
+          try {
+            candidate.setReferenceCounted(false)
+            candidate.acquire(30 * 60 * 1000L)
+            WakeAcquisition(candidate, android.os.SystemClock.elapsedRealtime() + 25 * 60 * 1000L)
+          } catch (t: Throwable) {
+            try { if (candidate.isHeld) candidate.release() } catch (_: Throwable) {}
+            throw t
+          }
+        },
+        keepExisting = { held -> android.os.SystemClock.elapsedRealtime() < held.renewAt && held.lock.isHeld },
+      )
     } catch (t: Throwable) {
       Log.e(TAG, "wake lock acquire failed (degraded best-effort)", t)
-      LogCollector.log(TAG, "wake lock FAILED: ${t.message}")
     }
   }
 
-  /**
-   * 唤醒锁续期（2026-08-23 修复：acquire(30min) 是一次性定时释放——引擎常驻超过 30 分钟
-   * 后段无锁；releaseWakeLock 从未被调用，服务销毁时也漏释放）。watchdog tick 调用：
-   * 持有即重设 30 分钟窗口（setReferenceCounted=false 下 acquire 幂等续窗）。
-   */
-  fun refreshWakeLock(context: Context) {
-    try {
-      val held = wakeLock?.isHeld == true
-      if (held) {
-        wakeLock?.acquire(30 * 60 * 1000L)
-      } else {
-        acquireWakeLock(context)
-      }
-    } catch (_: Throwable) {
+  /** Renew with a new acquisition; a released handle is never re-acquired by a stale tick. */
+  internal fun refreshWakeLock(context: Context, owner: WakeLockOwner) = acquireWakeLock(context, owner)
+
+  internal fun releaseWakeLock(owner: WakeLockOwner) { owner.acquisition.close() }
+}
+
+/** CAS publication/terminal teardown. Acquisition and release may block, but never hold a lock. */
+internal class EpochResourceOwner<T : Any>(private val release: (T) -> Unit) {
+  private data class State<T>(val closed: Boolean = false, val resource: T? = null)
+  private val state = java.util.concurrent.atomic.AtomicReference(State<T>())
+
+  fun install(acquire: () -> T, keepExisting: (T) -> Boolean = { false }): Boolean {
+    val before = state.get()
+    if (before.closed) return false
+    if (before.resource?.let(keepExisting) == true) return state.get() === before
+    // Teardown may win while acquire waits in Binder. Its terminal state rejects publication.
+    val candidate = acquire()
+    if (!state.compareAndSet(before, State(resource = candidate))) {
+      release(candidate) // Only this unpublished acquisition; never the replacement owner's handle.
+      return false
     }
+    before.resource?.let(release)
+    return true
   }
 
-  fun releaseWakeLock() {
-    try {
-      wakeLock?.let { if (it.isHeld) it.release() }
-      wakeLock = null
-    } catch (_: Throwable) {
-    }
+  fun close() {
+    val before = state.getAndSet(State(closed = true))
+    before.resource?.let(release)
   }
 }

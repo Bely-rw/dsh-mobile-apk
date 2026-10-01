@@ -1,9 +1,11 @@
 package com.dsharnessmobile.shell
 
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
@@ -62,6 +64,9 @@ object ShizukuTransport {
 
   @Volatile private var connectedAt = 0L
   private var bindLatch: CountDownLatch? = null
+
+  /** v3：本连接是否已把「应用 uid + 数据目录」回填给 UserService（按连接代次去重）。 */
+  @Volatile private var configuredForAge = -1L
 
   private val connection = object : ServiceConnection {
     override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -180,7 +185,7 @@ object ShizukuTransport {
     .tag(USER_SERVICE_TAG)
     .processNameSuffix("dsh-vdisplay")
     .debuggable(BuildConfig.DEBUG)
-    .version(BuildConfig.VERSION_CODE)
+    .version(BuildConfig.VERSION_CODE * 10 + ShizukuUserServiceBridge.PROTOCOL_VERSION)
 
   /** Stable JSON state suitable for the native bridge and VirtualDisplay controller. */
   fun status(context: Context): JSONObject {
@@ -336,22 +341,119 @@ object ShizukuTransport {
     }
   }
 
-  /** Native-only fixed argv execution. Never pass user/model-controlled shell text here. */
-  fun runController(context: Context, argv: Array<String>): JSONObject {
-    val ready = ensureBound(context)
-    if (!ready.optBoolean("ok")) return ready
-    val remote = service ?: return status(context)
-      .put("ok", false).put("code", "shizuku-user-service-not-bound")
+  /**
+   * v3（2026-09-30）：把「本应用 uid + 数据目录」回填给 UserService（每次连接一次）。
+   *
+   * 为什么必须做：root 通道里 UserService 的 uid=0，它写的文件属主是 root:root——落进应用
+   * 数据目录就是**应用自己读不回来**（0600），watcher / 插件更新 / 引擎读写随之失败。
+   * 回填后 UserService 才能把 [writeChunk] 的产物与 [repairOwnership] 的目标修回应用 uid。
+   * 旧服务或未确认配置返回 false，执行面拒绝派发；不能在身份/归一化能力未知时继续写入。
+   */
+  private fun configureIfNeeded(context: Context): Boolean {
+    val remote = service ?: return false
+    val age = connectedAt
+    if (age <= 0L) return false
+    if (configuredForAge == age) return true
+    val app = context.applicationContext
+    val uid = app.applicationInfo.uid
+    val root = app.applicationInfo.dataDir
     return try {
-      val result = remote.exec(argv, 8_000)
-      JSONObject()
-        .put("ok", result.getBoolean("ok"))
-        .put("exitCode", result.getInt("exitCode"))
-        .put("stdout", result.getString("stdout"))
-        .put("error", result.getString("error"))
-    } catch (t: Throwable) {
-      status(context).put("ok", false).put("code", "shizuku-command-failed")
-        .put("guidance", t.javaClass.simpleName + ": " + (t.message ?: ""))
+      if (remote.protocolVersion() < ShizukuUserServiceBridge.PROTOCOL_VERSION) return false
+      remote.configure(uid, root)
+      val ack = remote.configuration()
+      val valid = ack.getBoolean("ok") && ack.getInt("appUid", -1) == uid &&
+        ack.getString("appDataDir") == root && ack.getInt("protocolVersion", -1) >= ShizukuUserServiceBridge.PROTOCOL_VERSION
+      if (valid) configuredForAge = age
+      valid
+    } catch (failure: Throwable) {
+      Log.w(TAG, "configure not acknowledged: " + failure.javaClass.simpleName)
+      false
+    }
+  }
+
+  /**
+   * 属主归一（root 通道写盘污染的固定自愈原语，v4）。**不受 AI 授权门约束**——它不是模型能力，
+   * 而是应用修自己文件的自愈面：目标必须落在应用数据目录内、uid/gid 由 UserService 侧
+   * 固定为已配置的应用 uid（不接受任意 uid/gid）。
+   */
+  fun repairOwnership(context: Context, path: String, maxEntries: Int = 20_000): JSONObject =
+    RootExecutionFence.maintenance(context) {
+      val (remote, refusal) = readyService(context, applyGate = false)
+      if (remote == null) return@maintenance refusal ?: unavailableShell()
+      if (!configureIfNeeded(context)) return@maintenance JSONObject().put("ok", false)
+        .put("code", "repair-configuration-required").put("reason", "repair-configuration-required")
+        .put("guidance", "UserService 未确认应用身份，请重置 Shizuku 连接后再试。")
+      val lease = RpcLease(context, "shizuku-ownership-repair", applyGate = false)
+      try {
+        lease.beforeRpc(remote)?.let { return@maintenance it }
+        val reply = remote.repairOwnership(path, maxEntries)
+        lease.acknowledged()
+        val result = bundleJson(reply).put("transport", "shizuku")
+        val verified = reply.getBoolean("ok") && reply.containsKey("checked") && reply.containsKey("healed") &&
+          reply.getInt("failures", -1) == 0 && reply.getInt("unverifiedMutations", -1) == 0 &&
+          reply.getInt("remaining", -1) == 0 && !reply.getBoolean("truncated") && !reply.getBoolean("deadlineExceeded")
+        lease.complete(result, definitive = verified)
+      } catch (failure: Throwable) {
+        lease.complete(JSONObject().put("ok", false).put("transport", "shizuku")
+          .put("code", "repair-result-unknown").put("reason", "repair-result-unknown")
+          .put("failures", 1).put("remaining", -1)
+          .put("guidance", "属主维护未返回完整验证结果；不重放，需先处理隔离状态。"), definitive = false)
+      }
+    }
+
+  /** Bounded deep walk reaches polluted startup leaves even when their ancestors are app-owned. */
+  fun autoHealOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context)
+
+  /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
+  fun prepareStartupOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context, reuseRecent = true)
+
+  internal fun autoHealOwnershipDirect(context: Context): JSONObject = RootExecutionFence.maintenance(context) {
+    val app = context.applicationContext
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    val viaSu = RootAccess.isGranted(app)
+    if (uid != RootGrant.ROOT_UID && !viaSu) return@maintenance JSONObject().put("ok", true)
+      .put("checked", 0).put("healed", 0).put("failures", 0).put("skipped", "no-root-path")
+    val root = java.io.File(app.applicationInfo.dataDir, "files").path
+    val result = if (viaSu) RootAccess.repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES, 20_000L)
+      else repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES)
+    result.put("channelUid", uid).put("transport", if (viaSu) "su" else "shizuku")
+  }
+
+
+  /**
+   * 显式请求 Shizuku 授权（**必须在 UI 线程 + 有前台 Activity**）。
+   *
+   * 为什么单独成方法（2026-09-30 实测）：`ensureBound` 里的自动请求跑在**后台线程**
+   * （repairOwnership / kickBind 的路径），Shizuku 的 `requestPermission` 需要当前 Activity
+   * 才能把授权对话框落到用户眼前——后台调用静默失败，结果是「管理器列表里根本没有本应用」
+   * 且状态恒为 denied（用户看不到任何可点的授权入口）。
+   *
+   * 返回写后回读的 [status]，并带 `requested` 说明这次是否真的发起了请求。
+   */
+  fun requestPermission(activity: Activity): JSONObject {
+    val requested = runCatching {
+      activity.runOnUiThread { runCatching { Shizuku.requestPermission(REQUEST_CODE_VDISPLAY) } }
+      true
+    }.getOrDefault(false)
+    return status(activity).put("requested", requested)
+  }
+
+  /** Native-only fixed argv execution. Never pass user/model-controlled shell text here. */
+  fun runController(context: Context, argv: Array<String>): JSONObject = RootExecutionFence.command(context) {
+    runControllerInternal(context, argv)
+  }
+
+  private fun runControllerInternal(context: Context, argv: Array<String>): JSONObject {
+    val (remote, refusal) = readyService(context)
+    if (remote == null) return refusal ?: unavailableShell()
+    val lease = RpcLease(context, "shizuku-controller")
+    return try {
+      lease.beforeRpc(remote)?.let { return it }
+      val reply = remote.exec(argv, 8_000)
+      lease.acknowledged()
+      lease.complete(bundleJson(reply).put("transport", "shizuku"), executionDefinitive(reply))
+    } catch (failure: Throwable) {
+      lease.complete(shellFailure(failure), definitive = false)
     }
   }
 
@@ -377,7 +479,15 @@ object ShizukuTransport {
   private const val SHELL_PATH_PREFIX = "export PATH=/system/bin:/system/xbin:\$PATH; "
 
   /** v2 协议面就绪判定：返回 (service, refusal)——refusal 非空即结构化拒绝，调用方直接透传。 */
-  private fun readyService(context: Context): Pair<ShizukuUserService?, JSONObject?> {
+  private fun readyService(context: Context, applyGate: Boolean = true): Pair<ShizukuUserService?, JSONObject?> {
+    // issue #262 方案 A 策略门（runShell/pullFile/pushFile/removeRemote 四个执行面的共同入口）：
+    // 通道身份为 root 且未授权时，在**发起任何绑定/执行之前**拒绝——不是按 op 分类放行，
+    // uid 0 下 shExec 是任意 shell，分类隔离不存在（诚实性要求），故整体关闭。
+    //
+    // applyGate=false 仅供**应用自愈面**（repairOwnership）使用：它只把应用自己数据目录里的文件
+    // 属主修回应用自己的 uid，不是模型能力、也不构成权限放大；被自己的策略门挡住会让
+    // 「root 通道 + AI 未授权」这一组合失去自愈能力（文档已如此承诺，实现必须一致）。
+    if (applyGate) rootGateRefusal(context)?.let { return null to it }
     val ready = ensureBound(context)
     if (!ready.optBoolean("ok")) return null to ready
     val remote = service
@@ -385,20 +495,41 @@ object ShizukuTransport {
       return null to status(context).put("ok", false).put("code", "shizuku-user-service-not-bound")
     }
     val pv = runCatching { remote.protocolVersion() }.getOrDefault(-1)
-    if (pv < 2) {
+    if (pv < ShizukuUserServiceBridge.PROTOCOL_VERSION) {
       return null to JSONObject().put("ok", false).put("code", "shizuku-user-service-too-old")
         .put("protocolVersion", pv)
-        .put("guidance", "Shizuku UserService 协议为 v$pv，本机需要 v2（0.14.0 大输出 / 文件取回面）；" +
-          "在设置页「手机控制」重新连接 Shizuku 会重启 UserService（无需重装）。")
+        .put("guidance", "Shizuku UserService 协议为 v$pv，本机需要 v${ShizukuUserServiceBridge.PROTOCOL_VERSION}；" +
+          "请在设置页「手机控制」重置连接，重启旧 UserService（无需重装）。")
     }
+    if (!configureIfNeeded(context)) return null to JSONObject().put("ok", false)
+      .put("code", "shizuku-configuration-required").put("reason", "shizuku-configuration-required")
+      .put("guidance", "UserService 未确认本应用身份，请重置连接后重试。")
+    if (applyGate) actualIdentityRefusal(context, remote)?.let { return null to it }
     return remote to null
   }
 
   /**
    * 特权 shell 执行（uid 2000）：`sh -c <command>`，PATH 前置系统目录（F3 远端 PATH 污染修复同源）。
    * capture=true 时大输出落 shell 侧 spool 文件，只回报前 8 KiB 与文件坐标（filePath/size）。
+   *
+   * ── issue #262「命令面引号逃逸」在本方案下的处置（2026-09-30 对账登记）──────────────
+   * issue 原文点名：`argv = [sh, -c, PREFIX+command]` 形态下，模型传 `'; id -u; '` 会**逃逸回 root**，
+   * 并规定「任何**降权/包装**方案必须走 argv（命令作为单个 argv 元素）」。
+   *
+   * 本仓现状 = issue 的**方案 A**（策略门 + 免责门 + 通道身份探测，**不做降权包装**）：
+   * 命令本就按通道身份（uid 0 或 2000）执行，不存在「被包装后逃逸出去」的对象 ⇒ 该向量在 A 下
+   * **不成立**，故此处不改为 argv 形态（改了也只是同一件事换个写法，不增加任何隔离）。
+   *
+   * ⚠️ **硬约束（留给将来）**：一旦引入任何降权/包装（如 `su -c "setuidgid N ..."` 形态），
+   * 必须把待执行命令作为**单个 argv 元素**传入（`ProcessBuilder(listOf(wrapper, "sh", "-c", command))`
+   * 或 AIDL 的 argv 数组），**绝不把 command 拼进被包装的 shell 字符串里**——否则模型可用引号
+   * 逃出包装、以包装者的身份执行（issue 已实测该逃逸）。
    */
-  fun runShell(context: Context, command: String, timeoutMs: Int = SHELL_TIMEOUT_MS, capture: Boolean = false): JSONObject {
+  fun runShell(context: Context, command: String, timeoutMs: Int = SHELL_TIMEOUT_MS, capture: Boolean = false): JSONObject = RootExecutionFence.command(context) {
+    runShellInternal(context, command, timeoutMs, capture)
+  }
+
+  private fun runShellInternal(context: Context, command: String, timeoutMs: Int = SHELL_TIMEOUT_MS, capture: Boolean = false): JSONObject {
     if (command.isBlank()) {
       return JSONObject().put("ok", false).put("code", "shell-empty").put("guidance", "空命令")
     }
@@ -406,32 +537,31 @@ object ShizukuTransport {
     if (remote == null) return refusal ?: unavailableShell()
     val timeout = timeoutMs.coerceIn(1_000, MAX_SHELL_TIMEOUT_MS)
     val argv = arrayOf("sh", "-c", SHELL_PATH_PREFIX + command)
+    val lease = RpcLease(context, if (capture) "shizuku-capture" else "shizuku-exec")
     return try {
+      // argv/timeout and all local setup are complete before the final dispatch-point check.
+      lease.beforeRpc(remote)?.let { return it }
+      val reply = if (capture) remote.execCapture(argv, timeout, 8 * 1024) else remote.exec(argv, timeout)
+      lease.acknowledged()
+      val result = bundleJson(reply).put("transport", "shizuku")
       if (capture) {
-        val b = remote.execCapture(argv, timeout, 8 * 1024)
-        JSONObject()
-          .put("ok", b.getBoolean("ok"))
-          .put("exitCode", b.getInt("exitCode"))
-          .put("stdout", String(b.getByteArray("inline") ?: ByteArray(0), Charsets.UTF_8))
-          .put("size", b.getLong("size"))
-          .put("truncated", b.getBoolean("truncated"))
-          .put("filePath", b.getString("path") ?: "")
-          .put("error", b.getString("error") ?: b.getString("readError") ?: "")
-      } else {
-        val b = remote.exec(argv, timeout)
-        JSONObject()
-          .put("ok", b.getBoolean("ok"))
-          .put("exitCode", b.getInt("exitCode"))
-          .put("stdout", b.getString("stdout") ?: "")
-          .put("error", b.getString("error") ?: "")
-      }
-    } catch (t: Throwable) {
-      shellFailure(t)
+        result.remove("inline")
+        result.remove("path")
+        result.put("stdout", String(reply.getByteArray("inline") ?: ByteArray(0), Charsets.UTF_8))
+          .put("filePath", if (reply.getBoolean("spoolReady")) reply.getString("path") ?: "" else "")
+      } else result.put("stdout", reply.getString("stdout") ?: "")
+      lease.complete(result, executionDefinitive(reply) && (!capture || reply.getBoolean("spoolReady")))
+    } catch (failure: Throwable) {
+      lease.complete(shellFailure(failure), definitive = false)
     }
   }
 
   /** 远端 → 应用私有目录（files/...）分块取回（pull 语义）。 */
-  fun pullFile(context: Context, remote: String, local: String): JSONObject {
+  fun pullFile(context: Context, remote: String, local: String): JSONObject = RootExecutionFence.command(context) {
+    pullFileInternal(context, remote, local)
+  }
+
+  private fun pullFileInternal(context: Context, remote: String, local: String): JSONObject {
     val target = engineLocalFile(context, local)
       ?: return JSONObject().put("ok", false).put("code", "shell-path-denied")
         .put("guidance", "本地落点必须是应用私有目录内的路径（files/...）：$local")
@@ -441,32 +571,39 @@ object ShizukuTransport {
     }
     val (remoteSvc, refusal) = readyService(context)
     if (remoteSvc == null) return refusal ?: unavailableShell()
+    val lease = RpcLease(context, "shizuku-pull")
+    var offset = 0L // Only bytes acknowledged by the remote and committed to the local sink.
     return try {
       target.parentFile?.mkdirs()
-      var offset = 0L
       java.io.FileOutputStream(target).use { sink ->
         while (true) {
-          val chunk = remoteSvc.readChunk(remote, offset, PULL_CHUNK) ?: return shellFailure(
-            IllegalStateException("远端不可读（不存在或权限不足）：$remote"),
-          )
+          lease.beforeRpc(remoteSvc)?.let { return transferFacts(it, offset) }
+          val chunk = remoteSvc.readChunk(remote, offset, PULL_CHUNK)
+          lease.acknowledged()
+          if (chunk == null) return transferFacts(lease.complete(shellFailure(
+            IllegalStateException("远端不可读（不存在或权限不足）：$remote"))), offset)
           if (chunk.isEmpty()) break
+          if (chunk.size > PULL_CHUNK || chunk.size.toLong() > MAX_TRANSFER_BYTES - offset) {
+            return transferFacts(lease.complete(JSONObject().put("ok", false).put("code", "shell-output-too-large")
+              .put("guidance", "远端文件超过传输上限：$remote")), offset)
+          }
           sink.write(chunk)
           offset += chunk.size
-          if (offset > MAX_TRANSFER_BYTES) {
-            return JSONObject().put("ok", false).put("code", "shell-output-too-large")
-              .put("guidance", "远端文件超过 ${MAX_TRANSFER_BYTES / (1024 * 1024)} MiB 上限：$remote")
-          }
         }
       }
-      JSONObject().put("ok", true).put("code", "shell-ok")
-        .put("localPath", target.absolutePath).put("path", target.absolutePath).put("size", offset)
-    } catch (t: Throwable) {
-      shellFailure(t)
+      lease.complete(JSONObject().put("ok", true).put("code", "shell-ok")
+        .put("localPath", target.absolutePath).put("path", target.absolutePath).put("size", offset).put("offset", offset))
+    } catch (failure: Throwable) {
+      transferFacts(lease.failed(failure), offset)
     }
   }
 
   /** 应用私有目录（files/...）→ 远端分块写入（push 语义）。 */
-  fun pushFile(context: Context, local: String, remote: String): JSONObject {
+  fun pushFile(context: Context, local: String, remote: String): JSONObject = RootExecutionFence.command(context) {
+    pushFileInternal(context, local, remote)
+  }
+
+  private fun pushFileInternal(context: Context, local: String, remote: String): JSONObject {
     val source = engineLocalFile(context, local)
       ?: return JSONObject().put("ok", false).put("code", "shell-path-denied")
         .put("guidance", "本地来源必须是应用私有目录内的路径（files/...）：$local")
@@ -480,48 +617,69 @@ object ShizukuTransport {
     }
     if (source.length() > MAX_TRANSFER_BYTES) {
       return JSONObject().put("ok", false).put("code", "shell-output-too-large")
-        .put("guidance", "本地文件超过 ${MAX_TRANSFER_BYTES / (1024 * 1024)} MiB 上限：$local")
+        .put("guidance", "本地文件超过传输上限：$local")
     }
     val (remoteSvc, refusal) = readyService(context)
     if (remoteSvc == null) return refusal ?: unavailableShell()
+    val lease = RpcLease(context, "shizuku-push")
+    var offset = 0L // Acknowledged successful chunks; never guess bytes written by a failed RPC.
     return try {
-      var offset = 0L
       java.io.FileInputStream(source).use { input ->
         val buf = ByteArray(PULL_CHUNK)
+        var sent = false
         while (true) {
           val n = input.read(buf)
-          if (n < 0) break
-          val slice = if (n == buf.size) buf else buf.copyOf(n)
-          val r = remoteSvc.writeChunk(remote, slice, offset > 0)
-          if (!r.getBoolean("ok")) {
-            return JSONObject().put("ok", false).put("code", "shell-write-failed")
-              .put("guidance", "${r.getString("error") ?: "远端写入失败"}（$remote）")
+          if (n < 0 && sent) break
+          if (n == 0) continue
+          val count = n.coerceAtLeast(0) // Empty source still dispatches one truncating empty write.
+          if (count.toLong() > MAX_TRANSFER_BYTES - offset) return transferFacts(lease.complete(
+            JSONObject().put("ok", false).put("code", "shell-output-too-large")), offset)
+          val slice = if (count == buf.size) buf else buf.copyOf(count)
+          val append = offset > 0
+          // Local read/copy completed: recheck actual UID + current effective consent EVERY chunk.
+          lease.beforeRpc(remoteSvc)?.let { return transferFacts(it, offset) }
+          val reply = remoteSvc.writeChunk(remote, slice, append)
+          lease.acknowledged()
+          if (!reply.containsKey("ok")) return transferFacts(lease.complete(
+            JSONObject().put("ok", false).put("code", "shell-write-failed"), definitive = false), offset)
+          if (!reply.getBoolean("ok")) {
+            return transferFacts(lease.complete(JSONObject().put("ok", false).put("code", "shell-write-failed")
+              .put("failedChunkMayBePartial", true)
+              .put("guidance", "远端写入失败：" + (reply.getString("error") ?: "") + "（$remote）")), offset)
           }
-          offset += n
+          offset += count
+          sent = true
         }
       }
-      JSONObject().put("ok", true).put("code", "shell-ok")
-        .put("remotePath", remote).put("path", remote).put("size", offset)
-    } catch (t: Throwable) {
-      shellFailure(t)
+      lease.complete(JSONObject().put("ok", true).put("code", "shell-ok")
+        .put("remotePath", remote).put("path", remote).put("size", offset).put("offset", offset))
+    } catch (failure: Throwable) {
+      transferFacts(lease.failed(failure), offset)
     }
   }
 
   /** 远端删除（rm -f 语义；幂等）。 */
-  fun removeRemote(context: Context, remote: String): JSONObject {
+  fun removeRemote(context: Context, remote: String): JSONObject = RootExecutionFence.command(context) {
+    removeRemoteInternal(context, remote)
+  }
+
+  private fun removeRemoteInternal(context: Context, remote: String): JSONObject {
     if (!remote.startsWith("/")) {
       return JSONObject().put("ok", false).put("code", "shell-path-denied")
         .put("guidance", "远端路径必须是绝对路径：$remote")
     }
     val (remoteSvc, refusal) = readyService(context)
     if (remoteSvc == null) return refusal ?: unavailableShell()
+    val lease = RpcLease(context, "shizuku-remove")
     return try {
-      val r = remoteSvc.removePath(remote)
-      JSONObject().put("ok", r.getBoolean("ok")).put("code", if (r.getBoolean("ok")) "shell-ok" else "shell-remove-failed")
-        .put("guidance", r.getString("error") ?: "")
-        .put("remotePath", remote)
-    } catch (t: Throwable) {
-      shellFailure(t)
+      lease.beforeRpc(remoteSvc)?.let { return it }
+      val reply = remoteSvc.removePath(remote)
+      lease.acknowledged()
+      lease.complete(JSONObject().put("ok", reply.getBoolean("ok"))
+        .put("code", if (reply.getBoolean("ok")) "shell-ok" else "shell-remove-failed")
+        .put("guidance", reply.getString("error") ?: "").put("remotePath", remote), reply.containsKey("ok"))
+    } catch (failure: Throwable) {
+      lease.complete(shellFailure(failure), definitive = false)
     }
   }
 
@@ -539,6 +697,106 @@ object ShizukuTransport {
     .put("ok", false)
     .put("code", "shell-transport-failed")
     .put("guidance", "Shizuku shell 通道失败：" + t.javaClass.simpleName + ": " + (t.message ?: ""))
+
+  /**
+   * issue #262 方案 A：root 通道授权门（策略门 + 知情同意，**不是技术沙箱**）。
+   *
+   * 判据用**通道身份**而不是「设备是否 root」：只有 Shizuku 服务端以 root 启动（uid=0）
+   * 时本门才生效；uid=2000（ADB 启动）或读不到 uid 的通道维持既有语义，不受影响。
+   * uid 0 且未授权 ⇒ 特权执行面整体拒绝——uid 0 下任意 shell 本就无限制，
+   * 「按 op 分类只关掉 root 级 op」是做不到的假隔离（issue 已确证），故不装样子。
+   *
+   * @return `null` = 放行（非 root 通道，或已授权）；非空 = 结构化拒绝 JSON。
+   */
+  internal fun rootGateRefusal(context: Context): JSONObject? {
+    if (RootGrant.isGranted(context)) return null
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    if (uid != RootGrant.ROOT_UID) return null
+    return JSONObject()
+      .put("ok", false)
+      .put("code", "root-grant-required")
+      .put("guidance", "Shizuku 通道正以 root（uid 0）运行，而「AI root 权限」未授权：特权通道已按策略关闭。" +
+        "到设置页「手机控制」查看免责声明、勾选「已阅读」并开启「AI root 权限」。")
+  }
+
+  private fun actualIdentityRefusal(context: Context, remote: ShizukuUserService): JSONObject? =
+    dispatchIdentity(context, remote).second
+
+  private fun dispatchIdentity(context: Context, remote: ShizukuUserService,
+    applyGate: Boolean = true): Pair<Int, JSONObject?> {
+    val uid = runCatching { remote.uid() }.getOrDefault(-1)
+    if (uid != 0 && uid != 2000) return uid to JSONObject().put("ok", false)
+      .put("code", "shizuku-identity-failed").put("reason", "shizuku-identity-failed")
+      .put("guidance", "无法确认实际 UserService 通道身份，请重置连接后再试。")
+    if (applyGate && uid == 0 && !RootGrant.isGranted(context)) return uid to JSONObject().put("ok", false)
+      .put("code", "root-grant-required").put("reason", "root-grant-required")
+      .put("guidance", "AI root 权限未开启或当前版本的免责确认已失效。")
+    return uid to null
+  }
+
+  /** One lease per actual-root operation; never replay an RPC whose acknowledgement is unknown. */
+  private class RpcLease(private val context: Context, private val operation: String,
+    private val applyGate: Boolean = true) {
+    private var leased = false
+    private var inFlight = false
+    private var settledResult: JSONObject? = null
+
+    fun beforeRpc(remote: ShizukuUserService): JSONObject? {
+      val (uid, refusal) = dispatchIdentity(context, remote, applyGate)
+      if (refusal != null) return complete(refusal)
+      if (uid == 0 && !leased) {
+        RootMaintenanceLease.begin(context, operation)?.let { return it }
+        leased = true
+        // Persisting the lease is local setup: consent/actual identity must be current AFTER it.
+        dispatchIdentity(context, remote, applyGate).second?.let { return complete(it) }
+      }
+      inFlight = true
+      return null
+    }
+
+    fun acknowledged() { inFlight = false }
+
+    fun complete(out: JSONObject, definitive: Boolean = true): JSONObject {
+      if (!definitive || inFlight) out.put("ok", false)
+      if (!leased) {
+        if (!definitive || inFlight) out.put("noReplay", true).put("rpcResultUnknown", inFlight)
+        return out
+      }
+      settledResult?.let { return it }
+      val result = if (!definitive || inFlight) unknown(out, operation + "-result-incomplete")
+      else {
+        val finished = try { RootMaintenanceLease.finish(context) } catch (_: Throwable) { false }
+        if (finished) out else unknown(out, operation + "-lease-finish-failed")
+      }
+      settledResult = result
+      return result
+    }
+
+    fun failed(failure: Throwable): JSONObject = complete(shellFailure(failure), definitive = !inFlight)
+
+    private fun unknown(out: JSONObject, reason: String): JSONObject {
+      val result = RootMaintenanceLease.markUnknown(context, reason)
+      // Keep timeout/drain/read/offset facts at the top level without replacing the quarantine code.
+      for (key in out.keys()) if (key !in setOf("ok", "code", "reason", "guidance")) result.put(key, out.get(key))
+      return result.put("operationResult", out).put("noReplay", true).put("rpcResultUnknown", inFlight)
+    }
+  }
+
+  private fun bundleJson(reply: Bundle): JSONObject = JSONObject().apply {
+    for (key in reply.keySet()) put(key, reply.get(key))
+  }
+
+  private fun executionDefinitive(reply: Bundle): Boolean = reply.getBoolean("resultComplete") &&
+    reply.containsKey("exitCode") && reply.getInt("exitCode", -1) >= 0 &&
+    !reply.getBoolean("exitTimedOut") && !reply.getBoolean("drainTimedOut") &&
+    !reply.getBoolean("cleanupIncomplete") && !reply.getBoolean("truncated") &&
+    reply.getString("readError").isNullOrEmpty()
+
+  private fun transferFacts(out: JSONObject, offset: Long): JSONObject = out
+    .put("offset", offset).put("size", offset).put("offsetFact", "acknowledged-bytes")
+    .put("partial", offset > 0 || out.optBoolean("rpcResultUnknown") || out.optBoolean("failedChunkMayBePartial"))
+    .put("noReplay", true)
+
 
   private fun unavailableShell(): JSONObject = JSONObject()
     .put("ok", false).put("code", "shizuku-user-service-not-bound")

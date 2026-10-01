@@ -41,7 +41,10 @@
     { "surface": "consoleBridge", "method": "ready", "reason": "页面不轮询 ready()：会话状态由壳侧主动 pushStatus() 推给页面（ConsoleActivity.kt:68/114），页面用推来的 state==='ready' 驱动按钮使能，故无调用点。保留为壳侧只读探针面（供调试与外部断言）；G-6 把它纳入扫描面后必须登记，否则删掉它不会有任何门禁报警" }
   ],
   "tsOnly": [],
-  "setterWithoutGetter": [],
+  "setterWithoutGetter": [
+    { "surface": "androidBridge", "method": "setRootGranted", "reason": "issue #262（0.14.2-fx-2-root.1）：读面是复合状态 rootGrantState()（granted/consentValid/channelRoot 一次带出），写方法自身即写后回读返回同一全量 JSON——单字段 getter 会造成第二份真源，故有意不设" },
+    { "surface": "androidBridge", "method": "setRootConsent", "reason": "issue #262（0.14.2-fx-2-root.1）：同 setRootGranted——同意位只是 rootGrantState() 的一个字段，写后回读已覆盖读面" }
+  ],
   "preferenceGetters": [
     { "surface": "androidBridge", "method": "getOverlayEnabled", "reason": "返回持久化偏好，而非 OverlayController.isEnabled 事实值（偏好 && canDrawOverlays && 服务在场）——ST-02 已改壳侧判定，桥面 getter 仍返偏好；本条保留至桥面同步事实值" },
     { "surface": "androidBridge", "method": "getDevLogEnabled", "reason": "返回 dev 开关偏好，未回读「日志目录是否真在写」的事实值" }

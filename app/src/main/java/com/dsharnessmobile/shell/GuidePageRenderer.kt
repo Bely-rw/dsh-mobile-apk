@@ -231,11 +231,48 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
   private var apkReadyToInstall: File? = null
   private var apkBusy = false
 
+  /** 失败相位自愈的防重入标记（相位可能被多次应用；同一时刻只跑一次）。 */
+  private var ownershipRepairRunning = false
+
+  /**
+   * 失败相位的一次性属主自愈（2026-09-30，主人一问「root 属主会导致无法启动，你在设置里弄真有用吗」）。
+   *
+   * 纪律：①**自动**跑，不等用户点任何按钮（启动挂了的用户进不到设置页）；②防重入；
+   * ③结果**如实**写进提示行——修好了说清修了几条并给出下一步；一条没修到就**不加噪音**
+   * （无污染/无 root 路径时沉默，避免把「一切正常」渲染成「出事了」）。
+   */
+  private fun autoRepairOwnershipOnFailure() {
+    if (ownershipRepairRunning) return
+    ownershipRepairRunning = true
+    Thread({
+      val result = runCatching { ShizukuTransport.autoHealOwnership(activity.applicationContext) }.getOrNull()
+      activity.runOnUiThread {
+        ownershipRepairRunning = false
+        val healed = result?.optInt("healed") ?: 0
+        val failures = result?.optInt("failures") ?: 0
+        val skipped = result?.optString("skipped") ?: ""
+        val text = when {
+          result == null -> ""
+          skipped.isNotEmpty() -> ""
+          result.optString("reason") == "repair-result-unknown" -> "属主维护结果仍不明，请等待结算；不要重复请求。"
+          !result.optBoolean("ok") -> "属主维护未完成（已修复 $healed 项 / 失败 $failures 项）——请复制诊断日志后重试。"
+          healed > 0 -> "已自动修复 $healed 个 root 属主条目（root 通道写盘遗留）——点上方按钮重试启动。"
+          else -> ""
+        }
+        if (text.isNotEmpty()) pushHint(text, HintSource.PHASE, sticky = true)
+      }
+    }, "dsh-root-owner-repair-guide").start()
+  }
+
   fun buildGuideView(): LinearLayout {
     chrome = buildGuideChrome(
       activity,
       GuideCallbacks(
         onStartEngine = {
+          val pending = RootMaintenanceLease.outstanding(activity.applicationContext)
+          if (pending != null || RootExecutionFence.maintenanceActive) {
+            applyGuideHint(pending?.optString("guidance") ?: "已有特权工作尚未结算，暂不修改运行时；请等待。")
+          } else {
           // 缺陷 D（fx-2）：同一个主按钮在 **Error 相位**下语义不同——它变成「安全模式启动」。
           // 分叉放在这里而不是换控件：`GuideChrome` 只有一个 primaryButton，
           // 复用它的既有样式/锁态/无障碍面比新增按钮更少出事面（也避免用 Phase==Error 之外的判据）。
@@ -246,6 +283,7 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
             // 「再试一次刷新」；不清账的话降级闸门会让他永远拿不到那次刷新，按钮就成了摆设。
             activity.engineManager.clearRefreshLedger()
             activity.startEngineFlow()
+          }
           }
         },
         onOpenConsole = { activity.startActivity(Intent(activity, ConsoleActivity::class.java)) },
@@ -288,6 +326,12 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     val resolvedHint = hint ?: defaultHint(phase)
     // S1-2：相位文案走仲裁漏斗（不可打断相位期间，旁路回执不得顶掉它）。
     pushHint(resolvedHint, HintSource.PHASE, sticky = phaseLocked(phase))
+
+    // 2026-09-30（主人一问换来：「root 属主会导致无法启动，你在设置里弄真有用吗」）：
+    // **失败相位自动属主自愈**——启动已经挂了的时候用户就停在这一页，此时自动跑一次有界自愈
+    // （su 优先），并把结果如实写进提示行。修复不依赖用户找到任何按钮（启动挂了的用户
+    // 根本进不到设置页，那里的按钮形同虚设）。
+    if (phase == GuidePhase.Error) autoRepairOwnershipOnFailure()
 
     val busy = phase == GuidePhase.Starting ||
       phase == GuidePhase.Extracting ||
@@ -386,7 +430,8 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     )
     // 回执看一小会儿，然后真的以 safe 状态重启（见方法注释：为什么留延时、为什么用 View 的 postDelayed）。
     chrome.root.postDelayed({
-      if (lastGuidePhase != GuidePhase.Error) return@postDelayed
+      if (activity.isDestroyed || activity.isFinishing || lastGuidePhase != GuidePhase.Error ||
+        RootMaintenanceLease.outstanding(activity.applicationContext) != null || RootExecutionFence.maintenanceActive) return@postDelayed
       activity.engineFlow.engineRetryCount = 0
       activity.engineManager.clearRefreshLedger()
       activity.startEngineFlow()
