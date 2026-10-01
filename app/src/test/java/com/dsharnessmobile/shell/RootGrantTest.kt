@@ -174,10 +174,9 @@ class RootGrantTest {
         entry.contains("= RootExecutionFence.command(context) {") && entry.contains(name + "Internal(context,"))
     }
     val controller = body("ShizukuTransport.kt", "private fun runControllerInternal(")
-    assertBefore(controller, "rootGateRefusal(context)", "ensureBound(context)")
-    assertBefore(controller, "remote.protocolVersion()", "configureIfNeeded(context)")
-    assertTrue(controller.contains("< ShizukuUserServiceBridge.PROTOCOL_VERSION"))
-    assertBefore(controller, "configureIfNeeded(context)", "lease.beforeRpc(remote)")
+    // Controller uses the same pre-bind, v4-ack and actual-identity gateway already checked above.
+    assertBefore(controller, "readyService(context)", "lease.beforeRpc(remote)")
+    assertTrue("Controller must not bypass the common acknowledged gateway", !controller.contains("ensureBound(context)"))
     assertBefore(controller, "lease.beforeRpc(remote)", "remote.exec(argv,")
   }
 
