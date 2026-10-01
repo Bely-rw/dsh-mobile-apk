@@ -139,7 +139,7 @@ function requiredArgs(tool, url) {
 }
 
 /** 所有 browser_* 工具的两态 op 桩（通用判据用）。 */
-const stateStub = (state) => ({ [BROWSER_OPS.state]: state, [BROWSER_OPS.open]: { tabId: state.tabId, pageGeneration: state.pageGeneration } })
+const stateStub = (state) => ({ [BROWSER_OPS.state]: state, [BROWSER_OPS.open]: { ...state } })
 
 // ── 定点反证：issue #232 四处漏网 ─────────────────────────────────────────────
 
@@ -211,7 +211,7 @@ test('K-2 附带：schema 声明且值存在的 url/title 必须在 render 中�
 
 test('P0-c 反证：browser_open 在 loadState=error 时回执不得声称「已打开」，必须带错误态与原因', async () => {
   const { tool, value } = await drive(BROWSER_TOOLS.open, { url: FAIL_URL }, {
-    [BROWSER_OPS.open]: { tabId: 'tab-3', pageGeneration: 3 },
+    [BROWSER_OPS.open]: { ...FAILED_STATE },
     [BROWSER_OPS.state]: FAILED_STATE,
   })
   assert.equal(value.ok, true, '壳侧 op 成功但页面加载失败：这正是回执必须自己分辨的那条路径')
@@ -224,11 +224,11 @@ test('P0-c 反证：browser_open 在 loadState=error 时回执不得声称「已
 
 test('P0-c 核心：同一 URL 的成功与失败回执文本必须可区分（当前实现逐字相同）', async () => {
   const failed = await drive(BROWSER_TOOLS.open, { url: FAIL_URL }, {
-    [BROWSER_OPS.open]: { tabId: 'tab-3', pageGeneration: 3 },
+    [BROWSER_OPS.open]: { ...FAILED_STATE },
     [BROWSER_OPS.state]: FAILED_STATE,
   })
   const loaded = await drive(BROWSER_TOOLS.open, { url: OK_URL }, {
-    [BROWSER_OPS.open]: { tabId: 'tab-4', pageGeneration: 4 },
+    [BROWSER_OPS.open]: { ...LOADED_STATE },
     [BROWSER_OPS.state]: LOADED_STATE,
   })
   const failText = renderedText(failed.tool, failed.value)

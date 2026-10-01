@@ -309,6 +309,102 @@ class EngineManager(private val context: Context, private val pickToken: String?
   var lastStartRefusal: String? = null
 
   /**
+   * 上一次拒绝启动的**结构化原因码**（issue #309）。
+   *
+   * 为什么不能只靠 [lastStartRefusal] 的文案：调用方需要区分「live 运行时树残缺 ⇒ 删指纹重抽取
+   * 才有出路」与「端口被外部占用 ⇒ 重抽取无用」。旧实现只有一句人读文案，调用方无法据此选择
+   * 恢复动作，于是拒启路径既不 spawn（闸门 A）也读不到 engine.log（闸门 B 的判据）——两道闸门
+   * 互锁，自动路径为零。
+   */
+  @Volatile
+  var lastStartRefusalCode: String? = null
+
+  /**
+   * 最后一次「live 树残缺」拒启的**逐项取证**（issue #309）。
+   *
+   * 为什么拒启时就要取证：恢复动作是「删指纹 + 全量重抽取」，而重抽取会**覆盖现场**。
+   * 旧实现既没有恢复动作、也没有取证，issue 报障者只能靠人回忆「我删过 usr/lib 里的符号链接」。
+   * 现在把「缺了哪几项、路径是什么、mtime/大小」在**删指纹之前**落进 boot-fail.log；
+   * 若一个确认项都缺（只有 REQUIRED_LIBS 这类置信度低的判据命中），则按 issue #309 的反向告诫
+   * **不触发重抽取**——见 EngineStartFlow.maybeRecoverFromIncompleteLiveRuntime。
+   */
+  @Volatile
+  var lastStartRefusalEvidence: String? = null
+
+  /**
+   * 上一次「live 树残缺」拒启中的**确诊缺失项**（[RuntimeTree.START_RECOVERY_CONFIRMED_ENTRIES]）。
+   *
+   * 与 [lastStartRefusalEvidence] 的分工：evidence 是给人看的现场全文（含低置信度条目），
+   * 本字段是**判据**——只有它非空才允许花掉那次全量重抽取。分成两个字段而不是让调用方解析文本，
+   * 是为了让「恢复条件」是一个可直读的值，而不是一段需要正则的字符串。
+   */
+  @Volatile
+  var lastStartRefusalConfirmed: List<String> = emptyList()
+
+  /**
+   * 把「live 树已被外部改坏」显式告诉新鲜度判据：删掉指纹。
+   *
+   * 为什么是删文件而不是加一个状态位：[snapshotFresh] 的既有语义就是「node 在 + 指纹一致」，
+   * 删指纹即令其为假，冷启动路径 `if (!snapshotFresh()) refreshSnapshot(...)` 随即走完整重抽取，
+   * 不需要新增第三个判据分支、也不会与降级闸门产生新的组合面。
+   *
+   * @return 真 = 现在确实不 fresh（删掉了或本就不在）；假 = 文件在且删不掉——此时调用方
+   *   **不得**声称「已安排重抽取」，因为下次冷启动仍会在 [snapshotFresh] 处早退。
+   */
+  fun invalidateSnapshotFreshness(): Boolean {
+    // 独立评审：删除必须让开正在进行的刷新。`refreshSnapshotInternal` 会在提交点重写指纹
+    // （`writeFingerprint`），若在它进行中把指纹删掉，会出现「删了又被写回」而预算已花——
+    // 恢复动作静默失效。与 `startEngine` 的旁路闸门同源：刷新期间不碰运行时面。
+    // 返回 false 让调用方走「如实写 blocked 文案 + 退回预算」那条路，而不是假装成功。
+    if (EngineManager.snapshotRefreshing.get()) {
+      Log.w(TAG, "snapshot fingerprint invalidation deferred: a snapshot refresh is in progress")
+      return false
+    }
+    val fp = File(context.filesDir, ".snapshot-fingerprint")
+    if (!fp.exists()) return true
+    val deleted = try {
+      fp.delete()
+    } catch (t: Throwable) {
+      Log.w(TAG, "could not delete snapshot fingerprint", t)
+      false
+    }
+    if (!deleted) {
+      Log.e(TAG, "snapshot fingerprint could not be deleted; next start may still take the fresh early-exit")
+    }
+    return deleted
+  }
+
+  /**
+   * issue #309：闸门 A 拒启时的**逐项取证**（纯字符串，不改树、不做恢复）。
+   *
+   * 为什么必须在拒启的那一刻做：唯一的恢复动作是「删指纹 + 全量重抽取」，而重抽取会覆盖现场。
+   * 取证写在 boot-fail.log 里，事后能回答「当时缺的是哪几项、路径、大小、mtime」——
+   * issue 报障者的触发源正是外部对 live 树的改动，没有这条就只剩「我猜我删过什么」。
+   *
+   * 输出三段，用 ` | ` 连接（boot-fail.log 与 logcat 都是单行消费，不得换行）：
+   *   ① `missing=...` 逐项缺失（缺失项的输出形态由 [RuntimeTree.missingEntries] 决定）；
+   *   ② `confirmed=...` 其中**确诊**项（[RuntimeTree.START_RECOVERY_CONFIRMED_ENTRIES]，决定能否恢复）；
+   *   ③ `probe=...` 每项的存在性/大小/mtime（含未缺失项，用于区分「被删」与「从未有过」）。
+   *
+   * 只读，且**不重算判据**：`missing`/`confirmed` 由调用方（闸门 A）算好后传进来，
+   * 保证「记进日志的缺失项」与「决定要不要恢复的缺失项」来自同一次探测（否则两者可能不一致）。
+   * 绝不在这里删指纹——那是 EngineStartFlow.maybeRecoverFromIncompleteLiveRuntime 的职责，
+   * 它还要先过预算与证据分级两道闸门。
+   *
+   * @param missing [RuntimeTree.missingEntries] 的结果。
+   * @param confirmed [RuntimeTree.confirmedDamage] 的结果。
+   */
+  private fun liveRuntimeEvidence(missing: List<String>, confirmed: List<String>): String {
+    val probes = (RuntimeTree.BASE_ENTRIES.map { it to File(usrDir, it) } +
+      listOf("home/.dsh/profiles/web" to File(homeDir, ".dsh/profiles/web")) +
+      RuntimeTree.REQUIRED_LIBS.map { "lib/" + it to File(File(usrDir, "lib"), it) })
+      .joinToString(", ") { (name, file) -> name + "=" + RuntimeTree.describeEntry(file) }
+    return "missing=" + (missing.ifEmpty { listOf("(none)") }).joinToString(", ") +
+      " | confirmed=" + (confirmed.ifEmpty { listOf("(none)") }).joinToString(", ") +
+      " | probe=" + probes
+  }
+
+  /**
    * 最近一次「启动恢复未收敛」的明细（D-3：回滚失败时 marker 保留，下次启动重试）。
    * 非空即表示**当前这棵树可能不完整**——启动自检与诊断面据此如实上报，而不是当作正常启动。
    */
@@ -1079,6 +1175,13 @@ class EngineManager(private val context: Context, private val pickToken: String?
   /** Starts the embedded engine. [force] is reserved for a confirmed hung boot
    * after its full cold-start deadline; routine probes must never force-restart. */
   fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {
+    // 独立评审 6(a)：每次进入先**清掉上一次的拒启结论**，让「有码」严格等价于「本次就是被
+    // 闸门 A 拒的」。旧实现只在**通过**闸门 A 时清码，于是闸门 A 之前的那几条 return false
+    // （打包指纹不可用 / termux-exec 预载库缺失）会把**上一次**的 live-runtime 码与确诊项留下
+    // 来 ⇒ 调用方（错误页主按钮）会拿陈旧码去花掉那次重抽取，诊断包也会出现
+    // 「有 confirmed/evidence 却没有 code」的自相矛盾字段。
+    lastStartRefusalCode = null
+    lastStartRefusalConfirmed = emptyList()
     snapshotFingerprintProblem()?.let { problem ->
       lastStartRefusal = problem.failureCode + ": " + problem.detail
       return false
@@ -1110,12 +1213,32 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // **明确拒绝启动并给出可归因的原因**，让失败停在「运行时快照刷新失败」这一层，
     // 而不是放大成 90s 超时 + 反复重启。
     if (!liveRuntimeComplete()) {
+      // issue #309 建议 5：旧文案写「请重试刷新」，而当时**没有任何入口**能做这件事——文案承诺
+      // 了一个不存在的动作。现在两个出口都真实存在，文案按事实改写：
+      //   · 缺的是快照自身条目（确诊项）⇒ 调用方**自动**删指纹重做运行时，用户什么都不用做；
+      //   · 只缺低置信度条目 ⇒ 自动路径刻意不动（见 RuntimeTree.START_RECOVERY_CONFIRMED_ENTRIES），
+      //     用户可在错误页点主按钮强制重做一次。
       lastStartRefusal = "运行时快照不完整（live 树缺 node/bin.js/profile）——上一次快照刷新失败留下的半搬态；" +
-        "请重试刷新或清理应用数据后重装；本次不拉起引擎（避免 90s 超时与反复重启）"
+        "缺的是快照自身条目时会自动重做运行时，否则可在错误页点主按钮强制重做；" +
+        "本次不拉起引擎（避免 90s 超时与反复重启）"
+      // issue #309：给出结构化原因码，调用方据此触发**一次**「删指纹 + 清账本」的恢复动作。
+      // 没有它就没有恢复路径：拒启 ⇒ 不 spawn ⇒ engine.log 永不产生 ⇒ 闸门 B 判据恒为假。
+      lastStartRefusalCode = REFUSAL_LIVE_RUNTIME_INCOMPLETE
+      // issue #309：**删指纹之前**取证。恢复会覆盖现场，取证只能在此刻做；分级决定要不要恢复。
+      val missing = RuntimeTree.missingEntries(
+        root = usrDir,
+        profileDir = File(homeDir, ".dsh/profiles/web"),
+      )
+      val confirmed = RuntimeTree.confirmedDamage(missing)
+      lastStartRefusalConfirmed = confirmed
+      lastStartRefusalEvidence = liveRuntimeEvidence(missing, confirmed)
       Log.e(TAG, "engine start refused: live runtime incomplete — " + lastStartRefusal)
-      LogCollector.log(TAG, "engine start refused (live runtime incomplete)")
+      Log.e(TAG, "live runtime evidence: " + lastStartRefusalEvidence)
+      LogCollector.log(TAG, "engine start refused (live runtime incomplete) evidence=" + lastStartRefusalEvidence)
       return false
     }
+    // 通过闸门 A：码与确诊项已在入口清过（见函数头注释），此处无需重复。
+    // 取证字段**刻意不清**：它是只增的现场记录，供诊断包读取。
     val now = System.currentTimeMillis()
     // Process-level CAS: only one concurrent call really starts (device-measured EADDRINUSE double-start).
     if (!STARTING.compareAndSet(false, true)) return true
@@ -1439,6 +1562,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // 重抽取」这件事只能落在壳侧标记里；没有读取方的话它就是死账本——事后既无法证明它被写过，
     // 也进不了诊断包。这里把它带进 info.txt（存在才有该行），于是失败现场自带这一条事实。
     runtimeTreeDamageMarker(context)?.let { sb.append("runtime_tree_damage: ").append(it).append('\n') }
+    // issue #309：把「闸门 A 为什么拒启、当时缺了什么」也带进诊断包。
+    // 为什么必须进包：唯一的恢复动作（删指纹 + 全量重抽取）会覆盖现场；拒启取证如果只留在
+    // logcat/boot-fail.log，用户取包反馈时就没有这条已整理好的事实。两个字段同源同上一次拒启。
+    lastStartRefusalCode?.let { sb.append("start_refusal_code: ").append(it).append('\n') }
+    if (lastStartRefusalConfirmed.isNotEmpty()) {
+      sb.append("start_refusal_confirmed: ").append(lastStartRefusalConfirmed.joinToString(", ")).append('\n')
+    }
+    lastStartRefusalEvidence?.let { sb.append("start_refusal_evidence: ").append(it).append('\n') }
     // 0.14.1 块C §2.4：WebView 版本与语法下限判据进诊断包。
     // 为什么也进诊断包（而不只进 boot-diag.log）：老设备白屏时页面跑不起来，用户必须能**自助**取到
     // 「我的 WebView 版本够不够」这一个结论，而不必先跑到页面上看。
@@ -1980,6 +2111,14 @@ description: 手机操控纪律：无障碍语义树优先、ref 语义点击/�
      *  double-start the engine (device-observed EADDRINUSE). 90s covers the
      *  slowest observed boot with margin. */
     const val START_COOLDOWN_MS = 90_000L
+
+  /**
+   * 拒绝启动原因码：live 运行时树残缺（issue #309）。
+   *
+   * 语义 = 「这棵树需要重抽取才能起来」，与端口占用一类**不可**通过重抽取解决的原因区分开。
+   * 调用方（EngineStartFlow 的拒启分支）据此触发一次删指纹 + 清账本的恢复动作。
+   */
+  const val REFUSAL_LIVE_RUNTIME_INCOMPLETE = "live-runtime-incomplete"
 
     /** Process handle shared by every EngineManager in the application process. */
     @Volatile

@@ -1,9 +1,30 @@
-# known-gaps.md — 待办与已知缺口（非本轮范围，防再探）
+# known-gaps.md — 当前缺口、外部待验与历史记录
 
-## 8. 待办与已知缺口（非本轮范围，记录防止再探）
+## 0.14.3 当前交接（源码已登记；**开发方已构建 + 代码层已验，设备三层验收未做**）
+
+用户当前停止点为#308正常GitHub CI/review合并、完整0.14.3同步、arm64/x86_64 tester APK交付。外部tests/typecheck/门禁反证/CDP/ADB由用户另行安排，本source/doc任务未执行；“待外测”不作为暂停合并的占位阻塞，但也不等于安全、功能、三层或发布验收通过。开发方侧本轮**已构建**（`build-apk-013.ps1 -Suffix ""` exit 0，双 ABI 全链 49 条门禁 PASSED / 0 FAILED）、**代码层已跑**（Kotlin 965 项通过，含 #309 的 19 例）并产出 tester APK 与 SHA256（见 `docs/0.14.3-TEST-REQUIREMENTS.md` §8）。**三层设备验收（代码/CDP/ADB 用户层）明确未做**，由外部测试人员执行；CI/review 与本地构建都不能替代它。发布未授权。
+
+| 项 | 当前源码事实 | 剩余职责 / 外部证据 |
+|---|---|---|
+| Root授权/属主维护 | 有效versionCode consent、无未知命令重放、held-FD core/helper、v4 configuration、Context公平fence、耐久RootMaintenanceLease、per-lease honest pending已在场 | 真UID0/工作资料、commit失败、同boot应用restart保留UNKNOWN、同方案真boot解除、Binder/late acknowledgement与副作用计数待外验；不以kill su或手工清lease作结算。 |
+| ProcIo/capture | waiter外独立cleanup、不可变partial、私有.part仅完整publish、每transfer chunk复查consent | 新settlement/wiring fixtures已写未执行；真实descendant持管道/read/close阻塞与不完整spool待外验。 |
+| #304配置迁移 | marker保留/抑factory seed、活web patch导入导出及共享密钥警告、旧blank factory quarantine | 连续冷启动/换树/rollback/中断保留用户provider与key用假配置外验；legacy ConfigTransfer未挂载，SAF controller仍在用。 |
+| #305内嵌SHA | SnapshotFingerprintPolicy严格64hex，缺/坏metadata拒refresh/spawn，无legacy/degraded旁路 | 最终包hash/ABI与事务恢复外验；不是仅有源码就已证明快照不匹配被正确打包拒绝。 |
+| #306与startup | quiet foreground retry/recreate、holder重绑、userClosed保持；CAS flow generation、ServiceEpoch/wakeowner、finite6次2/4/8/16/30/30秒pending retry | 新policy/wiring/startup fixtures未执行；后台真实任务不中断、陈旧caller无后续effects、重复renderer crash不loop待外验。 |
+| 官方浏览器UI | 私有MIT source + neutral native adapter、真实tab-menu，捕获Session/tab与model/UI焦点分离；nonDefault profile先验证后load | 父任务目标0.2组件lib重建/完整自包含镜像；多会话多tab、HMR hide-only、HTTP/loopback cookie/storage/worker隔离及provider不支持拒绝待外验。不回Default；limited clear不保证全浏览数据擦除。 |
+| Windows身份 | UA/JS/UA-CH的Windows映射在native源中已改，按provider能力诚实回执 | 实际请求头/脚本/站点行为待外验，不称已测PC身份。 |
+| PTC A1 / pi streaming020 | 双文件PTC与六provider官方exact SHA/context在registry/runner/source copy reconciliation已接 | 普通snapshot post-apply已接统一runner --check多目标/exact verifier；父任务仍须目标原始产物重出runtime assets、组件lib/镜像与双ABI终包对账。 |
+| #288/#297及历史缺口 | 按当前真实可达面核实；不把用户授权HTTP当漏洞、不用旧head证据虚关issue | 没有实时overlay/effect证据时#288仍待报告；后续任务/里程碑changelog与AGENTS入口不属本doc委派。 |
+| #309 运行时树残缺无恢复路径（闸门 A/B 互锁） | **本轮已修**（源码级，未构建/未外验）。修前复核属实：`EngineManager.liveRuntimeComplete()`（`EngineManager.kt:489`）在 spawn 前拒启，且位置先于 `force`/可用性判定；拒启路径只写 boot-fail + `maybeAutoUndo`（不碰 `usr/`）+ `scheduleEngineRetry`；全仓 `refreshSnapshot` 调用点仅冷启动一处（`EngineStartFlow.kt:586`），拒启路径为零。闸门 B 判据取自当拍 `engine.log` 尾部，而不 spawn 就永不产生该日志 ⇒ 自愈不可达。 | **修法与取舍**：闸门 A 拒启路径现在会（① 先取证 → ② 写损坏标记 → ③ 删指纹 → ④ 清账本 → ⑤ 取诊断镜像 → ⑥ 如实写 boot-fail）让下一次冷启动走完整重抽取。**两道闸门**：预算复用 `runtimeTreeHealedThisRun`（每次运行一次，不新增变量，无重抽取死循环）；证据分级只用「快照自身条目」（`RuntimeTree.START_RECOVERY_CONFIRMED_ENTRIES`）触发——`REQUIRED_LIBS` 成员**刻意不触发**，因为 issue 原文告诫「不要贸然补全该表」（它是传递依赖假阴性来源），自动放宽等于每次启动白付一次 8-12 分钟全量抽取并抹掉现场。用户显式出口：错误页主按钮（Error 相位 =「安全模式启动」）在上一次拒启确为 live 残缺时**强制**重做一次（放行分级、**不放**预算）。**修前** `refreshSnapshot` 调用点仅冷启动一处、拒启路径为零；**修后**仍不新增调用点（改走「删指纹让既有的 `!snapshotFresh()` 分支生效」），与 #240 降级闸门不冲突（live 仍不完整 ⇒ `shouldDegrade` 返回 false）。**不改闸门 A 判据本身**：带病的树仍不被 spawn。 | **剩余职责 / 外部证据**：`Issue309StartRecoveryTest`（13 例，含反证：只有低置信度条目时不得花掉重抽取；证据分级/预算/顺序/文案如实性各有断言）本轮已跑 exit 0，且在注入两处变异后**必失败**（实测 2 failed，已还原）——这是**代码层**证据，不是设备验收。待外验：真机/模拟器上人为删 `files/usr/bin/node` 或 `profiles/web` 后冷启动，观察 `.snapshot-fingerprint` 是否消失、boot-fail 是否出现 `live-runtime-incomplete-recovery`、以及重抽取后引擎是否恢复；以及「只删一个 `usr/lib` 符号链接（低置信度）」时自动路径**不动**、点错误页主按钮后才重做。 |
+| #309 残留面：看门狗路径无恢复出口（**本轮未修，已知缺口**） | 第三轮独立评审实测确认：`EngineService.kt:281`（自动回撤成功后重启）与 `:319`（看门狗 RESTART 拍）**直接调 `engineManager.startEngine()`**，不经过 `EngineStartFlow` 的拒启分支，因此该路径下闸门 A 拒启后**没有**「删指纹 + 清账本」的恢复动作，也没有任何用户可见出口（服务静默重试）。 | **为什么本轮不改**：看门狗运行在服务上下文里，没有 `MainActivity` 实例，而恢复动作当前签名要 `Activity`（`filesDir`/`writeBootFail`/诊断镜像）。把它下沉成不依赖 Activity 的形式（用 Application Context + 服务侧落盘）是有意义但**独立**的改动面：涉及 boot-fail 写入路径、诊断镜像、以及「服务与 Activity 会不会同时花掉同一次预算」的并发口径，属安全敏感面（预算/快照事务），不应与 #309 的主体修复混在同一轮里顺手改。**影响评估**：只在「用户从不打开 App、纯靠前台服务自愈」这一条路径上成立；一旦用户打开 App（issue 现场的形态就是停在引导页错误页），Activity 路径即恢复出口。**待办**：把恢复动作的 Activity 依赖去掉后在看门狗 RESTART 分支接同一入口（含「同一次预算不得被两条路径各花一次」的判据）。 |
+| got@14.6.6 引擎运行时依赖（本轮已修） | 上游 0.2.0-rc.2 的 `otel` 是 enabled 基础服务，其 `lib/index.js` 顶部静态 import `got`；旧快照 1128 个 `package.json` 且不含 `got` ⇒ boot 期 `ERR_MODULE_NOT_FOUND`。已登记进 `engine-overlay.json` 的 `packages` 并重建双 ABI 快照（arm64 1134 个）。 | 双 ABI `check-engine-overlay.mjs` 现 412 条断言全绿（本会话实测 exit 0）。设备侧仍需外验 `otel` 行确实挂载且启动不崩。 |
+
+完整限制见 [Root维护](<dsh-mobile-apk/docs/AGENTS/ROOT-MAINTENANCE.md>)；逐项外验见 [测试需求](<docs/0.14.3-TEST-REQUIREMENTS.md>)。以下历史章节保留其当时版本/设备证据，不作为0.14.3现状或新head验收。
+
+## 8. 历史待办与缺口（需结合当前源码复核）
 
 - F2「T1 授权豁免自动升级」未落地（电池白名单仅引导 Intent；指数退避仅日志不改调度）——涉及系统策略写面，不自动执行。
-- F1.10 引擎更新通道未实现；F0.3 引擎事件桥未实现。
+- F1.10 引擎在线更新为既存待办；F0.3事件桥已在0.13.x落地，不再登记为未实现。
 - 子代理 PRD 评审完整清单见协调仓库 `docs/review-0.13.0-20260823.md §九` 与 `.deploy-tmp/prd-gap-review.md`（U4/U5、A4/A6/A8、B4/B5/B7、F4、P4 未修项）。
 - **~~扫描/图片版 PDF → 页图渲染受限~~（0.13.1 已修，0.13.0 记录作废）**：原记录「`@napi-rs/canvas` 仅 glibc 预编译装不上」系**误判**——npm 有 `@napi-rs/canvas-android-arm64`（N-API/Bionic 预编译，os=android cpu=arm64，真机 createCanvas 实测可用）。0.13.1 起随出厂快照装配（profiles/web package.json 登记 + tarball 解入，仅 arm64；npm 无 android-x86_64 triple，x86_64 模拟器维持守卫降级）。构建脚本 7c2 段。
 - **marketplace 惰性加载决策（0.13.0 D4）**：cordis 装配层无惰性概念；拆装配违反 F4「内置市场」。启动速度优化由 D2（快照瘦身）+ D3（NODE_COMPILE_CACHE）承担，marketplace 保持启动装配。
@@ -38,7 +59,7 @@
   从未实现；`android_app_launch {screenId}` 无落点回读，会报成功而应用落在真实屏。
   根因、方案与新增门禁清单见协调仓同名文档 §3/§4/§6/§7。
 - **按需 skill 注入（U-5）未实施**：控制流程仍会进入常驻上下文/schema 的部分未清点，token 预算门禁未做。
-- **Shizuku 许可登记缺口**：gradle aar 依赖不在 `check-third-party.mjs` 的 dpkg 矩阵覆盖内，`assets/licenses/THIRD_PARTY_NOTICES.md` 无 Shizuku 条目（Apache-2.0）——发版合规需补。
+- **Shizuku 许可登记缺口**：gradle aar 依赖不在 `check-third-party.mjs` 的 dpkg 矩阵覆盖内，`assets/licenses/THIRD_PARTY_NOTICES.md` 无 Shizuku条目（aar POM源码登记为MIT，旧Apache-2.0说法更正）——发版合规需补。
 - **性能 A1 结论未定**：`check-perf-instrumentation` 的 P-AC-01 要求出厂值 `patchReload: startup`，但 0.14.0 设备 A/B 观测 `live` 组中位约 12.5-13.0s 快于 `startup` 组 14.6-15.0s（n 小、compose 探针缺失、单机型）——方向与方案主张相反，需 owner 拍板是锁正确性语义还是改基线（见 `docs/0.14.0-preview-VERIFICATION-LOG.md` §50）。
 - **`combo-lazy-A4` 退役后的设备侧复验未做（2026-09-25）**：补丁已从 registry/IMPLS 移除、P1 的 `requires` 已清空，静态门禁与 17 个补丁回归全绿；但「撤 A4 后裸树启动期 2 次 compose」这一结论目前只有**离线同基线 A/B** 证据（`.deploy-tmp/retire-sweep/REPORT.md` §3.1.2）。设备侧需补：撤 A4 的快照冷启动读 `[perf] compose #N dur=` 与 `TOTAL calls=`，确认 calls ≤ 2 且首屏未变差（预期略好——A4 原先把那次 compose 压在首个请求路径上）。三层验收留到统一构建窗口。
 - **C5 正向对照的设备侧取证依赖一棵打过 P1 的引擎树**：`check-boot-budget.mjs` 的对照在构建链打补丁**之前**跑时必然缺席（记 SKIP，符合设计）；发布前 `--require-real` 档需要 `.deploy-tmp/snapshot-013/<abi>/stage/root/...` 那棵树**已打 P1**，否则 C5 只有 SKIP、拿不到「等价成立」。CI/发布链接线时需确认该前置。
@@ -217,7 +238,9 @@ real-only 反证；判据全在设备事实上，证据不足判 `INCONCLUSIVE` 
   未取到完成态。故「解锁链路是否被模型自主走通」目前只有**一次未完成的观察**，
   尚不足以判定（既不能算通过，也不能算断链）。
 
-## 0.14.2-fx-2-root.2 已知未闭合（2026-09-30，诚实登记）
+## 原 root PR 作者 head 的未闭合记录（2026-09-30）
+
+以下属于原 #302、重提 #308 作者 head 的历史记录，不作为0.14.3维护者修订证据。当前实现、限制与外部验收状态见 [ROOT-MAINTENANCE.md](ROOT-MAINTENANCE.md)。
 
 - **Shizuku 通道自身在本机不可用（授权断链）**：`Shizuku.checkSelfPermission()` 恒返回 denied
   （服务端 v13.6 判据里没有公开 `checkPermission`；客户端 AAR 为 13.1.5，**版本差**是首要嫌疑），

@@ -1,42 +1,42 @@
 # RUNTIME-PATCHES.md — assets/patched/ 运行时补丁登记
 
-> 职责：`app/src/main/assets/patched/` 逐文件的权威登记（0.13.7fx-1 起 **2 个在册**，0.14.1 起 **3 个在册**：attachment-local、session-persistence-jsonl、fs-local）——消费方 `EngineManager.applyRuntimePatches()`（EngineManager.kt:636），逐文件目标快照路径/作用/来源线索与维护约定。在册字节数与消费方注册行号 2026-09-25 当场 ls/grep 实测（三条资产随 0.14.2 追上游 0.1.7-rc.1 于 2026-09-24 按 rc.1 快照重建，见 §7.4）；退役批次见 §5。
+> 职责：设备端完整覆盖资产与构建期补丁的权威登记。0.14.3是源码交接，未构建本轮APK；§2与历史重出章节的尺寸/hash均是明确标注的旧批次记录，不是0.14.3测量。新目标0.2.0-rc.2的资产重出/最终同源对账仍由父任务完成，不能把旧资产标成已适配。
 
 ## 1. 机制（EngineManager.kt）
 
-- **路径速查**：快照解压根 = `filesDir`（usr/ + home/）；dshPkgs = `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai`（EngineManager.kt:925）；资产源 = APK 内 `assets/patched/`，经 `context.assets.open(asset)` 读取。
-- **触发时机**：每次 `startEngine` 前调用（EngineManager.kt:1030 调用 ⇒ :924 `applyRuntimePatches`）——首启解压后、以及每次快照刷新/重解压后自动重施加（幂等）。
-- **覆盖式全量替换**：`applyAssetPatch`（:938）把 asset 字节整文件写入目标，**非 delta/非行级补丁**——asset 即目标文件的完整修改版拷贝。
-- **内容指纹判定**：目标已存在且字节与 asset 完全一致（contentEquals，:952）才跳过；不用固定 marker 字符串——v1→v2 升级时旧 marker 曾导致更新后的 asset 被误跳过（注释实锤）。快照刷新覆盖目标后指纹失配 → 自动重施加。
+- **路径速查**：解压根为filesDir（usr/home），目标包根由EngineManager.applyRuntimePatches构造；见 [源码入口](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt#L1025-L1065>)。
+- **触发时机**：每次startEngine真正spawn前调用applyRuntimePatches；快照刷新后重新比对，幂等。
+- **覆盖式全量替换**：applyAssetPatch读取完整asset并整文件写入目标，不是delta/行级补丁。
+- **内容指纹判定**：目标存在且contentEquals资产才跳过；固定marker不能替代字节对账，历史旧marker曾掩盖新资产。
 - **目标包缺席即跳过**：目标父目录不存在时不落补丁（宁缺毋滥不留死覆盖）。
 - ~~hashAdaptive~~（0.13.7fx-1 随 web-frontend-index.html 退役，理由见 §8）：曾用于让 patched 模板跟随引擎 dist 的 content-hash bundle 名；`adaptIndexHashes` 已随 asset 一起删除。
-- 另有 append 式辅助 `applyAssetPatchAppend`（:964，marker 幂等追加，历史上用于 cordis.patch.yml 场景）——当前无调用方，仅保留备用。
+- applyAssetPatchAppend为历史备用，无当前调用方；不要把它当profile配置传输路径。
 
 ## 2. 文件逐项登记
 
-目标根 = 快照内 `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/`（dshPkgs，EngineManager.kt:925）。asset 字节数与注册行号 2026-09-25 ls/grep 实测。
+目标根为快照内usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai；下表尺寸来自明确历史批次。注册入口现在为applyRuntimePatches，旧注册行号不再作为当前锚点。
 
 | asset 文件（字节） | 目标快照路径（注册行） | 状态 | 作用 / 来源线索 |
 |---|---|---|---|
-| attachment-local-index.js（**47,937**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-attachment-local/lib/index.js（:926） | 生效 | 0.13.7 重出（引擎 0.1.5-rc.1）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）+ 0.14.0 review C1：**与构建期 `attach-durable-F2` 逐字节同源**（F2 已扩为三件套：祖先 fsync 守卫 + 两处 link(2)→rename 回退 + unlink ENOENT 容忍）；内含图片归一化 2048 降采样上限（`DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 2048`）。补丁判定走内容指纹而非内嵌标记 |
-| session-persistence-jsonl-index.js（**145,247**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-session-persistence-jsonl/lib/index.js（:928） | 生效 | 0.13.7 重出 + 0.13.8-b 追加 F5/F7（与构建期同源）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）：两处 link(2) 站点带 EACCES/EPERM/ENOTSUP → rename 回退，发布独占语义由模块级 `dshMobileClaimExclusive/ReleaseClaim` 恢复（O_EXCL 占位 + 失败回收）。**0.14.0 review C1 实锤**：v0.14.0-preview 资产曾是「内联占位 + helper 占位」双占位坏版本（恒 EEXIST 恒 false，旧会话迁移永久失败并留 0 字节毒文件）——修复 = F7 补丁增加 v1→v2 收敛分支 + 本资产从快照重出 + 门禁升级为逐字节比对。行为回归 `scripts/patches/tests/{spj-migration-link-f5,publish-exclusive-reclaim}.test.mjs`（后者支持 `--asset` 直测资产本体） |
-| fs-local-index.js（**47,793**，2026-09-26 由出厂态 fixture 经补丁链重建：F8 + B） | dsh-fs-local/lib/index.js（:930） | 生效 | **0.14.1 重新入册**（apk issue #246）：`writeFileAtomic` 的 `createIfAbsent` 发布站点是全包唯一的 `link(2)` 调用，且该分支失败即抛、无任何回退 → Android 应用域恒拒 hardlink ⇒ 真机上 `write` 工具建不了任何新文件（覆盖已存在文件走 `rename`，正常）。与构建期 `fs-local-link-F8` 逐字节同源。**本资产是 0.13.3 退役资产的重新入册**——当年退役理由「上游 0.1.2-rc.1 已原生覆盖 rename 回退」对 `createIfAbsent` 站点不成立（0.1.5-rc.1 实测：全文仅此一处 `link` 调用，`EACCES`/`EPERM`/`ENOTSUP` 无任何处理）。补丁判定走内容指纹而非内嵌标记。行为回归 `scripts/patches/tests/fs-local-link-f8.test.mjs`（支持 `--asset` 直测资产本体） | **0.14.2 追加 `fs-local-digest-guard-B`**（版本守卫摘要 CAS 兜底）：资产必须同时含 F8+B 两个 marker，否则引擎启动时会把 B 覆盖回「只有 F8」的旧字节 ⇒ 真机上 B 等于没修（实测踩到：旧资产 43,405 B 与当时快照逐字节一致，门禁因快照陈旧而不响）。重建方式 = 取出厂态 fixture 按 registry 顺序施加该文件全部 engine 补丁（产物 47,793 B），**禁止手改**；门禁见 §7.5 |
+| attachment-local-index.js（**47,937**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-attachment-local/lib/index.js（applyRuntimePatches） | 生效 | 0.13.7 重出（引擎 0.1.5-rc.1）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）+ 0.14.0 review C1：**与构建期 `attach-durable-F2` 逐字节同源**（F2 已扩为三件套：祖先 fsync 守卫 + 两处 link(2)→rename 回退 + unlink ENOENT 容忍）；内含图片归一化 2048 降采样上限（`DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 2048`）。补丁判定走内容指纹而非内嵌标记 |
+| session-persistence-jsonl-index.js（**145,247**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-session-persistence-jsonl/lib/index.js（applyRuntimePatches） | 生效 | 0.13.7 重出 + 0.13.8-b 追加 F5/F7（与构建期同源）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）：两处 link(2) 站点带 EACCES/EPERM/ENOTSUP → rename 回退，发布独占语义由模块级 `dshMobileClaimExclusive/ReleaseClaim` 恢复（O_EXCL 占位 + 失败回收）。**0.14.0 review C1 实锤**：v0.14.0-preview 资产曾是「内联占位 + helper 占位」双占位坏版本（恒 EEXIST 恒 false，旧会话迁移永久失败并留 0 字节毒文件）——修复 = F7 补丁增加 v1→v2 收敛分支 + 本资产从快照重出 + 门禁升级为逐字节比对。行为回归 `scripts/patches/tests/{spj-migration-link-f5,publish-exclusive-reclaim}.test.mjs`（后者支持 `--asset` 直测资产本体） |
+| fs-local-index.js（**47,793**，2026-09-26 由出厂态 fixture 经补丁链重建：F8 + B） | dsh-fs-local/lib/index.js（applyRuntimePatches） | 生效 | **0.14.1 重新入册**（apk issue #246）：`writeFileAtomic` 的 `createIfAbsent` 发布站点是全包唯一的 `link(2)` 调用，且该分支失败即抛、无任何回退 → Android 应用域恒拒 hardlink ⇒ 真机上 `write` 工具建不了任何新文件（覆盖已存在文件走 `rename`，正常）。与构建期 `fs-local-link-F8` 逐字节同源。**本资产是 0.13.3 退役资产的重新入册**——当年退役理由「上游 0.1.2-rc.1 已原生覆盖 rename 回退」对 `createIfAbsent` 站点不成立（0.1.5-rc.1 实测：全文仅此一处 `link` 调用，`EACCES`/`EPERM`/`ENOTSUP` 无任何处理）。补丁判定走内容指纹而非内嵌标记。行为回归 `scripts/patches/tests/fs-local-link-f8.test.mjs`（支持 `--asset` 直测资产本体） | **0.14.2 追加 `fs-local-digest-guard-B`**（版本守卫摘要 CAS 兜底）：资产必须同时含 F8+B 两个 marker，否则引擎启动时会把 B 覆盖回「只有 F8」的旧字节 ⇒ 真机上 B 等于没修（实测踩到：旧资产 43,405 B 与当时快照逐字节一致，门禁因快照陈旧而不响）。重建方式 = 取出厂态 fixture 按 registry 顺序施加该文件全部 engine 补丁（产物 47,793 B），**禁止手改**；门禁见 §7.5 |
 
 已退役资产（不在 `assets/patched/`，`applyAssetPatch` 注册行同步移除，勿再引用）：`primitives-index.js`、`fs-local-index.js`（0.13.3 批退役，d377abc——link(2) 回退族改由构建期补丁承担；**0.14.1 已重新入册，见 §2 的 fs-local-index.js 行与 §7.1 的 `fs-local-link-F8`**——退役时该回退并未真正落到构建期补丁，`createIfAbsent` 站点成了覆盖空洞）；`web-frontend-index.html`（0.13.7fx-1 退役，§8）；`llm-deepseek-index.js`（rc.2 起遗留死资产，随重出批删除）。
 
 ## 3. 维护约定（硬约束）
 
 1. **全量替换非 delta**：asset 必须是目标文件的完整拷贝（在原文件基础上改后整体入库）；不允许只存 diff 片段或手写残缺文件——applyAssetPatch 直接 writeBytes 整写，半截文件 = 引擎启动即崩。
-2. **更新需随上游引擎对齐**：三个在册 asset 对应 2026-09-24 按 dsh 0.1.7-rc.1 快照重建的包版本（三条全部与旧资产不同源，见 §7.4）。升级快照内引擎版本时必须：① 逐文件核对上游是否已原生包含同等修复（能删则删，llm-deepseek/rc8 为先例）；② 重出 asset 从对应版本包文件改起，不从旧 asset 迭代；③ 与构建期同源补丁（F2/F5）**两处必须同源**，否则互相回退。
+2. **更新需随上游引擎对齐**：升级0.2.0-rc.2必须从对应原始文件重出三条资产，并施加该文件全部当前补丁，再与最终双ABI快照逐字节/全部marker或exact verifier对账；不能叠加旧asset。§7.4/7.5是历史证据，不是本轮已完成。
 3. **禁止随手重生成**：内容指纹机制意味着 asset 与目标「看起来差不多但字节不同」就会触发重写——不得用本地构建产物/不同 minify 形态随手替换 asset；改动须走完整链路验证（引擎起得来、市场/会话/附件功能实测）。
 4. **新增补丁**：applyAssetPatch 注册新条目 + 本表登记；优先评估上游新版本是否已修复（能不补则不补）。
 
 ## 4. 施加结果验证方法
 
 - **日志锚点**（LogCollector/logcat，EngineManager.kt 内 Log.i/Log.w/Log.e）：
-  - `runtime patch applied/updated: <asset> -> <target>`（:956）= 本次实际写入；
-  - `runtime patch skipped (target package absent): <asset>`（:943）= 目标包被上游裁掉，按 §3-4 评估；
-  - `runtime patch asset missing: <asset>`（:949）= asset 缺失（打包遗漏，需查 APK assets）；
+  - runtime patch applied/updated日志表示本次实际写入；精确函数锚点见本节源码入口。
+  - runtime patch skipped (target package absent)表示目标缺席，按上游变更评估，不留死覆盖。
+  - runtime patch asset missing表示打包遗漏，不是功能通过。
   - `index hash adaptation failed; keeping bundled patch`（hashAdaptive 已于 0.13.7fx-1 随 web-frontend-index.html 退役，见 §8；该日志行不再产生）。
 - **产物抽验**：从 APK 内 assets/patched/ 取出与快照解压树目标文件做字节比对（contentEquals 同一判定）；发布链可用 `tar -xO` 抽验快照内目标文件（AGENTS.md 惯例）。
 - **行为抽验**：剪贴板复制（primitives）、附件上传图片（attachment 2048 上限）、WebView 沉浸式与老内核插件列表（web-frontend）、会话持久化/文件工具（fs-local、session-persistence-jsonl）。
@@ -108,6 +108,22 @@
 | `boot-third-party-isolation-G3` | `dsh-app-boot/lib/index.js` | 第三方插件 boot 期失败隔离：`boot()` 经隔离式挂载器挂 root include，失败条目若属**用户自装**（非 `@deepseek-ai/*` / `@dsh-android/*` / 出货具名插件）则加 `disabled:true` 后重试并点名列出被跳过的插件；官方/出厂插件失败、不可识别失败、或超过上限 8 个仍响亮失败。真因：用户自装插件 import 期抛错在 `mountRootInclude` 就抛出，`boot-pending-G1` 的锚点 `assertEntriesActivated` 结构上不可达。真源见 `scripts/patches/registry.json` 的 `boot-third-party-isolation-G3`；回归 `node scripts/patches/tests/boot-third-party-isolation-g3.test.mjs` |
 | `file-upload-restart-R1` | `dsh-client-file-upload/lib/index.js` | Agent resolver 单槽注册改为**同槽覆盖**（2026-09-28 模拟器 5556 实锤）：cordis `Fiber._reload` 的顺序是「先执行新实例 body、再 `_unload()` 释放旧 effect」，故 session-controller 因 `agent-default-model` 条目被改写而重启时，新 `SessionController` 构造里的 `ctx.effect(() => ctx.fileUploads.registerAgentResolver(...))` 撞上上游的 already-registered 守卫 → 新 fiber 判 FAILED、服务永久缺席（切一次默认模型即触发，客户端恒报 `session/control: active Service "sessionController" is unavailable`）。修法只去掉守卫、保留身份判据的 disposer（旧 fiber 的 disposer 不会清掉新注册）；仍只有一个槽。真源见 `scripts/patches/registry.json` 的 `file-upload-restart-R1` |
 
+
+### 7.1a 0.14.3 新增/变更补丁与构建钩子（源码在场，未执行）
+
+| 补丁/文件 | 真实目标与职责 | 登记 / 回归状态 |
+|---|---|---|
+| [ptc-android-native-A1](<dsh-mobile-apk/scripts/patches/ptc-android-native-A1.mjs>) | dsh-ptc-runtime-node@0.2.0-rc.2的host lib/index.js及child lib/process.js；Android trusted linker64→TERMUX__PREFIX/bin/node前缀，heap仅本次NODE_OPTIONS，host/child精确native allowlist，model JS env仍null-prototype空对象 | registry/apply-patches已接A1并requires L1；exact双文件verifier及additionalTargets/targetMarkers在场。source-copy fixture与 [A1测试](<dsh-mobile-apk/scripts/patches/tests/ptc-android-native-A1.test.mjs>) 已写、未运行。 |
+| [pi-upstream-streaming-020](<dsh-mobile-apk/scripts/patches/pi-upstream-streaming-020.mjs>) | raw pi-ai@0.87.1覆盖会丢官方pnpm patch；精确恢复anthropic-messages、bedrock-converse-stream、mistral-conversations、openai-completions、openai-responses-shared、pi-messages六个dist/api JS | [官方patch副本](<dsh-mobile-apk/scripts/patches/upstream/pi-ai-0.87.1.patch>)固定SHA b9bcce474fb2ac44633dff0fa722816a5bff5451b4575d5874035ea14ba70a4f，完整六文件plan先验证后缓存写，严格上下文、幂等、无fuzzy。G2 requires streaming020。 |
+| ptc-argv-L1 | host heap参数移出argv，经本次NODE_OPTIONS；A1重整launch前缀，不能只保留L1并假称Android已可启动 | registry仍在场，A1 requires L1；旧fixture通过不能证明target0.2双文件通过。 |
+| terminal-inspector-android-D1 | dsh-subprocess-local的runner-launch-B2zsQ1Dz（按targetDiscovery发现版本bundle）；createProcessInspector把android归入既有Linux分支，其它平台throw不放宽 | registry在场；版本重锚/最终bundle核实由父构建完成，不推断0.2已验收。 |
+| atomic-stale-lock-F4 | dsh-atomic-write | registry自0.1.7-rc.2已移入retired：上游原生takeOverExitedLock吸收孤儿锁语义；0.14.3仍不施加，历史§7.1行不是当前登记。 |
+
+A1只适配native启动，不提供process confinement provider，不改policy/approval/sandbox默认。有效danger-full-access沿既有授权直跑；read-only/workspace-write缺provider仍sandbox-unavailable，不能自动downgrade/root或把自动审批当full-access。
+
+统一runner已读取多文件实现，source-build reconcile-engine-patch-copies展开所有additionalTargets、对逻辑目标运行exact verifier后复制到同包pnpm物理副本，最终source snapshot检查复用同一口径。普通build-snapshot-013的post-apply已改为再次调用统一runner --check --scope engine，成功日志明确包含全部companion与exact upstream verifier；不会把streaming020说明marker当源码literal。apply前capture-only留目标原始fixture字节用于外部回归，不执行测试。本source/doc任务未运行任何构建/检查。
+
+三条runtime asset当前仍为历史目标的完整文件；0.14.3尺寸/hash/同源结论留空待实际重出与终包对账，不虚构测量。所有新增补丁文件、官方patch与0.2 fixture均登记于 [执行地图覆盖账本](<dsh-mobile-apk/docs/AGENTS/EXECUTION-MAP.md>)。
 
 镜像纪律（0.13.8 PR-A1 起）：本仓 `scripts/patches/**` 是协调仓权威源的**逐字节镜像**（云端
 自包含构建检出本仓），`scripts/check-patch-mirror.mjs` 在两仓 CI 与构建链强制比对——

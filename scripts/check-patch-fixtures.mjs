@@ -17,11 +17,12 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const SELF_TEST = process.argv.includes('--self-test')
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 
 const fails = []
 const check = (label, ok, detail) => {
@@ -30,12 +31,16 @@ const check = (label, ok, detail) => {
 }
 
 /** 对一棵 fixtures/tests 树跑三条断言，返回失败列表（--self-test 用临时树驱动反例）。 */
-function audit(fixturesDir, testsDir, baseline) {
+function audit(fixturesDir, testsDir, baseline, sourceCommit = null, registry = null) {
   const out = []
   const manifestPath = join(fixturesDir, 'manifest.json')
   if (!existsSync(manifestPath)) return ['夹具台账缺席: ' + manifestPath]
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
   const declared = manifest.fixtures ?? {}
+  if (registry && (manifest.capture?.engine !== baseline || manifest.capture?.sourceCommit !== sourceCommit
+    || manifest.capture?.registrySha256 !== sha256(readFileSync(join(HERE, 'patches', 'registry.json'))))) {
+    out.push('夹具捕获登记身份/补丁集与当前合同不符：必须从本代真实构建产物重新捕获')
+  }
   // A 台账完备
   const dirs = readdirSync(fixturesDir).filter((d) => statSync(join(fixturesDir, d)).isDirectory())
   for (const d of dirs) if (!declared[d]) out.push(`夹具目录未在台账声明: ${d}`)
@@ -45,8 +50,26 @@ function audit(fixturesDir, testsDir, baseline) {
     if (meta.source === 'engine-tgz') {
       if (meta.engine !== baseline) out.push(`夹具未随版: ${dir} engine=${meta.engine} != contract.baseline=${baseline}`)
       if (!dir.endsWith('-' + meta.engine)) out.push(`夹具目录名与台账版本不符（改名没改台账）: ${dir} vs ${meta.engine}`)
-      for (const f of meta.files ?? []) {
-        if (!existsSync(join(fixturesDir, dir, f))) out.push(`夹具文件缺席: ${dir}/${f}`)
+      const files = meta.files ?? []
+      if (!files.length || new Set(files).size !== files.length) out.push('夹具文件集为空/重复: ' + dir)
+      const provenance = meta.provenance
+      if (!provenance || !/^[0-9a-f]{64}$/.test(provenance.tarballSha256 ?? '')
+        || !/^[^/\\]+\.tgz$/.test(provenance.tarballFile ?? '')
+        || !['source-build', 'published-tarball'].includes(provenance.inputKind)) out.push('夹具缺真实产物来源/hash: ' + dir)
+      if (provenance?.inputKind === 'source-build' && (!/^[0-9a-f]{40}$/.test(provenance.sourceCommit ?? '')
+        || (sourceCommit && provenance.sourceCommit !== sourceCommit))) out.push('夹具源码提交与合同不符: ' + dir)
+      for (const f of files) {
+        if (typeof f !== 'string' || f.startsWith('/') || f.includes('\\') || f.split('/').some(part => part === '..' || part === '.')) {
+          out.push('夹具文件路径不安全: ' + dir + '/' + f); continue
+        }
+        const path = join(fixturesDir, dir, f)
+        if (!existsSync(path)) out.push('夹具文件缺席: ' + dir + '/' + f)
+        else if (meta.fileSha256?.[f] !== sha256(readFileSync(path))) out.push('夹具文件实际 hash 与捕获记录不符: ' + dir + '/' + f)
+      }
+      if (!files.includes('package.json')) out.push('夹具缺包身份清单: ' + dir)
+      else if (existsSync(join(fixturesDir, dir, 'package.json'))) {
+        const pkg = JSON.parse(readFileSync(join(fixturesDir, dir, 'package.json'), 'utf8'))
+        if (meta.package !== pkg.name + '@' + pkg.version) out.push('夹具包身份与台账不符: ' + dir)
       }
     } else if (meta.source === 'synthetic') {
       if (!String(meta.reason ?? '').trim()) out.push(`合成夹具必须写明 reason（为什么不用真产物）: ${dir}`)
@@ -60,6 +83,32 @@ function audit(fixturesDir, testsDir, baseline) {
         out.push(`测试仍在引用代弃夹具（等于拿旧字节做回归）: ${dir}`)
       }
     } else out.push(`夹具 source 未知: ${dir} = ${meta.source}`)
+  }
+  // 多文件补丁：所有目标必须由当前代真产物提供；主文件存在不能洗绿缺席的 companion。
+  for (const patch of [...(registry?.patches ?? []), ...(registry?.retired ?? [])]) {
+    if ((patch.scope ?? 'vendor') !== 'engine') continue
+    let targets = [patch.target, ...(patch.additionalTargets ?? [])]
+    if (patch.id === 'terminal-inspector-android-D1') {
+      const discovered = manifest.capture?.discoveredTargets?.[patch.id]
+      const prefix = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/'
+      if (!Array.isArray(discovered) || discovered.length !== 1 || !discovered[0].startsWith(prefix)
+        || !/^lib\/runner-launch-[^/]+\.js$/.test(discovered[0].slice(prefix.length))) {
+        out.push('D1 缺精确真实构建 chunk 发现记录'); continue
+      }
+      const target = discovered[0]
+      const matches = Object.entries(declared).flatMap(([dir, meta]) => meta.source === 'engine-tgz' && meta.engine === baseline
+        ? Object.entries(meta.targets ?? {}).filter(([, capturedTarget]) => capturedTarget === target && meta.patchIds?.includes(patch.id))
+          .map(([inner]) => join(fixturesDir, dir, inner)) : [])
+      const anchor = 'function createProcessInspector(platform = process.platform, arch = process.arch, internals = DEFAULT_INTERNALS) {'
+      if (matches.length !== 1 || !existsSync(matches[0]) || !readFileSync(matches[0], 'utf8').includes(anchor)
+        || !readFileSync(matches[0], 'utf8').includes('terminal inspection is unsupported on platform')) out.push('D1 发现记录不对应唯一真实 inspector 文件')
+      targets = [...discovered, ...(patch.additionalTargets ?? [])]
+    }
+    for (const target of targets) {
+      const captured = Object.values(declared).filter(meta => meta.source === 'engine-tgz' && meta.engine === baseline
+        && Object.entries(meta.targets ?? {}).some(([inner, capturedTarget]) => capturedTarget === target && meta.files?.includes(inner)))
+      if (captured.length !== 1) out.push('登记补丁目标必须恰有一份当前真夹具: ' + patch.id + ' ' + target)
+    }
   }
   // C 禁写死
   const hardcoded = /['"]fixtures['"],\s*['"][a-z0-9-]+-\d+\.\d+\.\d+[^'"]*['"]/
@@ -79,8 +128,16 @@ if (SELF_TEST) {
       mkdirSync(join(fx, 'dsh-demo-0.9.9-rc.1', 'lib'), { recursive: true })
       mkdirSync(ts, { recursive: true })
       writeFileSync(join(fx, 'dsh-demo-0.9.9-rc.1', 'lib', 'index.js'), '// fixture\n')
+      // Self-test-only fixture metadata; never written to the repository ledger.
+      const packageBytes = JSON.stringify({ name: 'dsh-demo', version: '0.9.9-rc.1' })
+      writeFileSync(join(fx, 'dsh-demo-0.9.9-rc.1', 'package.json'), packageBytes)
       writeFileSync(join(fx, 'manifest.json'), JSON.stringify({
-        fixtures: { 'dsh-demo-0.9.9-rc.1': { source: 'engine-tgz', engine: '0.9.9-rc.1', files: ['lib/index.js'] } },
+        fixtures: { 'dsh-demo-0.9.9-rc.1': {
+          source: 'engine-tgz', engine: '0.9.9-rc.1', package: 'dsh-demo@0.9.9-rc.1',
+          files: ['lib/index.js', 'package.json'],
+          fileSha256: { 'lib/index.js': sha256('// fixture\n'), 'package.json': sha256(packageBytes) },
+          provenance: { inputKind: 'published-tarball', tarballFile: 'self-test.tgz', tarballSha256: sha256('self-test provenance only') },
+        } },
       }))
       writeFileSync(join(ts, 'demo.test.mjs'), "const FIXTURE = 'x'\n")
       mut({ fx, ts })
@@ -90,6 +147,14 @@ if (SELF_TEST) {
       { label: '反证：夹具未随版判红', want: true, run: ({ fx }) => {
         const m = JSON.parse(readFileSync(join(fx, 'manifest.json'), 'utf8'))
         m.fixtures['dsh-demo-0.9.9-rc.1'].engine = '0.9.8-rc.1'
+        writeFileSync(join(fx, 'manifest.json'), JSON.stringify(m))
+      } },
+      { label: '反证：真实字节 hash 漂移判红', want: true, run: ({ fx }) => {
+        writeFileSync(join(fx, 'dsh-demo-0.9.9-rc.1', 'lib', 'index.js'), '// different bytes\n')
+      } },
+      { label: '反证：丢失产物来源判红', want: true, run: ({ fx }) => {
+        const m = JSON.parse(readFileSync(join(fx, 'manifest.json'), 'utf8'))
+        delete m.fixtures['dsh-demo-0.9.9-rc.1'].provenance
         writeFileSync(join(fx, 'manifest.json'), JSON.stringify(m))
       } },
       { label: '反证：未声明目录判红', want: true, run: ({ fx }) => { mkdirSync(join(fx, 'dsh-orphan-0.9.9-rc.1'), { recursive: true }) } },
@@ -125,7 +190,8 @@ const testsDir = join(ROOT, 'scripts', 'patches', 'tests')
 check('夹具台账在场', existsSync(join(fixturesDir, 'manifest.json')),
   '跑 node scripts/probe-engine-anchors.mjs --fixtures 生成')
 if (!fails.length) {
-  for (const m of audit(fixturesDir, testsDir, contract.baseline)) fails.push(m)
+  for (const m of audit(fixturesDir, testsDir, contract.baseline, contract.upstream.commit,
+    JSON.parse(readFileSync(join(HERE, 'patches', 'registry.json'), 'utf8')))) fails.push(m)
   check('夹具三条断言（台账完备 / 随版 / 禁写死）', fails.length === 0, fails.join(' | '))
 }
 if (fails.length) {

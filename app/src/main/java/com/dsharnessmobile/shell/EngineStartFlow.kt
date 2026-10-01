@@ -666,11 +666,40 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 属于前者：不再空等 90s 预算，直接以可归因的原因收口，用户看到的不再是
         // 「进程在 90s 预算内死亡」这种无指向的结论。
         val refusal = activity.engineManager.lastStartRefusal
+        val refusalCode = activity.engineManager.lastStartRefusalCode
         LogCollector.writeBootFail(
           activity, if (refusal != null) "engine-start-refused" else "engine-start-false",
           "EngineManager.startEngine() 返回 false（未能拉起引擎进程）"
+            + (refusalCode?.let { "；refusalCode=" + it } ?: "")
+            // issue #309：把**判别性事实**（确诊项有几个）也写进 boot-fail，而不是只写进
+            // LogCollector.log——后者只有采集器在跑时才落盘（独立评审 C6 指出的可诊断性缺口）。
+            // 这一格正是「自动路径为什么没动」的唯一线索：空 = 只有低置信度条目命中。
+            + (refusalCode?.let { "；confirmed=" + activity.engineManager.lastStartRefusalConfirmed.joinToString(",") } ?: "")
             + (refusal?.let { "；refusal=" + it } ?: ""),
         )
+        // issue #309：解开闸门 A / 闸门 B 的互锁。
+        //
+        // 互锁形态（源码级确证）：闸门 A（liveRuntimeComplete，spawn 之前）拒启 ⇒ 不 spawn
+        // ⇒ engine.log 永不产生 ⇒ 闸门 B（maybeSelfHealDamagedRuntimeTree 读 engine.log 尾部
+        // 找 CANNOT LINK）判据恒为假 ⇒ 自愈不可达。且 refreshSnapshot 全仓只有冷启动一个调用点，
+        // 拒启路径为零；UI 的「重试」只清账本不删指纹（指纹新鲜时是 no-op）——自动与手动路径都为零，
+        // 用户实测 36 次 / 47 分钟无任何恢复动作。
+        //
+        // 修法：拒启原因确为「live 树残缺」**且缺的是确诊项**时，删指纹 + 清账本，让下一次冷启动
+        // 的 `if (!snapshotFresh())` 走完整重抽取。三处克制：
+        //   ① 只在确诊项缺失时触发——REQUIRED_LIBS 成员可能是**传递依赖**误报（issue #309 明确
+        //      告诫「不要贸然补全该表」，否则互锁会从「可人工救」升级为「只能清应用数据」），
+        //      因此它们只记录、不触发；
+        //   ② 复用 runtimeTreeHealedThisRun（每次 app 运行一次），不新增预算变量，
+        //      因此不会引入「重抽取 → 再失败 → 再重抽取」死循环；
+        //   ③ 不改闸门 A 的判据本身——带病的树仍然不被 spawn，安全性不变。
+        // 预算用尽或缺的都是低置信度条目时如实停在错误页并留档，不假装已修复。
+        if (refusalCode == EngineManager.REFUSAL_LIVE_RUNTIME_INCOMPLETE) {
+          maybeRecoverFromIncompleteLiveRuntime(
+            activity,
+            confirmedMissing = activity.engineManager.lastStartRefusalConfirmed,
+          ) { isCurrentEngineFlow(generation) }
+        }
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
           activity.applyGuidePhase(GuidePhase.Error, "引擎启动失败")
@@ -1033,7 +1062,7 @@ internal fun startupRecoverThenProbe(recover: () -> Unit, probeRunning: () -> Bo
   return probeRunning()
 }
 
-// ── task-79（Bug A）：运行时树损坏 ⇒ 一次受控重抽取 ─────────────────────────────
+// ── task-79（Bug A）+ issue #309：运行时树损坏 ⇒ 一次受控重抽取 ────────────────
 
 /**
  * 本次 app 运行是否已经为「运行时树损坏」自愈过一次（进程内一次性，见 [RuntimeTree.maySelfHeal]）。
@@ -1041,7 +1070,11 @@ internal fun startupRecoverThenProbe(recover: () -> Unit, probeRunning: () -> Bo
  * 为什么是**进程内**标记而不是持久化：预算是「每次 app 运行最多一次」——用户重启 app 就是重新给一次机会，
  * 这与「每次启动都无限重抽取」有本质区别。持久化会让用户永远翻不了身。
  */
-@Volatile private var runtimeTreeHealedThisRun = false
+// 独立评审 C3：「读-判-写」三步并不原子，而它有两个真实并发来源——启动流的 worker 线程与
+// EngineService 看门狗的 RESTART 拍（`EngineService.kt:319` 直接调 startEngine），两者可能
+// 同时读到 false。后果本来无害（删指纹/清账本都幂等），但注释宣称「每次运行最多一次」，
+// 那就让它**真的**只有一次：用 CAS 把「花掉预算」变成单次操作。
+private val runtimeTreeHealedThisRun = java.util.concurrent.atomic.AtomicBoolean(false)
 
 /**
  * task-79（Bug A）：引擎**因动态链接失败而死**时，判定运行时树损坏并触发一次受控重抽取。
@@ -1066,12 +1099,12 @@ private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity, current: () 
   val tail = try { PluginMounts.readEngineLogTail(activity, 4_096) } catch (_: Throwable) { "" }
   if (!current() || !RuntimeTree.snapshotLinkFailure(tail)) return
   LogCollector.log("dsh-engine-start", "engine died from a dynamic-link failure; runtime tree is damaged")
-  if (!RuntimeTree.maySelfHeal(runtimeTreeHealedThisRun)) {
+  // CAS 即判定：抢输的那一拍直接认预算已花，不再重复删指纹/重抽取（避免重抽取死循环）。
+  if (!runtimeTreeHealedThisRun.compareAndSet(false, true)) {
     // 预算用尽：不再删指纹/重抽取，停在可读错误页（既有 UI 已展示诊断包路径）。
     LogCollector.log("dsh-engine-start", "runtime tree damage: self-heal budget already spent this run; not re-extracting (avoid a re-extract loop)")
     return
   }
-  runtimeTreeHealedThisRun = true
   try {
     if (!current()) return
     // ① 壳侧标记（不被引擎截断），供后续启动与诊断读取。
@@ -1124,6 +1157,119 @@ private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?
   // ③ 诊断包镜像（不切界面相位，理由见上方注释）。
   if (!current()) return
   activity.engineManager.mirrorDiagnosticsToShared(notice.code)
+}
+
+/**
+ * issue #309：live 运行时树残缺时**唯一**的自动恢复动作（与闸门 B 共用同一份预算）。
+ *
+ * 为什么需要它：闸门 A 在 spawn 之前就拒启，因此 engine.log 根本不会产生，闸门 B 的判据
+ * （读 engine.log 尾部的 CANNOT LINK / library not found）**结构性不可达**；而 refreshSnapshot
+ * 全仓只有冷启动一个调用点，拒启分支为零、UI 的「重试」在指纹新鲜时是 no-op。结果是「live 树
+ * 缺一条 soname 链」这种可自愈状态会把用户永久挡在错误页（issue 实测 36 次 / 47 分钟零恢复）。
+ *
+ * **两道闸门**（判定全在 RuntimeTree.allowStartRecovery，本函数只执行其结论，不自己发明条件）：
+ *   ① 预算——复用 runtimeTreeHealedThisRun（每次 app 运行一次），不新增预算变量，
+ *      因此不会引入「重抽取 → 再失败 → 再重抽取」死循环；
+ *   ② 证据分级——confirmedMissing 为空时**自动路径**不动作。低置信度条目（REQUIRED_LIBS 成员）
+ *      可能是传递依赖造成的假阴性，issue #309 明确告诫「不要贸然补全该表」；自动放宽等于把
+ *      「可人工救」升级成「每次启动白付一次 8-12 分钟全量抽取并抹掉现场」。
+ *      **唯一例外是用户显式动作**（userForced，错误页的错误态按钮）：自动路径的克制不能变成
+ *      「用户连点一下都不行」——issue 现场用户只能靠壳侧终端手工补库，本 issue 的核心诉求
+ *      正是「给闸门 A 加出口」。预算仍照旧约束他：一次之后仍失败就停手。
+ *
+ *      **如实声明其边界**（独立评审 C1/C2：不声明就等于又造一个「承诺不存在的动作」）：
+ *      手动点击**不保证**产生动作，两种情况下它是**静默空操作**——
+ *        · 本次运行已花过预算（自动路径先花掉了那一次）⇒ 日志写 budget already spent；
+ *        · 根本没有 live 树残缺拒启（`lastStartRefusalCode` 不是该码）⇒ 调用方压根不进来。
+ *      另外 userForced **不是**「强制启动」：它只放行证据分级去删指纹，spawn 仍由闸门 A 把关，
+ *      即带病的树在重抽取完成前依然起不来（这是安全属性，不是缺陷）。
+ *
+ * 动作（与闸门 B 的自愈同形，避免两套口径）——顺序**不可换**：
+ *   ① 写壳侧损坏标记（不被引擎截断，供后续启动与诊断读取）；
+ *   ② 删 .snapshot-fingerprint（EngineManager.invalidateSnapshotFreshness）⇒
+ *      下一次冷启动的 `if (!snapshotFresh())` 走完整重抽取；
+ *   ③ 清刷新失败账本 ⇒ 避免降级闸门在新局面下用旧账打架；
+ *   ④ 写一份**快照前**诊断镜像 ⇒ 拒启取证已在 boot-fail.log，这里补一份可整包取走的现场。
+ *
+ * **不做什么**（写清以免被当成漏做）：不改闸门 A 的判据，带病的树仍然不被 spawn；不在本函数内
+ * 直接调 refreshSnapshot（那会把 2.5GB 解压塞进拒启分支的调用栈，且与冷启动路径争同一次刷新）；
+ * 不承诺一次修好——预算用尽或证据不足时如实停在错误页，由用户手动「重试」再走一轮。
+ * 与 #240 的降级闸门不冲突：下一次冷启动时 live 仍不完整 ⇒ shouldDegradeRefresh() 返回 false ⇒
+ * 不会绕过这次刷新（删除指纹正是为了让那条路径真正走到 refreshSnapshot）。
+ *
+ * @param activity 宿主（用其 filesDir 与 engineManager）。
+ * @param confirmedMissing 闸门 A 的**确诊缺失项**（EngineManager.lastStartRefusalConfirmed）。
+ * @param userForced 真 = 用户在错误页显式要求重做运行时（放行证据分级，不放行预算）。
+ * @param current 世代校验，恢复途中若已换代则立刻停手。
+ */
+internal fun maybeRecoverFromIncompleteLiveRuntime(
+  activity: MainActivity,
+  confirmedMissing: List<String>,
+  userForced: Boolean = false,
+  current: () -> Boolean,
+) {
+  if (!current()) return
+  if (!RuntimeTree.allowStartRecovery(confirmedMissing, runtimeTreeHealedThisRun.get(), userForced)) {
+    val reason = if (confirmedMissing.isEmpty() && !userForced) {
+      "no confirmed missing entry (only low-confidence probes fired, so the automatic path stays put)"
+    } else {
+      "self-heal budget already spent this run"
+    }
+    LogCollector.log("dsh-engine-start", "live runtime incomplete (gate A): " + reason + "; staying at the readable error page")
+    return
+  }
+  // 上面是纯判定（便于单测）；**这里是权威**：CAS 抢输说明另一条线程刚花掉了那一次，
+  // 立刻收手，不得重复恢复。
+  if (!runtimeTreeHealedThisRun.compareAndSet(false, true)) {
+    LogCollector.log("dsh-engine-start", "live runtime incomplete (gate A): lost the one-shot budget race; staying at the readable error page")
+    return
+  }
+  val evidence = confirmedMissing.joinToString(", ")
+  LogCollector.log(
+    "dsh-engine-start",
+    "live runtime incomplete (gate A): clearing fingerprint so the next start re-extracts the runtime; confirmed=" + evidence,
+  )
+  // 每一步各自容错，且**任何一步失败都要留下可归因的落盘记录**：
+  // 旧写法把整段包在一个 try 里，标记写盘一抛（独立评审 D6）就连一条 boot-fail 都没有，
+  // 只剩一句 Log.w——这正是本 issue 反复出现的「失败现场不存在」的同形复发。
+  val stepFailure = runCatching {
+    java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
+      .writeText(System.currentTimeMillis().toString() + (0x0A).toChar())
+  }.exceptionOrNull()
+  if (stepFailure != null) {
+    Log.w("dsh-engine-start", "could not write runtime-tree damage marker", stepFailure)
+  }
+  if (!current()) return
+  // 删指纹：即使上面的标记没写成，这一步仍是恢复动作的承重墙，必须继续尝试。
+  val invalidated = activity.engineManager.invalidateSnapshotFreshness()
+  if (!current()) return
+  activity.engineManager.clearRefreshLedger()
+  if (!current()) return
+  // 独立评审 6(b)：删指纹**没成**时把预算**退回去**。
+  //
+  // 为什么必须退：预算的语义是「一次运行内最多重做一次运行时」，用来防止重抽取死循环；
+  // 而 invalidation 失败意味着**根本没安排重做**（没有触发重抽取的载体）。此时若照样烧掉预算，
+  // 自动路径与用户手动点击在本次运行内**双双失效**，用户被钉在错误页——比本 issue 修之前更糟
+  // （修之前只是拒绝，现在变成「拒绝且连出口都烧了」）。退回是安全的：什么都没做，
+  // 也就没有任何循环可防。
+  if (!invalidated) runtimeTreeHealedThisRun.set(false)
+  // 落盘文案必须**如实**反映真做成了什么：删不掉指纹时不能写「下次启动将走完整重抽取」，
+  // 否则复现的是本 issue 第 5 条指出的同形缺陷（文案承诺一个并不存在的动作）。
+  LogCollector.writeBootFail(
+    activity,
+    if (invalidated) "live-runtime-incomplete-recovery" else "live-runtime-incomplete-recovery-blocked",
+    "闸门 A 拒启（live 运行时树残缺，确诊项：" + evidence + "）：" +
+      if (invalidated) {
+        "已删指纹并清刷新账本，下次启动将走完整重抽取；本次不 spawn"
+      } else {
+        "指纹删不掉（存储异常），无法安排重抽取；本次不 spawn"
+      } + (stepFailure?.let { "；损坏标记写入失败=" + it.javaClass.simpleName } ?: ""),
+  )
+  if (!current()) return
+  // 取证镜像放最后：它是最贵的一步（六代 engine.log + 有界 logcat 抽取），
+  // 而且必须在**结果已定**之后取，否则镜像里的 start_refusal_* 还是上一次拒启的值
+  // （独立评审 C7）。best-effort：失败不影响上面的结论。
+  activity.engineManager.mirrorDiagnosticsToShared("live-runtime-incomplete")
 }
 
 /**

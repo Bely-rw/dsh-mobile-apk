@@ -61,19 +61,14 @@ jobs:
           python --version
       # 快照构建期会跑 check-browser-syntax-floor（判据 1 依赖真实 TypeScript 解析器），
       # 并注入各插件的 lib/ ⇒ 缺依赖会以 exit 2「无法判定」拒发（首次派发实测：release run 36352307693 两个 ABI 同因失败）。
-      # 与 build-apk.yml 同一口径：有锁文件走 npm ci（按锁文件可复现），无锁文件走 npm install。
-      - name: 构建插件（有锁文件走 npm ci；dsh-host-web-compat 用已提交 lib）
+      # 0.2 源码适配只更新声明；CI 必须先解析实际锁图，再 npm ci，并随产物记录真实 lock hash。
+      - name: 构建插件（lock-only 后 npm ci；dsh-host-web-compat 用已提交 lib）
         shell: bash
         run: |
           set -e
           install_deps() {
-            if [ -f "$1/package-lock.json" ]; then
-              echo "  deps: npm ci（锁文件在场，可复现）"
-              (cd "$1" && npm ci --no-audit --no-fund)
-            else
-              echo "  deps: npm install（无锁文件，按 package.json 解析）"
-              (cd "$1" && npm install --no-audit --no-fund)
-            fi
+            node scripts/source-build/install-project-dependencies.mjs "$1" \
+              ".deploy-tmp/source-build/plugin-lock-resolution-${{ matrix.abi }}.json"
           }
           # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
           # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module（真实 run 实测）。
@@ -109,6 +104,12 @@ jobs:
         with:
           name: snapshot-${{ matrix.abi }}
           path: .deploy-tmp/snapshot-013/${{ matrix.abi }}/snapshot.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-locks-${{ matrix.abi }}
+          path: .deploy-tmp/source-build/plugin-lock-resolution-${{ matrix.abi }}.json
           if-no-files-found: error
           retention-days: 7
 
@@ -170,14 +171,15 @@ jobs:
         run: |
           yes | sudo "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
           find "${ANDROID_HOME}/build-tools" -maxdepth 2 -type f -name apksigner | tail -1
-      - name: 构建插件（有锁文件走 npm ci）
+      - name: 构建插件（lock-only 后 npm ci）
         shell: bash
         run: |
           set -e
           # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
           # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module（真实 run 实测）。
           for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay; do
-            if [ -f "$d/package-lock.json" ]; then (cd "$d" && npm ci --no-audit --no-fund); else (cd "$d" && npm install --no-audit --no-fund); fi
+            node scripts/source-build/install-project-dependencies.mjs "$d" \
+              .deploy-tmp/source-build/plugin-lock-resolution-release.json
             (cd "$d" && npm run build)
           done
       - name: Kotlin 单测（check-kotlin-test-count 的输入）
@@ -191,20 +193,19 @@ jobs:
           # 结果目录 app/build/test-results/testDebugUnitTest 会被下面的门禁就地读取并比对基线。
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
-      # 发布门禁集里有若干条**输入是上游源码树**（check-dead-tokens 读 dsh/packages/client/ui-theme/src/styles，
-      # check-contract 读 dsh/packages/** 并对上游树做 git describe/commit 身份核对）。
-      # apk 仓自身不含 dsh/ ⇒ 不检出上游时它们会以 SKIP 结案，而严格档（--require）下 SKIP 即判红
-      # （真实 run 36355385922 就死在这里）。故在此按仓库固定提交检出上游树。
-      - name: 检出上游 dsh 树（固定提交；门禁面含上游输入）
+      # 上游源码门禁统一读 contract.upstreamRepo；旧 dsh/ 与 readonly 审核树不得代替 0.2 build input。
+      # 缺输入会 SKIP，而 --require 拒绝 SKIP；源码版本、提交和 describe 都必须与合同一致。
+      - name: 检出上游源码树（0.2 固定提交；合同路径）
         shell: bash
         run: |
           set -e
-          git clone --filter=blob:none --no-checkout https://github.com/deepseek-ai/deepseek-harness.git dsh
-          cd dsh
-          git checkout 477b4f420553e8a52c2fbccc464d7561b239c443
-          git describe --tags --always
-          test -d packages/client/ui-theme/src/styles || { echo "::error::上游令牌定义面缺席"; exit 1; }
-          du -sh "$PWD"
+          mkdir -p .deploy-tmp
+          git clone --filter=blob:none --no-checkout https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          git -C .deploy-tmp/deepseek-harness checkout --detach 639ed015397290b3745d163aafe02ffee4aa3f84
+          test "$(git -C .deploy-tmp/deepseek-harness rev-parse HEAD)" = "639ed015397290b3745d163aafe02ffee4aa3f84"
+          test "$(git -C .deploy-tmp/deepseek-harness describe --tags --always)" = "dsh-v0.2.0-rc.2"
+          node -e 'const c=require("./scripts/contract.json"), p=require("./.deploy-tmp/deepseek-harness/package.json"); if(c.upstreamRepo!==".deploy-tmp/deepseek-harness" || c.baseline!=="0.2.0-rc.2" || c.upstream.commit!=="639ed015397290b3745d163aafe02ffee4aa3f84" || p.version!==c.baseline || p.packageManager!=="pnpm@11.7.0") throw Error("release source identity does not match contract")'
+          test -d .deploy-tmp/deepseek-harness/packages/client/ui-theme/src/styles || { echo "::error::上游令牌定义面缺席"; exit 1; }
       # 本地链期望的输入位是 .deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz（**注入前**），
       # 注入/降级/门禁/打包都在链内完成。J1 产出的正是注入前快照，归置到该位置即可。
       - name: 归置快照为本地链输入位（pre-injection；注入由链内完成）
@@ -246,7 +247,13 @@ jobs:
         run: |
           set -e
           OUT="release/v${ver}"
-          mkdir -p "$OUT/apk" "$OUT/snapshot" "$OUT/plugins"
+          mkdir -p "$OUT/apk" "$OUT/snapshot" "$OUT/plugins" "$OUT/provenance"
+          cp .deploy-tmp/source-build/plugin-lock-resolution-release.json "$OUT/provenance/"
+          if [ "${{ inputs.skip_snapshot_rebuild }}" != "true" ]; then
+            for abi in arm64 x86_64; do
+              cp ".deploy-tmp/snapshot-013/plugin-locks-${abi}/plugin-lock-resolution-${abi}.json" "$OUT/provenance/"
+            done
+          fi
           ls -l "out/v${ver}"
           for f in out/v${ver}/*.apk; do [ -f "$f" ] && cp "$f" "$OUT/apk/"; done
           for f in out/v${ver}/snapshot-*.tar.xz; do [ -f "$f" ] && cp "$f" "$OUT/snapshot/"; done
@@ -320,7 +327,7 @@ jobs:
             gh release create "$TAG" --repo "${{ github.repository }}" --draft \
               --title "dsh-mobile $TAG" --notes-file "release/v${ver}/notes.md"
           fi
-          for f in release/v${ver}/apk/*.apk release/v${ver}/snapshot/*.tar.xz release/v${ver}/plugins/*.tgz release/v${ver}/MANIFEST.txt release/v${ver}/notes.md; do
+          for f in release/v${ver}/apk/*.apk release/v${ver}/snapshot/*.tar.xz release/v${ver}/plugins/*.tgz release/v${ver}/provenance/*.json release/v${ver}/MANIFEST.txt release/v${ver}/notes.md; do
             [ -f "$f" ] || continue
             gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
           done

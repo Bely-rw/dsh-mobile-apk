@@ -12,7 +12,7 @@ import { canonicalizePackedManifest } from './normalize-snapshot.mjs'
 
 const repo = resolve(process.argv[2] ?? '')
 const cache = resolve(process.argv[3] ?? '')
-const expectedCommit = '477b4f420553e8a52c2fbccc464d7561b239c443'
+const expectedCommit = '639ed015397290b3745d163aafe02ffee4aa3f84'
 const overlayPath = resolve('scripts/snapshot-config/engine-overlay.json')
 if (!process.argv[2] || !process.argv[3]) {
   console.error('usage: node scripts/source-build/export-dsh-engine.mjs <dsh-source-root> <overlay-cache>')
@@ -25,11 +25,16 @@ if (commit !== expectedCommit) throw new Error(`unexpected DeepSeek Harness comm
 
 const overlay = JSON.parse(readFileSync(overlayPath, 'utf8'))
 const sourcePackage = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'))
+if (sourcePackage.version !== '0.2.0-rc.2' || sourcePackage.packageManager !== 'pnpm@11.7.0'
+  || overlay.engineVersion !== '0.2.0-rc.2' || overlay.rootPackage?.version !== '0.2.0-rc.2') {
+  throw new Error('source export requires official 0.2.0-rc.2 source/overlay and pnpm 11.7.0')
+}
 const lockfilePath = join(repo, 'pnpm-lock.yaml')
 if (!existsSync(lockfilePath)) throw new Error('pinned Harness source is missing pnpm-lock.yaml')
 const vendorOverridePath = resolve('.deploy-tmp/source-build/harness-vendor-overrides.json')
 const vendorOverrideReport = JSON.parse(readFileSync(vendorOverridePath, 'utf8'))
-if (vendorOverrideReport.harnessSourceCommit !== expectedCommit) {
+if (vendorOverrideReport.harnessSourceCommit !== expectedCommit
+  || vendorOverrideReport.mode !== 'pinned-target-source-evidence' || vendorOverrideReport.rewoundSourceCount !== 0) {
   throw new Error(`vendor source overrides target ${vendorOverrideReport.harnessSourceCommit}, expected ${expectedCommit}`)
 }
 const packageSourceCommits = new Map((vendorOverrideReport.overrides ?? []).map((item) => [item.package, item.sourceCommit]))
@@ -64,10 +69,8 @@ const packed = []
 for (const [name, version] of [...wanted].sort(([a], [b]) => a.localeCompare(b))) {
   const entry = manifests.get(name)
   if (!entry) throw new Error(`missing source package: ${name}`)
-  // Every overlay pin must match the tree as staged: the vendor source overrides
-  // replace the pinned Cordis packages before this runs, so no version rewriting
-  // happens here and the packed manifests stay exactly as their source commits
-  // published them.
+  // Every pin follows the official target manifest. Vendor evidence audits the
+  // same target without rewinding sources; packed versions are never rewritten.
   if (entry.manifest.version !== version) {
     throw new Error(`${name} source version ${entry.manifest.version} does not match overlay pin ${version}`)
   }

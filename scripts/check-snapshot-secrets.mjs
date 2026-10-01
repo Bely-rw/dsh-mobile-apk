@@ -64,7 +64,9 @@ const npmrc = pathHits(/home\/\.npmrc/i)
 if (npmrc.length) failOut('npmrc', npmrc)
 
 // settings.yaml 内容级（0.13.0 C1/Q14）：允许非机密 seed 模板存在，但不得含真实凭据形态
-const hasSettings = pathHits(/home\/\.dsh\/settings\.yaml/i)
+const importedSettings = lines.filter((path) => path.split('/').pop()?.toLowerCase() === 'settings.yaml.imported')
+if (importedSettings.length) failOut('imported-user-settings', importedSettings)
+const hasSettings = lines.filter((path) => path === 'home/.dsh/settings.yaml')
 if (hasSettings.length) {
   let content = ''
   let readFailed = false

@@ -85,10 +85,10 @@ export interface AndroidShellBridge {
   resetShizukuConnection?: () => string
   /**
    * issue #262「AI root 权限」读面：`{ok, granted, consentValid, consentVersionCode,
-   * currentVersionCode, channelUid, channelRoot, canToggle, honesty}`。
+   * currentVersionCode, channelUid, channelRoot, canToggle, honesty, ownership}`。
    *
    * `channelRoot` 是**通道身份**判据（Shizuku 服务端 uid==0），不是「设备是否 root」——
-   * 已 root 但 Shizuku 以 ADB（uid 2000）启动的设备此值为 false，开关置灰。
+   * 已 root 但 Shizuku 以 ADB（uid 2000）启动时此值为 false；显式授权的 su 是独立替代通道。
    */
   rootGrantState?: () => string
   /** issue #262 开关写面：判据（通道 root + 同意有效）全满足才写入；返回写后读回 JSON，
@@ -104,16 +104,16 @@ export interface AndroidShellBridge {
    *  `{ok, suExists, suPath, state: 'unknown'|'requesting'|'granted'|'denied'|'timeout'|'no-su',
    *  uid, granted, requesting, manager:{package,label,installed}, guidance}`。 */
   rootAccessState?: () => string
-  /** 2026-09-30 主人定例：显式请求 root 授权——后台 `su -c id` **触发 Root 管理器授权弹窗**；
+  /** 2026-09-30 主人定例：显式检测 root 授权——后台 `su -c id -u` 取真实 uid；不保证所有管理器自动弹窗。
    *  非阻塞（立即返回 `{ok:true,code:'request-started'}`，结果靠轮询 rootAccessState 收敛）；
    *  幂等（在飞时不重复起，避免弹窗连发）。 */
   requestRootAccess?: () => string
   /* 2026-09-30 主人指正后**移除**了 `openRootManager`：各家 Root 管理器包名/入口不一
      （还可能根本没有管理器 App，如部分 ROM 内置 su），打开不保证成功 ✗；而能刷 root 的用户
      自己会开管理器 ✓ ⇒ 只保留「检测/请求 root 授权」＋诚实引导文案。勿再加回来。 */
-  /** 2026-09-30 主人定例：root 通道写盘**属主自愈**（有界抽查 + 有界修复，只在通道身份为 root 时动作）。
-   *  root 写的文件属主是 root:root ⇒ 应用自己读不回来（0600）⇒ watcher/插件/引擎读写失败。
-   *  返回 `{ok, channelUid, checked, healed, skipped?}`。 */
+  /** Single-flight asynchronous native app-data ownership maintenance; never an AI shell entry.
+   * Returns `{ok, code:repair-started|repair-running, running, startedAt, ...}` immediately.
+   * Only `rootGrantState().ownership.result` settles checked/healed/failures and complete/partial status. */
   repairRootOwnership?: () => string
   /** Pre-0.13.7 implicit ACTION_VIEW on a single path (kept: the page's path clicks
    *  fall back to it when the chooser is unavailable). Returns whether it launched. */
@@ -131,6 +131,8 @@ export interface AndroidShellBridge {
   incomingWorkspacePath?: () => string
   /** BrowserHost workbench lifecycle/navigation state (JSON string). */
   browserHostStatus?: () => string
+  /** Narrow session/tab-addressed navigation; JSON replies echo session and authoritative native tabs. */
+  browserHostCommand?: (payload: string) => string
   browserHostShow?: (url?: string | null) => string
   browserHostHide?: () => string
   browserHostReload?: () => string

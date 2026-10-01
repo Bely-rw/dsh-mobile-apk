@@ -53,6 +53,8 @@ class AndroidBridge(
   private val onIncomingWorkspacePath: () -> String = { "" },
   /** BrowserHost workbench state and commands; callable only by trusted DSH UI. */
   private val onBrowserHostStatus: () -> String = { """{"ok":false,"reason":"browser-host-not-wired"}""" },
+  /** 0.14.3: narrow session/tab-addressed navigation, not a page JS or shell interface. */
+  private val onBrowserHostCommand: (String) -> String = { _ -> """{"ok":false,"available":false,"reason":"browser-host-not-wired"}""" },
   private val onBrowserHostShow: (String?) -> String = { _ -> """{"ok":false,"reason":"browser-host-not-wired"}""" },
   private val onBrowserHostHide: () -> String = { """{"ok":false,"reason":"browser-host-not-wired"}""" },
   private val onBrowserHostReload: () -> String = { """{"ok":false,"reason":"browser-host-not-wired"}""" },
@@ -339,6 +341,10 @@ class AndroidBridge(
   /** BrowserHost current lifecycle/navigation state for the Files-sidebar workbench. */
   @JavascriptInterface
   fun browserHostStatus(): String = onBrowserHostStatus()
+
+  /** Session/occurrence-addressed browser commands for the trusted native adapter. */
+  @JavascriptInterface
+  fun browserHostCommand(payload: String): String = onBrowserHostCommand(payload)
 
   /** Lazily create/show BrowserHost and optionally navigate to one http(s) URL. */
   @JavascriptInterface

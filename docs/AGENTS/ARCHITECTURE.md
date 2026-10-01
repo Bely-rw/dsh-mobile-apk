@@ -9,13 +9,13 @@
 | MainActivity.kt | 主 WebView 宿主/生命周期/桥接线/insets/BrowserHost 与 VdisplayHost 生命周期编排 | 几乎所有协作类（构造注入） |
 | GuidePageRenderer.kt | 引导页纯代码 UI 渲染 + GuidePhase 状态机 + WebUI/引导页切换 + APK 自更新交互 | MainActivity |
 | GuideChrome.kt | 引导页控件句柄束（GuideChrome/GuideCallbacks 数据类，DsUi 消费方） | GuidePageRenderer、MainActivity、WatchdogV2、EngineService |
-| EngineStartFlow.kt | 启动流/失败重试/前台监控/冻结看门狗/更新编排（onCreate/onResume 委托入口） | MainActivity、GuidePageRenderer |
-| ConfigTransfer.kt | 配置导入导出纯逻辑 + DirectoryPickerController（SAF）+ MediaPickController + PickImageContract | MainActivity（含 AndroidBridge lambda 接线） |
+| EngineStartFlow.kt / ForegroundPageRecoveryPolicy.kt | CAS generation/token启动所有权；前台页面generation与一次安静恢复，后台不运行freeze监控；销毁取消caller不取消共享root worker | MainActivity、GuidePageRenderer |
+| ConfigTransfer.kt | legacy 配置导入导出未挂载；同文件 DirectoryPickerController 的 SAF 注册仍在用；活动配置读写归 EngineManager→SnapshotUserData | MainActivity（仅选择器） |
 | DownloadSaver.kt | 引擎源下载落盘（exports 优先/MediaStore 回退）+ 外链系统浏览器打开 | MainActivity、UpdateChecker |
 | WebUiChrome.kt | 窗口 UI chrome：沉浸式/剪贴板/常亮/主题推送（真源统一走 ShellState） | MainActivity |
 | FileIncoming.kt | 外部来件（VIEW/SEND）校验净化→临时工作区→通知引擎；queued source 保留到浏览器草稿 claim 或 TTL | MainActivity、EngineService |
 | AndroidBridge.kt | `window.androidBridge` 全部 @JavascriptInterface（计数由 check-bridge-symmetry 守；含设置/chooser/ScreenScope/BrowserHost/虚拟屏/BackGate 接线） | MainActivity（唯一 addJavascriptInterface 点） |
-| BrowserHost.kt / BrowserHostNavigationPolicy.kt / BrowserOverlayPolicy.kt | 惰性隔离第二 WebView（无 bridge）；准入 = http(s)/about:blank 且**主机规范化后**拒回环等价写法（数值/八进制/十六进制/结尾点/IPv4-mapped）；请求级过滤另拒回环/链路本地/元数据段；stage bounds + viewport letterbox；覆盖层可见性判据（fail-closed + 发布者保鲜 TTL） | MainActivity |
+| BrowserHost.kt / BrowserHostNavigationPolicy.kt / BrowserOverlayPolicy.kt / BrowserHostProfile.kt | Session/tab 捕获目标与 model/UI focus 分离；每tab无桥WebView先验证nonDefault profile，再允许HTTP/loopback并保留受保护控制origin拒绝；stage/letterbox/TTL；不支持profile拒绝、不回Default | MainActivity、可信browserHostCommand、模型controlOp |
 | ScreenScope.kt | 0.14 新增：ScreenScope/ScreenTargets/ScreenScopePrefs——用户屏幕范围的 native 真源（损坏/未知回落 virtual-only） | AndroidBridge、DeviceControlService |
 
 注入方向：MainActivity 字段初始化阶段 `by lazy`/直接构造各协作类并传 `this`（如 `engineFlow = EngineStartFlow(this)`）；ActivityResult 注册必须在 STARTED 前，故 dirPickerController/mediaPickerController 为字段直接构造。协作类只回调 MainActivity 的 internal 方法，不持有彼此。
@@ -41,12 +41,12 @@
 | 文件 | 职责一句话 | 被引用 |
 |---|---|---|
 | EngineManager.kt | 快照部署/指纹刷新（事务化）/引擎 spawn（linker64 回退）/shellEnv/运行时补丁部署 | EngineService、EngineStartFlow、ConsoleSession、MainActivity、UpdateManager、UndoGate |
-| EngineService.kt | 前台服务 + 5s 看门狗 tick + onTaskRemoved 礼仪 | BootReceiver、EngineStartFlow、MainActivity、WatchdogV2、UpdateManager（注释） |
+| EngineService.kt | ServiceEpoch拥有startup/watchdog/undo caller与WakeLockOwner；等待后重复epoch检查；pending最多六次2/4/8/16/30/30秒重查，耗尽不自旋 | BootReceiver、EngineStartFlow、MainActivity、WatchdogV2 |
 | WatchdogV2.kt | 深度探活/熔断指数退避/PARTIAL_WAKE_LOCK + task-done 标记按字节偏移消费（ST-12） | EngineService、BootReceiver、EngineStartFlow、UndoGate、GuideChrome（注释） |
 | UndoGate.kt | 连败 6 次急救回退：调 assets/undo-emergency.mjs restore-last-good（幂等/防循环） | EngineService、EngineStartFlow、EngineManager（注释） |
 | SnapshotExtractor.kt | xz tar 流式解压（commons-compress）+ security.android.exec xattr 补章 + zip-slip 防护 | EngineManager、UpdateManager |
 | SnapshotTransaction.kt | 运行时替换事务：暂存解压→原子交换→指纹提交；中断恢复（前滚/回滚/丢弃） | EngineManager |
-| SnapshotFs.kt / SnapshotFileMode.kt / SnapshotUserData.kt | NOFOLLOW 文件原语（目录枚举走 `newDirectoryStream`，避 `Stream.toList()` 的 API 34 依赖）/ 权限位 / ≤0.13.2 遗留 `.dsh-backup` 一次性补写 | SnapshotTransaction、EngineManager |
+| SnapshotFs.kt / SnapshotFileMode.kt / SnapshotUserData.kt / SnapshotFingerprintPolicy.kt | NOFOLLOW文件原语、权限、legacy backup；迁移marker与活动profile配置保留/传输/旧blank seed隔离；严格内嵌SHA与durable fingerprint准入 | SnapshotTransaction、EngineManager |
 | FactoryProfilePatch.kt | 0.14（#214）：profile `cordis.patch.yml` 工厂语义定点纠正（按 id 以工厂为准，退役 disabled 残行清理，用户独有条目不动） | EngineManager、SnapshotTransaction |
 | UpdateManager.kt | 快照在线更新（manifest/sha256/换 usr，usr-old 回退） | EngineManager、EngineStartFlow、UndoGate（注释） |
 | EngineProbe.kt | 引擎探活（Proxy.NO_PROXY 直连 #118；401/303 视作 alive） | 壳侧全部探活唯一入口 |
@@ -75,7 +75,7 @@
 | LogCollector.kt | 开发者日志收集（logcat+engine.log + 启动分段插桩；进程级单例） | 全壳日志面 |
 | DsUi.kt | 引导页共享 drawable/动效/按压反馈 | GuidePageRenderer、GuideChrome |
 | PathOpen.kt | 系统「打开方式」选择器（FileProvider content:// + MIME；目录走树选择器；canonical 白名单） | AndroidBridge → MainActivity |
-| ProcIo.kt | 子进程有界 I/O（readBounded 三态 timedOut/truncated；禁裸 readText，check-bounded-io 门禁） | UndoGate、EngineManager、LogCollector |
+| ProcIo.kt | 有界排水与waiter外独立kill/close workers；不可变partial/exit/drain/read/cleanup facts，local cleanup不证明特权后代结算 | RootAccess、ShizukuUserService、UndoGate、EngineManager、LogCollector |
 | ShellState.kt | ST 真源收敛：沉浸式/开发者日志两处「展示值 ≠ 事实」的统一读写面（仅偏好 ∧ 运行时合取） | MainActivity、WebUiChrome、AndroidBridge |
 | LiveProbe.kt | 轻量真源探测原语（TCP connect + TTL ≤ 页面轮询周期；时钟/探测体可注入单测） | 迁移保留，无当前调用者 |
 | ApkArtifactCheck.kt | 启动页 APK 自更新产物校验（缓存/新下载两路径共用同一严格度：存在/大小/sha256） | GuidePageRenderer、UpdateChecker |
@@ -87,11 +87,20 @@
 | 文件 | 职责一句话 | 被引用 |
 |---|---|---|
 | ShizukuTransport.kt | 应用侧 Shizuku UserService 生命周期（权限状态、bind/解绑、固定 argv 与经授权的 `sh -c` 执行） | VdisplayController、MainActivity、ShellOps |
-| ShizukuUserService.kt | shell/root 侧 UserService 实现（AIDL 提供 exec/execCapture 与分块文件传输；由应用侧网关控制调用） | ShizukuTransport |
+| ShizukuUserService.kt | shell/root 侧 v4 服务，确认完整 app UID/可信数据 anchor；有界执行、文件传输和共享 FD 属主修复 | ShizukuTransport |
+| RootGrant.kt / RootAccess.kt | 有效 AI 同意与 su 授权是独立门；最后可信派发点检查，固定维护例外不暴露任意 shell | ShizukuTransport、ShellOps、AndroidBridge |
+| OwnershipRepairCore.kt / OwnershipRepair.kt / RootRepairMain.kt | 共享有界遍历与 Android FD 适配；su 只加载已安装 APK 的固定 helper | RootAccess、ShizukuUserService |
+| RootExecutionFence.kt / RootMaintenanceLease.kt / RootOwnershipJobs.kt | Context感知公平零时限读栅栏/维护写栅栏；UID0派发前耐久lease；同boot UNKNOWN阻止新派发/维护/启动；共享job状态按当前lease诚实pending | RootAccess、ShizukuTransport、EngineStartFlow、EngineService、RootGrant |
 | VdisplayController.kt | VirtualDisplay 创建/销毁、Settings launch 探针、`input -d` 回退探针、viewer Surface attach/detach | MainActivity、VdisplayHost、DeviceControlService |
 | VdisplayHost.kt | 原生 viewer SurfaceView 宿主：把可信 Files stage 几何映射到根 FrameLayout 并 attach 到 controller | MainActivity |
 | VirtualDisplayProbe.kt | 建屏 flags 探针（本地位值常量，不引用 @hide 常量；金丝雀/无泄漏断言） | 调试验收（device probe） |
 | BackGate.kt | 返回网关决策器（页内层栈可用性 → 消费/退出）+ `BackGateBridge`（setAvailable/getBackAvailable 2 个 @JavascriptInterface） | MainActivity（OnBackPressedCallback 接线） |
+
+### 5.1 0.14.3 依赖与线程边界
+
+维护实现与限制的唯一详述见 [Root维护](<dsh-mobile-apk/docs/AGENTS/ROOT-MAINTENANCE.md>)：RootGrant策略不向固定helper暴露任意shell；RootMaintenanceLease先持久化再UID0派发；RootOwnershipJobs共享worker不归某Activity/Service caller所有。ProcIo/ShizukuCaptureIo的本地有界返回与远端确定完成是两件事，不完整capture不发布ready spool。
+
+浏览器UI私有复用官方MIT BrowserBody/Title/controller契约，官方Sidebar指南/标签框架通过注册消费，不拷Electron/Iframe后端。NativeBrowserSession把GUI occurrence绑定native tab，自定义菜单使用真实sidebar.right.tab.menu.item扩展点；HMR/unmount hide而非销毁AI页。BrowserHostProfile按Session隔离cookie/storage/worker，UI geometry focus不替代模型captured Session/tab。Windows UA字符串、JS platform与UA-CH均按目标identity选择；是否实际生效依赖provider能力并在回执如实标注，未设备验证。
 
 ## 6. assets/ 结构（app/src/main/assets/）
 

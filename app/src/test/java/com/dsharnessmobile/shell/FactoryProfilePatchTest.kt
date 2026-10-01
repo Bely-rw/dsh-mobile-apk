@@ -479,6 +479,10 @@ class FactoryProfilePatchTest {
    * 「disable 上游行 + 换 `agent-default-model-mobile` 新 id insert」两条顶层块，改为**同 id 就地
    * 覆盖 config**（一条顶层块）⇒ 顶层条目数少一条。旧写法使 session-controller 的
    * `agentDefaultModel` 供给依赖一条自定义 id 的条目，它 pending 即整个 session 面静默消失。
+   * 21 增回 22 是 0.14.3 追版 0.2.0-rc.2 的产品改动：上游 `bundle/web-app/cordis.patch.yml` 新增
+   * `desktop-product-telemetry` 与 `product-analytics` 两行（桌面产品遥测/分析，不是 Android 服务），
+   * 我方按 Android 面显式 disable 这两行——不禁则设备上会去连桌面遥测端点。两条都经
+   * `check-contract.mjs` §8 核对「上游确实存在该 id」后才允许写入，不存在空指向。
    */
   @Test
   fun realFactoryFileSelfMergeIsByteIdentical() {
@@ -493,7 +497,9 @@ class FactoryProfilePatchTest {
     assertTrue("零改动时不得有改动说明", result.changes.isEmpty())
 
     val blocks = FactoryProfilePatch.topLevelBlocks(text)
-    assertEquals("顶层条目数（工厂件结构改变时同步本断言）", 21, blocks.size)
+    // 23 = 22 个 `- ` 顶层条目 + 1 个「首个条目之前的注释头」块（parseBlocks 会把它们冲成独立块）。
+    // 历史锚点：0.14.2 时代 20 个条目 ⇒ 21 块，正是本断言当时的期望值。
+    assertEquals("顶层条目数（工厂件结构改变时同步本断言）", 23, blocks.size)
     val groups = blocks.map { FactoryProfilePatch.blockIds(it) }.filter { it.size > 1 }
     assertEquals("唯一多子条目组 = shell-termux + host-web-compat", 1, groups.size)
     assertEquals(listOf("shell-termux", "host-web-compat"), groups.single())
@@ -524,7 +530,7 @@ class FactoryProfilePatchTest {
 
     assertTrue("D10：缺失的组内兄弟必须被补回", result.text.contains("id: host-web-compat"))
     assertTrue("补回的是同一个组（shell-termux 仍是组首）", result.text.contains("id: shell-termux"))
-    assertEquals("顶层条目数不变（补进组内，不是追加成新块）", 21, FactoryProfilePatch.topLevelBlocks(result.text).size)
+    assertEquals("顶层条目数不变（补进组内，不是追加成新块）", 23, FactoryProfilePatch.topLevelBlocks(result.text).size)
     val group = FactoryProfilePatch.topLevelBlocks(result.text)
       .first { FactoryProfilePatch.blockIds(it).contains("shell-termux") }
     assertEquals(listOf("shell-termux", "host-web-compat"), FactoryProfilePatch.blockIds(group))

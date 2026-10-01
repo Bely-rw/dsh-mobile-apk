@@ -225,3 +225,9 @@
 # 逆转条件：出现 Android 上真能跑的引擎实现 ⇒ 同时删掉本行与那条豁免。
 - id: office-to-pdf
   disabled: true
+# Official 0.2.0-rc.2 desktop product telemetry/analytics are not Android services.
+# Retain the shared otel service and official ui-settings-session-log upload control.
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true

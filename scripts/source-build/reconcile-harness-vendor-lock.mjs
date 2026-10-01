@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Align only the five pinned vendor importers with their archived manifests.
+// Audit the declared target-source vendor importers; an unchanged lock is valid.
 // Keep every existing package resolution and integrity entry unchanged.
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -64,8 +64,19 @@ function main() {
   const originalPath = join(dirname(reportPath), 'harness-pnpm-lock.original.yaml')
   const overrideReport = JSON.parse(readFileSync(resolve(overrideReportArg), 'utf8'))
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot, encoding: 'utf8' }).trim()
-  if (overrideReport.harnessSourceCommit !== commit || overrideReport.overrides?.length !== 5) {
-    throw new Error('vendor override report does not match the pinned Harness checkout or package count')
+  if (commit !== '639ed015397290b3745d163aafe02ffee4aa3f84'
+    || overrideReport.harnessSourceCommit !== commit
+    || overrideReport.mode !== 'pinned-target-source-evidence'
+    || overrideReport.rewoundSourceCount !== 0
+    || !Array.isArray(overrideReport.overrides) || overrideReport.overrides.length === 0) {
+    throw new Error('vendor evidence does not match the official target source or reports a source rewind')
+  }
+  const auditedPaths = new Set()
+  for (const item of overrideReport.overrides) {
+    if (item.sourceCommit !== commit || !/^vendor\/[a-z][a-z0-9-]*$/.test(item.path) || auditedPaths.has(item.path)) {
+      throw new Error('vendor evidence contains a foreign source, unsafe path or duplicate importer')
+    }
+    auditedPaths.add(item.path)
   }
 
   const requireFromHarness = createRequire(join(sourceRoot, 'apps', 'cli', 'package.json'))
@@ -82,18 +93,22 @@ function main() {
     edits.push(...reconcileImporter(lock.importers?.[item.path], manifest, item.path, workspace.overrides ?? {})
       .map((edit) => ({ path: item.path, ...edit })))
   }
-  if (!edits.length) throw new Error('expected pinned vendor manifest specifier differences, found none')
-
-  const adjusted = Buffer.from(yaml.dump(lock, { lineWidth: -1, noRefs: true, quotingType: "'" }))
+  // Same-target source evidence normally requires no importer edits. Preserve even
+  // the original YAML bytes in that case rather than fabricating a reconciliation.
+  const adjusted = edits.length
+    ? Buffer.from(yaml.dump(lock, { lineWidth: -1, noRefs: true, quotingType: "'" }))
+    : original
   copyFileSync(lockPath, originalPath)
-  writeFileSync(lockPath, adjusted)
+  if (edits.length) writeFileSync(lockPath, adjusted)
   const report = {
     harnessSourceCommit: commit,
     originalLockfile: originalPath,
     originalLockfileSha256: sha256(original),
     adjustedLockfileSha256: sha256(adjusted),
+    auditedImporterCount: auditedPaths.size,
     importerEdits: edits,
-    reason: 'Pinned Cordis manifests predate the Harness lock importers. Importer specifiers follow the workspace link overrides; only those specifiers and obsolete importer entries change, with all locked package resolutions fixed.',
+    lockfileChanged: edits.length > 0,
+    reason: 'Vendor sources match the official target. Importer specifiers follow its manifests and workspace link overrides; zero edits is valid. Any reconciliation is metadata-only and preserves all existing package resolutions/integrities.',
   }
   writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
   console.log(`reconciled ${edits.length} pinned vendor lock importer entries without resolving packages`)

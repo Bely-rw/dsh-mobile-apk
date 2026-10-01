@@ -6,7 +6,7 @@
  *    同代 ref；原生侧还会再验一次 generation 与当前页代次。旧 ref / 跨页 ref 一律拒绝，不猜测点击。
  *  - **URL 准入门在原生 BrowserHost**（只允许非本地 http(s)/about:blank）；本层不复制准入逻辑，
  *    但会把拒绝原因原样透传给模型。
- *  - 单一工位（一个 BrowserHost，一个标签页）：多标签工具如实返回单标签事实，不假装支持。
+ *  - 会话/标签页隔离：快照记忆与控制参数保留所属会话及 tabId，不借用前台 UI 的当前页。
  *  - 每个动作写审计（经 bridge 服务的 audit 面；缺失时静默降级，审计不是主流程门禁）。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -29,12 +29,12 @@ interface SnapshotMemory {
   refs: Set<string>
 }
 
-/** 最近一次成功 snapshot 的 ref 集（单工位；动作工具据此附带 generation）。 */
-let lastSnapshot: SnapshotMemory | undefined
+/** 最近一次成功 snapshot 按会话隔离；同名 tab/ref 不可跨会话复用。 */
+const lastSnapshots = new Map<string, SnapshotMemory>()
 
 /** 清除浏览器记忆（open/navigate 换页、测试隔离）。 */
 export function resetBrowserMemory(): void {
-  lastSnapshot = undefined
+  lastSnapshots.clear()
 }
 
 /**
@@ -189,7 +189,7 @@ function renderTabLines(v: Record<string, unknown>): string {
 }
 
 export function browserTools(face: () => BrowserControlFace | undefined): unknown[] {
-  /** 会话键：控制 op 一律带归属会话，壳侧据此做单实例归属校验（0.14.0）。 */
+  /** 会话键：控制 op 一律保留捕获会话，壳侧据此选择独立的 Workspace/profile。 */
   const sessionScope = new AsyncLocalStorage<string>()
 
   const sessionOf = (exec: unknown): string | undefined => {
@@ -314,8 +314,8 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
     ...extra,
   })
 
-  const stateOf = async (): Promise<Payload> => {
-    const result = await call(BROWSER_OPS.state, {}, 6_000)
+  const stateOf = async (tabId?: string): Promise<Payload> => {
+    const result = await call(BROWSER_OPS.state, tabId === undefined ? {} : { tabId }, 6_000)
     return result.ok ? result.data : {}
   }
 
@@ -324,14 +324,16 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
     return typeof value === 'number' && Number.isFinite(value) ? value : 0
   }
 
-  const requireSnapshot = (): SnapshotMemory | undefined => lastSnapshot
+  const memoryKey = (): string => sessionScope.getStore() ?? '__anonymous__'
+  const resetSessionMemory = (): void => { lastSnapshots.delete(memoryKey()) }
+  const requireSnapshot = (): SnapshotMemory | undefined => lastSnapshots.get(memoryKey())
 
   const tools: unknown[] = [
     defineTool({
       name: BROWSER_TOOLS.open,
       description:
         '打开侧栏 AI 浏览器并导航到一个 http(s) 地址（本地回环/file/content/data/javascript 一律拒绝）。'
-        + '可选先应用视口档（viewport）与身份档（identity）。返回页面代次，后续 snapshot/click 以它为准。',
+        + '可选原子应用目标页的视口档（viewport）与身份档（identity），不重载其它页。返回页面代次，后续 snapshot/click 以它为准。',
       parameters: {
         url: { type: 'string', required: true, description: '要打开的 http(s) 地址' },
         viewport: { type: 'string', description: '视口档 id（见 browser_set_viewport 的预设表）' },
@@ -361,7 +363,9 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
       execute: async ({ url, viewport, identity, tabId }: { url: string; viewport?: string; identity?: string; tabId?: string }, exec) => {
         const session = gate(exec)
         if (!session.ok) return { ok: false, error: 'browser-not-authorized', guidance: session.guidance } as never
-        audit(BROWSER_TOOLS.open, { url, viewport, identity }, true)
+        // Validate both options before one atomic open; pre-setters would mutate/reload the old tab.
+        let viewportConfig: Payload | undefined
+        let identityConfig: Payload | undefined
         let appliedViewport: string | undefined
         if (typeof viewport === 'string' && viewport !== '') {
           const preset = VIEWPORT_PRESETS.find((p) => p.id === viewport)
@@ -373,8 +377,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
               guidance: '可用视口：' + VIEWPORT_PRESETS.map((p) => p.id).join(', ') + '（device/follow-screen = 跟随工位）。',
             } as never
           }
-          const result = await call(BROWSER_OPS.viewport, { preset: viewport, route: 'S2', width: preset?.width ?? 0, height: preset?.height ?? 0 }, 8_000)
-          if (!result.ok) return denied(result) as never
+          viewportConfig = { preset: preset?.id ?? 'device', route: 'S2', width: preset?.width ?? 0, height: preset?.height ?? 0 }
           appliedViewport = viewport
         }
         let appliedIdentity: string | undefined
@@ -386,17 +389,22 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
               guidance: '可用身份：' + IDENTITY_PROFILES.map((p) => p.id).join(', ') + '。',
             } as never
           }
-          const result = await call(BROWSER_OPS.setUa, { profile: profile.id, ua: profile.ua, platform: profile.platform, mobile: profile.mobile }, 8_000)
-          if (!result.ok) return denied(result) as never
+          identityConfig = { profile: profile.id, ua: profile.ua, platform: profile.platform, mobile: profile.mobile }
           appliedIdentity = profile.id
         }
         // tabId = 任务标识：给了就用它（存在则复用、不存在则新建），不给就**开一个新页**。
         // 这是「AI 可以同时控制多网页」的入口语义：每次 browser_open 默认得到独立一页。
         const route = typeof tabId === 'string' && tabId !== '' ? { tabId } : { newTab: true }
-        const opened = await call(BROWSER_OPS.open, { url, ...route }, 20_000)
+        audit(BROWSER_TOOLS.open, { url, viewport, identity }, true)
+        const opened = await call(BROWSER_OPS.open, {
+          url, ...route,
+          ...(viewportConfig === undefined ? {} : { viewportConfig }),
+          ...(identityConfig === undefined ? {} : { identityConfig }),
+        }, 20_000)
         if (!opened.ok) return denied(opened) as never
-        resetBrowserMemory()
-        const state = await stateOf()
+        resetSessionMemory()
+        // The atomic open reply belongs to its captured target, not a subsequent active-tab poll.
+        const state = opened.data
         const openedTabId = typeof opened.data.tabId === 'string' ? opened.data.tabId : ''
         return {
           ok: true,
@@ -467,7 +475,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         for (const node of nodes) if (typeof node.ref === 'string') refs.add(node.ref)
         const tabId = typeof result.data.tabId === 'string' ? result.data.tabId : 'tab-1'
         const pageGeneration = pageGenerationOf(result.data)
-        lastSnapshot = { tabId, pageGeneration, refs }
+        lastSnapshots.set(memoryKey(), { tabId, pageGeneration, refs })
         return {
           ok: true,
           tabId,
@@ -507,9 +515,9 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
           return { ok: false, error: 'snapshot-required', guidance: '先调用 browser_snapshot 拿到 ref，再点击；不猜测坐标。' } as never
         }
         audit(BROWSER_TOOLS.click, { ref }, true)
-        const result = await call(BROWSER_OPS.input, { kind: 'tap', ref, pageGeneration: memory.pageGeneration }, 15_000)
+        const result = await call(BROWSER_OPS.input, { kind: 'tap', ref, tabId: memory.tabId, pageGeneration: memory.pageGeneration }, 15_000)
         if (!result.ok) return denied(result) as never
-        const state = await stateOf()
+        const state = await stateOf(memory.tabId)
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : '',
@@ -554,10 +562,10 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         }
         audit(BROWSER_TOOLS.type, { ref, length: text.length }, true)
         const result = await call(BROWSER_OPS.input, {
-          kind: 'text', ref, text, replace: replace !== false, pageGeneration: memory.pageGeneration,
+          kind: 'text', ref, text, replace: replace !== false, tabId: memory.tabId, pageGeneration: memory.pageGeneration,
         }, 15_000)
         if (!result.ok) return denied(result) as never
-        const afterType = await stateOf()
+        const afterType = await stateOf(memory.tabId)
         return {
           ok: true,
           url: typeof result.data.url === 'string' ? result.data.url : '',
@@ -589,9 +597,13 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         const session = gate(exec)
         if (!session.ok) return { ok: false, error: 'session-not-full-access', guidance: session.guidance } as never
         audit(BROWSER_TOOLS.press, { key }, true)
-        const result = await call(BROWSER_OPS.input, { kind: 'key', key }, 10_000)
+        const memory = requireSnapshot()
+        const result = await call(BROWSER_OPS.input, {
+          kind: 'key', key,
+          ...(memory === undefined ? {} : { tabId: memory.tabId, pageGeneration: memory.pageGeneration }),
+        }, 10_000)
         if (!result.ok) return denied(result) as never
-        const state = await stateOf()
+        const state = await stateOf(typeof result.data.tabId === 'string' ? result.data.tabId : undefined)
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : '',
@@ -747,8 +759,8 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         audit(BROWSER_TOOLS.navigate, { url }, true)
         const result = await call(BROWSER_OPS.open, { url }, 20_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
-        const state = await stateOf()
+        resetSessionMemory()
+        const state = result.data
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : url,
@@ -782,9 +794,9 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         if (!session.ok) return { ok: false, error: 'session-not-full-access', guidance: session.guidance } as never
         const result = await call(BROWSER_OPS.js, { expr: 'history.back();JSON.stringify({ok:true})' }, 10_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         await new Promise((resolve) => setTimeout(resolve, 400))
-        const state = await stateOf()
+        const state = await stateOf(typeof result.data.tabId === 'string' ? result.data.tabId : undefined)
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : '',
@@ -816,9 +828,9 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         if (!session.ok) return { ok: false, error: 'session-not-full-access', guidance: session.guidance } as never
         const result = await call(BROWSER_OPS.js, { expr: 'history.forward();JSON.stringify({ok:true})' }, 10_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         await new Promise((resolve) => setTimeout(resolve, 400))
-        const state = await stateOf()
+        const state = await stateOf(typeof result.data.tabId === 'string' ? result.data.tabId : undefined)
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : '',
@@ -850,8 +862,8 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         if (!session.ok) return { ok: false, error: 'session-not-full-access', guidance: session.guidance } as never
         const result = await call(BROWSER_OPS.js, { expr: 'location.reload();JSON.stringify({ok:true})' }, 10_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
-        const state = await stateOf()
+        resetSessionMemory()
+        const state = await stateOf(typeof result.data.tabId === 'string' ? result.data.tabId : undefined)
         return {
           ok: true,
           url: typeof state.url === 'string' ? state.url : '',
@@ -916,7 +928,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         if (!session.ok) return { ok: false, error: 'browser-not-authorized', guidance: session.guidance } as never
         const result = await call(BROWSER_OPS.followTab, { tabId }, 8_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         return {
           ok: true,
           activeTabId: typeof result.data.activeTabId === 'string' ? result.data.activeTabId : tabId,
@@ -945,7 +957,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
         if (!session.ok) return { ok: false, error: 'browser-not-authorized', guidance: session.guidance } as never
         const result = await call(BROWSER_OPS.closeTab, tabId === undefined ? {} : { tabId }, 8_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         return {
           ok: true,
           closedTabId: typeof result.data.closedTabId === 'string' ? result.data.closedTabId : '',
@@ -980,7 +992,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
           profile: selected.id, ua: selected.ua, platform: selected.platform, mobile: selected.mobile,
         }, 10_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         return {
           ok: true,
           profile: selected.id,
@@ -1018,7 +1030,7 @@ export function browserTools(face: () => BrowserControlFace | undefined): unknow
           preset: selected.id, route: 'S2', width: selected.width, height: selected.height,
         }, 10_000)
         if (!result.ok) return denied(result) as never
-        resetBrowserMemory()
+        resetSessionMemory()
         return {
           ok: true,
           preset: selected.id,

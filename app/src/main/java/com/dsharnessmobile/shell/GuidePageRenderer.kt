@@ -428,6 +428,34 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       if (copied) activity.getString(R.string.ds_safe_entered)
       else activity.getString(R.string.ds_safe_prompt_copy_failed),
     )
+    // issue #309：错误页的显式动作**同时**是闸门 A 的手动出口。
+    //
+    // 为什么必须是这个按钮：本仓的错误页只有它一个主按钮（Error 相位下它就是「安全模式启动」），
+    // 而 issue 现场用户能自救的唯一途径是壳侧终端手工补库——那等于没有出路。自动路径刻意克制
+    // （只有确诊项缺失才花掉那次重抽取），所以低置信度条目命中时必须留一个**用户显式**的出口。
+    //
+    // 为什么限定在「上一次拒启就是 live 树残缺」：`lastStartRefusalCode` 非空即表示本进程刚被
+    // 闸门 A 挡下（错误页正是在同一次启动尝试后出现的）；否则无差别地花掉一次 8-12 分钟全量
+    // 重抽取，对「插件装配失败」一类完全可以回滚的问题就是纯损失。
+    //
+    // 预算没有被这里放行：真要修不好（安装包本身缺件 / 存储坏块），一次之后仍会停在可读错误页。
+    //
+    // 如实声明（独立评审 C1/C2）：这一次点击**可能什么都不做**——本次运行已花过预算时它是
+    // 静默空操作（日志会写 budget already spent）。另外它不是「强制启动」：只放行证据分级去删
+    // 指纹，spawn 仍归闸门 A 把关，重抽取完成前带病的树照样起不来（安全属性，非缺陷）。
+    if (engine.lastStartRefusalCode == EngineManager.REFUSAL_LIVE_RUNTIME_INCOMPLETE) {
+      // **必须离开 UI 线程**（独立评审 C6）：恢复动作里含诊断镜像（拷贝六代 engine.log，
+      // 单代有界 2MB）与一次有界 logcat 抽取，**可能阻塞到 10s 级**。本方法运行在
+      // `runOnUiThread` 上，原地调用就是一条真实的 ANR 路径。自动路径本来就跑在启动流的
+      // worker 线程上，这里对齐同一执行上下文；世代校验由 lambda 负责，换代即停手。
+      Thread {
+        maybeRecoverFromIncompleteLiveRuntime(
+          activity,
+          confirmedMissing = engine.lastStartRefusalConfirmed,
+          userForced = true,
+        ) { !activity.isDestroyed && !activity.isFinishing }
+      }.start()
+    }
     // 回执看一小会儿，然后真的以 safe 状态重启（见方法注释：为什么留延时、为什么用 View 的 postDelayed）。
     chrome.root.postDelayed({
       if (activity.isDestroyed || activity.isFinishing || lastGuidePhase != GuidePhase.Error ||

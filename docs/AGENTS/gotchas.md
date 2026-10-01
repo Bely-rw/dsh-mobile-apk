@@ -1284,3 +1284,50 @@
     **真因**：Shizuku 的 UserService 进程**由 Shizuku 管理器持有、跨应用重启存活**；`UserServiceArgs.version(...)` 取自 `BuildConfig.VERSION_CODE`，**versionCode 不变时 Shizuku 不会重建服务** ⇒ 跑的还是旧版 dex，v3 的 transaction 根本不存在。
     **修法**：①加 AIDL 面就**同时 bump versionCode**（让 Shizuku 自动重建）；②已有的出口是设置页「重置链接」（`unbindUserService(remove=true)` 强制移除后重建）；③代码侧一律 `runCatching` + 结构化 `*-unsupported` 回报，**不假装成功**。
     **复验**：vc 44→45 重装后 `configure` 生效、`repairOwnership` 返回真实计数。
+
+229. **原 root 策略只认 su 授权/旧开关，且派发后异常回退会重复命令（0.14.3 源码修订）**：
+    **真因**：应用获得 root 与授权 AI 使用 root 是两件事；原始 granted bit 在升级后仍可能为真，当前版本 consent 已失效。将所有 shizuku/root/shell 错误归为可回退又混淆派发前不可用与派发后结果不明。
+    **修法**：最后执行点使用有效 RootGrant；新 consent 不复活旧开关；root Shizuku/su 为替代通道。ShellOps 仅精确派发前不可用白名单回退一次，不重跑 root-policy refusal、非零 exit、超时或 Binder 结果不明。v4 configure 加完整 UID/anchor 回读确认，绑定 version 同时编码 protocol，旧服务拒绝派发。
+    **证据**：源码与 pure decision/dispatch-count 需求已补；当前维护者新 head 的构建与外部三层验收仍待收口，不沿用作者旧 head。
+
+230. **path 型 chown 与事后 cap 不能界定维护副作用，顶层抽查漏深层启动污染（0.14.3 源码修订）**：
+    **真因**：canonical/lstat 与后续路径变更之间存在替换窗口；find 先执行再数结果不能限制已发生变更；uid 归一不证明 SELinux 标签正确。
+    **修法**：固定签名 APK helper 与共享 held-FD Android adapter；O_PATH/O_NOFOLLOW pin、访问前预算、深度/deadline、fstat/fchown/fstat 对照、hardlink/foreign/device/special-node 拒绝。protected_hardlinks 不明拒绝，root-origin 可被其它主体写入的 regular 拒绝。维护与本应用受控特权执行用读写栅栏，结果含失败/截断/未验证计数；明确不做 SELinux relabel，不能锁住外部特权 namespace。
+    **证据**：fake walker/参数解析夹具已写但未运行；描述符策略与非原子 root 竞态限制见 ROOT-MAINTENANCE.md，待外部验证。
+
+231. **维护放在事务恢复之后/主线程等待，既来不及自愈又可能冻结 UI（0.14.3 源码修订）**：
+    **真因**：污染的 marker/stage 可能在 fresh 判定前的恢复期已被读取；同步修复回包把提交任务误报成完成。Service onStartCommand 不适合等待 root/Binder。
+    **修法**：Activity/Service 的后台 startup worker 在事务恢复前进入共享 single flight，近同时启动复用5s内结算；caller 最多30s，未知结果仍保持 worker/fence，不重放。UI 请求立即返回，既有 root 状态轮询结算；仅完整计数/flags/remaining 合法才显示完成，部分/未知明确提示。
+    **证据**：源码与异步 UI fixtures 已补、尚未执行；外部需验证 Binder 卡住、前后台/关闭、并发栅栏和三层实际体验。
+
+232. **su/Binder本地超时或杀客户端不是特权后代结算，应用重启也不能清UNKNOWN（0.14.3源码修订）**：
+    **真因**：root helper/远端RPC可能已写盘，destroyForcibly、pipe close、reader join只描述本地进程/管道；同boot进程重建丢内存标志会重新派发并与旧helper并行。裸读tryLock还可插队公平写者。
+    **修法**：UID0真正派发前RootMaintenanceLease同步commit；Context栅栏锁前/锁内读lease，公平零毫秒timed读锁；helper只有完整JSON+确定exit0/2可finish，已确认部分信封仍ok=false。exit/drain/read/cleanup/Binder未知持续隔离新派发、维护、startup；同boot app restart/recreate不清，只有同boot-id/boot-count方案的真boot变化清。无手工清除。
+    **证据**：当前源码与RPC wiring fixture在场，未执行；真实boot/late ack/commit失败与副作用反证见 [外部测试需求](<docs/0.14.3-TEST-REQUIREMENTS.md>)。不沿用旧head或声称已测安全。
+
+233. **cleanup也能阻塞waiter；不完整capture不可当ready文件（0.14.3源码修订）**：
+    **真因**：直接destroy/close可能永久等待，晚到drainer继续写让“已返回partial”变化；发布仍被writer占用的spool会把半文件交后续pull。
+    **修法**：ProcIo每个kill/stream-close独立daemon、同一cleanup预算join，短内存锁仅copy immutable partial；ShizukuCaptureIo private .part只在writer/flush/close已终止且全flags完整后rename，失败spoolReady=false/路径空。transfer每chunk在RPC紧前重读实际UID/有效consent，offset仅acknowledged-bytes，unknown不重放。
+    **证据**：ProcIoSettlementFixtureTest/ShizukuCaptureSettlementFixtureTest/ShizukuRpcLeaseWiringFixtureTest已写未跑；要补真实后代持管道与部分写入，不把daemon线程或本地kill当远端证明。
+
+234. **陈旧startup finally/Service teardown会抢新flow与wake锁；后台renderer重载可循环（0.14.3源码修订）**：
+    **真因**：running/generation分离、等待后不复核、全局wake句柄让旧caller取消新owner；后台冻结不是前台无响应，destroyed WebView不可能靠reload重生。
+    **修法**：StartupFlowOwnership单份CAS token/generation；ServiceEpoch每次等待后复查并按owner获取/释放wake锁；销毁只中断caller不杀共享root worker，pending六次[2,4,8,16,30,30]秒后停步。ForegroundPageRecoveryPolicy后台合并、前台一次quiet retry/recreate，holder新Activity重绑，重复崩溃停native error、保留userClosed/userShutdown。
+    **证据**：StartupLifecycleOwnershipTest与Foreground政策/接线fixtures在场未运行；需外验晚到副作用、关闭后不复活、后台真实任务不被中断。
+
+235. **迁移后的settings缺席不等于缺用户配置；factory reseed与旧导出路径会抹provider（0.14.3，#304/#305）**：
+    **真因**：官方import将legacy YAML改名.imported，活配置在web profile patch；旧升级把缺YAML补空factory seed，旧桥还导出这个假真源。缺/非法内嵌SHA旧legacy fallback又可能把错误包当fresh。
+    **修法**：stage保留import marker并抑factory seed；SnapshotUserData选活patch、同格式原子导入/备份、导出共享key警告，只隔离已知旧blank模板。MainActivity接EngineManager，legacy ConfigTransfer不挂；SnapshotFingerprintPolicy严格64hex拒缺/坏metadata，无legacy/degraded旁路。
+    **证据**：SnapshotMigrationPolicyTest/SnapshotFingerprintPolicyTest在场未跑；双ABI包与连续升级/rollback假配置外验待交接，不填造产物hash。
+
+236. **浏览器无bridge不代表storage隔离；UI focus不是模型Session/tab（0.14.3源码修订）**：
+    **真因**：cookie不按端口隔离，Default共享jar让换loopback端口也可携主cookie；currentWorkspace/activeTab异步漂移会把工具写到邻会话。raw npm pi overlay也会丢官方pnpm补丁，PTC只改host环境仍让child失败。
+    **修法**：BrowserHostProfile在load/settings前验证per-session nonDefault并自有worker策略，不支持即拒不回Default；控制捕获Session/tab/modelTab与UI舞台分开，refs/identity/viewport/error均per-tab；官方MIT UI私有复用、真实tab-menu扩展。PTC A1 host/child双文件与pi streaming020六provider exact SHA/context及副本同步入runner；普通snapshot post-apply已统一runner --check复核全部companion/exact verifier，不再只搜主target marker。
+    **证据**：源码/fixtures/patch登记在场，未构建/未执行；HTTP/loopback storage隔离、UA/UA-CH、模型跨会话、PTC授权不downgrade待外验。旧资产尺寸/hash不当新测量。
+
+237. **闸门A拒启与闸门B自愈互锁：只有能spawn才会写engine.log，而拒启恰恰不spawn（0.14.3，#309）**：
+    **真因**：`liveRuntimeComplete()`在spawn前拒启（且先于force/可用性判定⇒看门狗force也绕不过），而自愈判据`snapshotLinkFailure`读的是**当拍engine.log尾部**——不spawn就永不产生该文件⇒自愈条件恒为假。全仓`refreshSnapshot`调用点只有冷启动一处，拒启路径为零；UI「重试」只`clearRefreshLedger`不删指纹，指纹新鲜时是no-op。于是「live树缺一条条目」这种可自愈状态把用户永久挡在错误页（issue实测36次/47分钟零恢复）。
+    **修法**：拒启时先**取证**（缺失项+确诊分级+每项size/mtime，写进boot-fail与诊断包）再**删指纹**，借既有的`if (!snapshotFresh()) refreshSnapshot(...)`冷启动分支走完整重抽取——不新增调用点。触发条件是**双闸门**：预算复用`runtimeTreeHealedThisRun`（每次运行一次，避免重抽取→再失败→再重抽取），且缺失项里至少有一条是「快照自身条目」（`START_RECOVERY_CONFIRMED_ENTRIES`）。
+    **为什么`REQUIRED_LIBS`成员刻意不触发自动恢复**：issue原文明确告诫「不要贸然补全该表」——该表只列`usr/bin/node`的8条`DT_NEEDED`，**不含传递依赖**，因此它的命中可能是假阴性（真缺的可能是`libicudata.so.78`那类传递依赖）。自动放宽的代价是每次启动白付一次8-12分钟全量抽取并抹掉现场，比不修更坏；故低置信度条目只记录，用户可在错误页主按钮**显式**重做一次（放行分级、不放行预算）。
+    **证据**：`Issue309StartRecoveryTest`13例本轮exit 0（含反证：只有低置信度条目时必须拒绝；注入两处变异后实测2 failed已还原）。真机/模拟器删件冷启动与「只删一个库符号链接」两条外验未做。不改闸门A判据本身，带病的树仍不被spawn。
+

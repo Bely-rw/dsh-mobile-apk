@@ -1,71 +1,51 @@
 # DEPENDENCIES.md — 引用库权威登记
 
-> 职责：APK 构建期依赖（gradle 7 项）、平台内置库、探活反射项与内嵌引擎边界的登记与升级策略。版本号 2026-09-14 抄自 `app/build.gradle.kts`（依赖声明 :111-120）与根 `build.gradle.kts`；工具链实测：AGP 8.8.2 / Kotlin 2.0.21 / Gradle 8.11.1 / Java 17（compileOptions/target 17）。
+> 源码登记：0.14.3 / versionCode 45，未构建本轮APK。声明版本不证明产物版本、ABI、大小/hash或测试通过。依赖以 [APK Gradle声明](<dsh-mobile-apk/app/build.gradle.kts#L127-L150>) 和 [引擎overlay](<dsh-mobile-apk/scripts/snapshot-config/engine-overlay.json>) 为准；不维护会漂移的文件/导入计数。
 
-## 1. 工具链（根 build.gradle.kts + gradle-wrapper.properties）
+## 1. 工具链与构建声明
 
-| 项 | 值 | 备注 |
+| 项 | 源码值 / 约束 |
+|---|---|
+| AGP / Kotlin / Gradle / Java | 8.8.2 / 2.0.21 / 8.11.1 / 17；发布与开发使用项目wrapper，不用系统gradle替代。 |
+| compileSdk / targetSdk / minSdk | 36 / 34 / 26；任何新增API保持minSdk守卫。 |
+| versionCode / versionName | 45 / 0.14.3；suffix来自Gradle属性；这是当前声明，不是已生成的APK。 |
+| Termux基线 | BuildConfig.TERMUX_VERSION=0.118.3。 |
+| 签名 | repoDebug固定keystore，来源链与正常链使用同一证书；终包签名指纹由真实构建后补，不虚构。 |
+| lint | checkReleaseBuilds=false / abortOnError=false，不等于功能或安全门禁通过。 |
+
+## 2. Gradle依赖
+
+| 依赖 | 版本 | 当前用途 / 升级联动 |
 |---|---|---|
-| Android Gradle Plugin | 8.8.2 | 根 build.gradle.kts |
-| Kotlin Android 插件 | 2.0.21 | 根 build.gradle.kts（jvmTarget 17） |
-| Gradle | 8.11.1 | gradle-wrapper.properties distributionUrl（发布链必须用本仓 wrapper，勿用系统 gradle） |
-| compileSdk / targetSdk / minSdk | 36 / 34 / 26 | 理由见 docs/AGENTS/ANDROID-API-USAGE.md §5 |
-| versionCode / versionName | 38 / 0.14.0-preview | app/build.gradle.kts:25-30（快照构建可加 -PversionNameSuffix） |
-| 签名 | repoDebug（keystore/debug.keystore，CI 与本地字节兼容）；来源审计链同样走这一把并在产出侧断言指纹 | build.gradle.kts 签名块注释：跨机同签名是覆盖安装前提；坑 202 |
-| lint | checkReleaseBuilds=false / abortOnError=false | 离线环境无 lint 缓存，不在发布关键路径 |
+| dev.rikka.shizuku:api/provider | 13.1.5 | 强类型UserService/API与bootstrap；ShizukuTransport/ShizukuUserService/VdisplayController。源码POM登记口径为MIT，不沿用旧文的Apache-2.0误记；aar notices仍须按实际分发核实。 |
+| androidx.activity:activity-ktx | 1.10.1 | ComponentActivity、ActivityResult；同文件legacy ConfigTransfer未挂载，但DirectoryPickerController的SAF注册仍被MainActivity使用。 |
+| androidx.webkit:webkit | 1.12.1 | BrowserHost document-start/UA-CH；0.14.3 BrowserHostProfile需要MULTI_PROFILE、set/getProfile、profile cookie/webStorage/geolocation/serviceWorker API。必须运行时feature gate并在load/settings前验证nonDefault，不能fallback Default。 |
+| androidx.core:core-ktx | 1.15.0 | FileProvider、NotificationCompat、insets与WindowCompat等。 |
+| androidx.dynamicanimation:dynamicanimation | 1.1.0 | 声明保留；贴边spring已退役，不能当现行悬浮球行为。 |
+| org.apache.commons:commons-compress | 1.28.0 | 快照tar/xz流式解压、symlink/权限/xattr路径；noCompress xz保留原字节流。 |
+| org.tukaani:xz | 1.10 | commons-compress的XZ算法后端。 |
+| junit:junit | 4.13.2（testImplementation） | JVM策略/core/源码接线及process/capture settlement fixtures。 |
+| org.json:json | 20240303（testImplementation） | JVM真实JSONObject/JSONArray，Android平台运行用系统实现。 |
+| androidx.test.ext:junit / runner | 1.2.1 / 1.6.2（androidTestImplementation） | VirtualDisplay instrumentation探针，不进产品工具面。 |
 
-## 2. gradle 依赖（app/build.gradle.kts:111-120，共 7 项，全部 implementation）
+新core/lease/issue政策类未添加Gradle生产依赖；同文件ShizukuCaptureIo与EpochResourceOwner也复用java/Android基础能力。Profile.dispose只停自己的worker并flush自己的cookie；limited clear不承诺清空IndexedDB/CacheStorage/worker registration，不能调用全局singleton实现隔离。
 
-| 依赖 | 版本 | 用途（代码锚点） | 换掉的成本 |
-|---|---|---|---|
-| dev.rikka.shizuku:api | 13.1.5 | Shizuku 特权 transport：`ShizukuTransport` 直连 API（权限状态/UserService bind/绑定回调） | 回退反射会失去 UserService 强类型通道；Shizuku 是 0.14 U-4 拍板的正式特权 transport |
-| dev.rikka.shizuku:provider | 13.1.5 | manifest `rikka.shizuku.ShizukuProvider`（binder bootstrap，`INTERACT_ACROSS_USERS_FULL` 保护，门禁白名单放行） | 自写 provider 需对齐 Shizuku binder 协议；随 api 同步升级 |
-| androidx.activity:activity-ktx | 1.10.1 | ComponentActivity 基类（MainActivity/ConsoleActivity）；ActivityResultContracts 目录/权限等契约（ConfigTransfer、MainActivity） | 自写 ActivityResult 分发与回调生命周期；选择器「字段初始化即注册」时序约束要重推 |
-| androidx.core:core-ktx | 1.15.0 | FileProvider（PathOpen 外部打开）；ViewCompat/WindowInsetsCompat/WindowCompat（insets 三件套、ShellState 沉浸式） | FileProvider 可自实现 ContentProvider 但需自管 URI 授权与安全边界；insets 兼容层要回退平台 API 并全档自测 |
-| androidx.dynamicanimation:dynamicanimation | 1.1.0 | **壳侧已无使用方**（0.14.1 块I 删除 OverlayService 的 springSnapToEdge/cancelSpring/springAnim 与贴边吸附，详见坑 147 邻域与 docs/0.14.1-preview-HALO-FREE-MOVE-AND-RING.md §4.1）——依赖声明**按详档判定保留**，供将来动效复用 | 手写 spring 微分方程或降级 ValueAnimator；保留声明的原因：删依赖会牵动 gradle/lock 面与用途表，收益为零 |
-| org.apache.commons:commons-compress | 1.28.0 | 快照 xz tar 流式解压（TarArchiveInputStream/XZCompressorInputStream，SnapshotExtractor）——快照逐文件解压 + owner-only 权限 + exec xattr 全走它 | 自实现 xz+tar 成本极高；换库需重验数万文件流式解压与 symlink 保留 |
-| org.tukaani:xz | 1.10 | xz 解码算法后端（commons-compress 依赖它做 XZ） | 与 commons-compress 绑定，单独换无意义 |
+## 3. 平台内置与探活
 
-### 2.1 使用面实测（grep import 计数，2026-09-14）
+org.json、ProcessBuilder、HttpURLConnection、java.nio.file、java.util.concurrent是平台/标准库；Root维护使用android.system.Os的held-FD/no-follow操作，不引重复JNI依赖。ProcIo独立cleanup workers不阻塞waiter，返回不可变partial；耐久lease用Context私有SharedPreferences commit与boot-id/BOOT_COUNT，未知epoch拒绝。手写MuxClient WebSocket握手/帧协议依赖Socket、SHA-1、Base64，不因浏览器迁移另引网络库。
 
-| 依赖 | 使用文件数 | 明细 |
-|---|---|---|
-| activity-ktx | 4 | MainActivity、ConsoleActivity、GuideChrome（ComponentActivity 引用）、ConfigTransfer（契约） |
-| core-ktx | 7 | MainActivity、ConsoleActivity、WebUiChrome、EngineService、NotifyCenter（NotificationCompat）、FileIncoming、ShellState |
-| dynamicanimation | 0 | 0.14.1 块I 起壳侧零使用方（原 OverlayService 的贴边吸附已删；声明保留，用途变化已登记） |
-| commons-compress | 2 | SnapshotExtractor（解压主路径）、EngineManager（快照刷新复用同一套 tar/xz 流） |
-| xz | 0（间接） | 经 commons-compress 的 XZCompressorInputStream 间接使用 |
-| shizuku api/provider | 2 | ShizukuTransport（api 直连）、ShizukuUserService（AIDL/Stub 基类） |
+ShizukuSupport/ShizukuProbe仍反射探活，授权只能由用户在Shizuku中授予；原生应用su授权与AI root consent是独立门。多用户采用完整UID。UserService协议v4与应用版本绑定，升级/存活服务需要确认configuration，旧服务不能冒充已配置。
 
-### 2.2 相关构建配置（build.gradle.kts 实测）
+## 4. 引擎、npm与许可的第二依赖面
 
-- `buildConfigField TERMUX_VERSION = "0.118.3"`（:31）：快照内 Termux 基线版本号，用于运行时一致性展示/诊断。
-- `androidResources.noCompress += "xz"`（:46，注释：snapshot.tar.xz 已 xz 压缩，AAPT 二次压缩破坏流式读取）——commons-compress 依赖拿到原始字节流的前提。
-- mergeDebugAssets/mergeReleaseAssets doFirst 校验：assets/snapshot.tar.xz 缺失即抛 GradleException 并给出下载指引（快照大文件不入库）。
+当前源码适配目标为官方 dsh-v0.2.0-rc.2 / commit 639ed015397290b3745d163aafe02ffee4aa3f84（预发布，不称stable）。overlay root/第一方包0.2.0-rc.2、pi-ai0.87.1、Cordis4.0.4及官方Lexical0.49.0家族是源码输入；APK内实际版本待终包核实。自包含来源链和协调仓共同管理快照npm/Termux闭包，不是“APK仓不管理”。旧Cordis回退源码逻辑不能继续套在新目标上。
 
-## 3. 平台内置（无 gradle 依赖，勿加重复坐标）
+raw npm overlay不会自动保留官方pnpm patch。六provider pi-upstream-streaming-020需固定官方patch SHA并精确上下文；Android PTC A1需host/child双目标和副本同步。具体补丁、目标与构建钩子状态见 [运行时补丁台账](<dsh-mobile-apk/docs/AGENTS/RUNTIME-PATCHES.md>)。
 
-- **org.json**（JSONObject/JSONArray/NULL 语义）：Android 平台内置，多文件使用——AndroidBridge、AdbState、EngineProbe、FileIncoming、OverlayLiveFeed、OverlayPanel、UpdateManager、OverlayService、WatchdogV2、BrowserHost、Notify*、Vdisplay* 等。注意桥返回 JSON 以真机内置实现为准（NULL 处理曾有 `optString` 对 NULL 返 "null" 字面量的坑，悬浮球会话标题已判空）。
-- **手写 WebSocket**（MuxClient.kt）：java.net.Socket + Base64 + MessageDigest(SHA-1) + SecureRandom 完成 RFC6455 握手/帧解析/掩码——不引 OkHttp 等网络库（换掉的成本 = 新增 3-4MB 依赖面 + 回环信任围栏行为重验，且 downlink-only 语义要重验）。
-- **其他 java.* 面**：HttpURLConnection（DownloadSaver/EngineProbe/OverlayService.postRpc/OverlayPanel.postRespond/UpdateManager/ControlPoller）、ProcessBuilder（EngineManager/ConsoleSession/AdbState/ShizukuUserService spawn）、java.nio.file.Files（EngineManager）——均标准库，零依赖。
+官方浏览器UI仅私有MIT复用BrowserBody/Title/controller契约，保留SOURCE清单/LICENSE，不导入官方feature插件运行时公开API或Electron/Iframe实现；Sidebar指南与tab框架通过注册消费。组件源码/manifest的目标依赖不等于lib已重建或镜像已完成。GPL/第三方notice按快照dpkg与aar/npm各自范围核实，dpkg门禁不覆盖aar；未见最终0.14.3license artifact前不称合规已通过。
 
-## 4. Shizuku 依赖面（0.14.0 由反射转正式依赖，历史决策见 git）
+## 5. 升级回归与证据
 
-- **直连（新）**：`ShizukuTransport`/`ShizukuUserService`/`VdisplayController` 使用 `dev.rikka.shizuku:api/provider 13.1.5` 的类型（`Shizuku.UserServiceArgs`、`Stub.asInterface` 等），承载虚拟屏特权 transport。
-- **反射（保留）**：`ShizukuSupport`（引导页状态行）与 `ShizukuProbe`（五态探针，fail-closed）仍走 `Class.forName` 反射——探针在 aar 未接入/类被 shrink 时也能安全降级。
-- **授权纪律**：Shizuku 授权只能由用户在 Shizuku App 内授予；壳侧只做标准请求与状态读，不把授权请求当作授予（`ShizukuTransport` 文件头注释）。
-- **合规现状（缺口）**：Shizuku 为 Apache-2.0 的 gradle aar 依赖；`check-third-party.mjs` 只覆盖快照 dpkg 矩阵，**不覆盖 gradle aar**，`assets/licenses/THIRD_PARTY_NOTICES.md` 也未含 Shizuku 条目——补登记事项见 `known-gaps.md`（0.14.0 收尾）。
+版本变更需同步来源pin、lock根声明、同源补丁/资产、双仓副本及许可来源。运行时资产从目标版本原始产物完整重建，不叠旧资产；逐字节一致与全部补丁marker/精确verifier都要成立。webKit升级重点验证profile首次赋值、worker/cookie/storage隔离、不支持provider失败、UA-CH与Activity重建holder；Shizuku重点验证旧AIDL服务、工作资料UID、chunk撤consent与耐久UNKNOWN。快照/SAF/Files/通知/控制台/引擎流式任务按 [外部测试需求](<docs/0.14.3-TEST-REQUIREMENTS.md>) 执行。
 
-## 5. 内嵌引擎与快照依赖（不进 gradle 的第二依赖面）
-
-- 引擎：`@deepseek-ai/dsh` 0.1.5-rc.1，快照内 `usr/lib/node_modules/@deepseek-ai/dsh`（EngineManager dshBin），web 模式监听 127.0.0.1:3080（--no-open）；APK 版本与引擎版本解耦，桥协议版本化（androidBridge.version）。
-- 快照内 npm 依赖树（@deepseek-ai/* 包、react/shiki 等 cordis 装配）与 Termux 包（node/git/android-tools 等）由协调仓 `scripts/build-snapshot-013.mjs` 构建注入，**不在本仓库管理**。
-- 许可合规边界：全部第三方清单与许可证全文随包分发在 `assets/licenses/`（THIRD_PARTY_NOTICES.md + GPL-2.0/GPL-3.0/LGPL-2.1/LGPL-3.0 四全文）；清单由协调仓 `scripts/check-third-party.mjs` 从快照 dpkg 清单生成（GPL 义务硬门禁）。本文件只登记构建期依赖；快照内依赖以该文件为权威。
-
-## 6. 升级策略建议
-
-1. **低频原则**：依赖面服务于「稳定壳 + 云端自包含构建」，无功能需求不主动升级；AGP/Kotlin 升级必须连带验证 `.github/workflows/build-apk.yml` 与本地 `gradlew assembleDebug` 双链一致。
-2. **必测真机回归项**（任何依赖变更后）：快照全量解压（指纹翻转 + `.snapshot-fingerprint` 更新，勿中途杀进程）；引擎冷启动探活与市场安装（linker64 回退 + termux-exec preload 链）；悬浮球三窗口显示/无吸附拖动手感（dynamicanimation 已无使用方，见用途表）；SAF 目录选择与 All Files Access 分代（activity-ktx 契约敏感，26-29/30+/33+ 三档）；FileProvider 外部打开白名单（core-ktx）；Shizuku transport（api/provider 版本与 Shizuku App 侧协议兼容——升级前先在模拟器装对应 Shizuku 版本实测 bind）。
-3. **commons-compress/xz 锁定**：与快照 tar 产物格式强耦合，仅在快照构建链同步验证后升级；解压失败 = 用户首启白屏级事故。
-4. **新增依赖**：先过 GPL/许可合规（登记 scripts/third-party-licenses.json + THIRD_PARTY_NOTICES.md），再评估体积与 ABI 面——当前零 JNI/.so 依赖，保持该状态。
-
+当前source/doc工作不运行测试、typecheck、门禁或构建；父任务仍负责正常CI/review、#308合并、0.14.3完整同步与arm64/x86_64 tester APK。外部三层验收保持未执行，不冒充merge blocker，也不冒充发布批准。
