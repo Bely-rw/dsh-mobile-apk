@@ -98,7 +98,9 @@ function reconcileTarget(engineRoot, files, patch) {
   const canonicalFile = join(engineRoot, targetRel)
   const canonicalBytes = readFileSync(canonicalFile)
   if (!patch.verifier && (!marker || !canonicalBytes.toString('utf8').includes(marker))) {
-    throw new Error(`规范补丁目标缺 marker：${patch.id}（${marker}）`)
+    // 规范目标（targetRel 那份）是其余副本的**来源**，它自己缺 marker 就等于补丁根本没打上。
+    // 措辞保留旧实现的判据短语（补丁完全没打上）：这是同一事实，且 reconcile 的回归用例按它断言。
+    throw new Error(`补丁完全没打上（规范补丁目标缺 marker）：${patch.id}（${marker}）`)
   }
   const rows = copies.map((file) => ({
     file, path: relative(engineRoot, file).split(sep).join(posix.sep), size: statSync(file).size,
