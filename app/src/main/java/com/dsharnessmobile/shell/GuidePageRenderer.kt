@@ -439,6 +439,10 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     // 重抽取，对「插件装配失败」一类完全可以回滚的问题就是纯损失。
     //
     // 预算没有被这里放行：真要修不好（安装包本身缺件 / 存储坏块），一次之后仍会停在可读错误页。
+    //
+    // 如实声明（独立评审 C1/C2）：这一次点击**可能什么都不做**——本次运行已花过预算时它是
+    // 静默空操作（日志会写 budget already spent）。另外它不是「强制启动」：只放行证据分级去删
+    // 指纹，spawn 仍归闸门 A 把关，重抽取完成前带病的树照样起不来（安全属性，非缺陷）。
     if (engine.lastStartRefusalCode == EngineManager.REFUSAL_LIVE_RUNTIME_INCOMPLETE) {
       maybeRecoverFromIncompleteLiveRuntime(
         activity,

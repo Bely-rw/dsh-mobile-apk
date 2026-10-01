@@ -1167,6 +1167,13 @@ class EngineManager(private val context: Context, private val pickToken: String?
   /** Starts the embedded engine. [force] is reserved for a confirmed hung boot
    * after its full cold-start deadline; routine probes must never force-restart. */
   fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {
+    // 独立评审 6(a)：每次进入先**清掉上一次的拒启结论**，让「有码」严格等价于「本次就是被
+    // 闸门 A 拒的」。旧实现只在**通过**闸门 A 时清码，于是闸门 A 之前的那几条 return false
+    // （打包指纹不可用 / termux-exec 预载库缺失）会把**上一次**的 live-runtime 码与确诊项留下
+    // 来 ⇒ 调用方（错误页主按钮）会拿陈旧码去花掉那次重抽取，诊断包也会出现
+    // 「有 confirmed/evidence 却没有 code」的自相矛盾字段。
+    lastStartRefusalCode = null
+    lastStartRefusalConfirmed = emptyList()
     snapshotFingerprintProblem()?.let { problem ->
       lastStartRefusal = problem.failureCode + ": " + problem.detail
       return false
@@ -1222,8 +1229,8 @@ class EngineManager(private val context: Context, private val pickToken: String?
       LogCollector.log(TAG, "engine start refused (live runtime incomplete) evidence=" + lastStartRefusalEvidence)
       return false
     }
-    // 通过闸门 A：清掉上一次的拒启结论（**不清取证**——它是只增的现场记录，由诊断包读取）。
-    lastStartRefusalCode = null
+    // 通过闸门 A：码与确诊项已在入口清过（见函数头注释），此处无需重复。
+    // 取证字段**刻意不清**：它是只增的现场记录，供诊断包读取。
     val now = System.currentTimeMillis()
     // Process-level CAS: only one concurrent call really starts (device-measured EADDRINUSE double-start).
     if (!STARTING.compareAndSet(false, true)) return true

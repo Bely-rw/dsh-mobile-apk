@@ -142,12 +142,18 @@ class Issue309StartRecoveryTest {
       "闸门 B 的判据必须是 engine.log 尾部 + 链接失败签名（这正是它被互锁的原因）",
       selfHeal.contains("readEngineLogTail") && selfHeal.contains("snapshotLinkFailure"),
     )
+    // 独立评审指出：旧断言取 gateA 的切片止于 `lastStartRefusalCode = null`，而 spawn 在其后，
+    // 所以 contains("startWithArgs(") **恒为假**——它守不住任何东西。改成真正有判别力的判据：
+    // 「拒启分支在 return false 之前不得出现任何 spawn 调用」（切片改为整个 gate-A if 块）。
     val manager = code("EngineManager.kt")
-    val gateA = between(manager, "if (!liveRuntimeComplete()) {", "lastStartRefusalCode = null")
+    val gateA = between(manager, "if (!liveRuntimeComplete()) {", "lastStartRefusalConfirmed = confirmed")
     assertFalse(
-      "闸门 A 拒启路径不得 spawn（否则互锁的成因就变了）",
+      "闸门 A 拒启路径直到取证为止不得 spawn（否则互锁的成因就变了）",
       gateA.contains("startWithArgs("),
     )
+    // 且整段拒启必须 return false（不得放行到后面的 spawn 段）。
+    val refusalTail = between(manager, "lastStartRefusalEvidence = liveRuntimeEvidence(missing, confirmed)", "val now = System.currentTimeMillis()")
+    assertTrue("拒启必须 return false", refusalTail.contains("return false"))
     assertTrue("闸门 A 必须在 return 之前给出结构化原因码", gateA.contains("REFUSAL_LIVE_RUNTIME_INCOMPLETE"))
   }
 
@@ -180,12 +186,14 @@ class Issue309StartRecoveryTest {
   fun `recovery order is marker fingerprint ledger evidence then boot fail`() {
     val flow = code("EngineStartFlow.kt")
     val fn = between(flow, "internal fun maybeRecoverFromIncompleteLiveRuntime(", "private fun clearRuntimeTreeDamageMarker(")
+    // 顺序（独立评审 C7 后调整）：标记 -> 删指纹 -> 清账本 -> 落盘结论 -> 取证镜像。
+    // 镜像必须在**结论已定**之后：否则镜像里的 start_refusal_* 还是上一次拒启的值。
     val order = listOf(
       "DAMAGE_MARKER",
       "invalidateSnapshotFreshness()",
       "clearRefreshLedger()",
-      "mirrorDiagnosticsToShared(",
       "writeBootFail(",
+      "mirrorDiagnosticsToShared(",
     )
     var at = -1
     for (token in order) {
@@ -193,7 +201,70 @@ class Issue309StartRecoveryTest {
       assertTrue("恢复动作缺步骤或顺序错：" + token, next > at)
       at = next
     }
-    assertFalse("恢复不得绕过预算判定", fn.contains("runtimeTreeHealedThisRun = true\n\n  try"))
+    // 独立评审指出：旧断言写的是 fn.contains("runtimeTreeHealedThisRun = true\n\n  try")，
+    // 而函数里该语句与 try 之间隔着 5 行 ⇒ 该模式**永不匹配**，是一条恒真的空断言
+    // （声称守预算，实则连预算被绕过都抓不住）。改成真正的顺序断言：
+    // 「先过预算闸门，才允许置位」——把预算判定挪到置位之后就会被这里判红。
+    val gateAt = fn.indexOf("allowStartRecovery(")
+    val spendAt = fn.indexOf("runtimeTreeHealedThisRun.compareAndSet(false, true)")
+    assertTrue("预算判定必须存在：" + gateAt, gateAt >= 0)
+    assertTrue("花预算必须是 CAS 单次操作：" + spendAt, spendAt >= 0)
+    assertTrue("预算判定必须先于花预算（否则预算形同虚设）", gateAt < spendAt)
+  }
+
+  /**
+   * **本 issue 的因果闭环**（独立评审主张 B1 的正面反证）：删指纹**就是**让新鲜度翻转的那一步。
+   *
+   * 评审主张：「低置信度条目命中时，人工按钮删了指纹，但 snapshotFresh() 仍为真 ⇒ 冷启动在
+   * snapshotFresh() 处早退 ⇒ 按钮是空操作」。这条主张自相矛盾——删指纹之所以算恢复动作，
+   * 正因为它令 liveFingerprint() 读不到文件（回落空串）从而 fresh 判假。本用例把这条链钉死：
+   *   ① 指纹在场 ⇒ fresh ⇒ 冷启动早退（**这才是本 issue 无恢复路径的成因**）；
+   *   ② 指纹缺失或空白 ⇒ 必不 fresh ⇒ start() 进 refreshSnapshot 分支；
+   *   ③ start() 的刷新判据仍是 snapshotFresh()（没有被改成别的条件）。
+   * 三段缺一，恢复动作才会真的变成空操作；任一段被改坏，本用例判红。
+   */
+  @Test
+  fun `deleting the fingerprint is exactly what flips freshness into the refresh branch`() {
+    val fp = "a".repeat(64)
+    val bundled = SnapshotFingerprintPolicy.read(fp)
+    assertTrue("内嵌指纹必须可解析", bundled.failureCode == null && bundled.fingerprint == fp)
+    assertTrue(
+      "指纹在场 ⇒ fresh ⇒ 冷启动早退（本 issue 的成因）",
+      SnapshotFingerprintPolicy.fresh(nodeExists = true, bundled = bundled, committed = fp),
+    )
+    for (missing in listOf<String?>(null, "", "   ")) {
+      assertFalse(
+        "指纹缺失或空白时必须判不 fresh，否则删指纹这个恢复动作是空操作",
+        SnapshotFingerprintPolicy.fresh(nodeExists = true, bundled = bundled, committed = missing),
+      )
+    }
+    val flow = code("EngineStartFlow.kt")
+    assertTrue(
+      "start() 必须以 snapshotFresh() 为刷新判据（删指纹才能把它推入刷新分支）",
+      flow.contains("if (!activity.engineManager.snapshotFresh()) {"),
+    )
+    val fn = between(flow, "internal fun maybeRecoverFromIncompleteLiveRuntime(", "private fun clearRuntimeTreeDamageMarker(")
+    assertTrue("恢复函数必须调具名删指纹 API", fn.contains("invalidateSnapshotFreshness()"))
+  }
+
+  /**
+   * 独立评审 C7/D6：镜像必须在结论之后，且**任一步失败都要留落盘记录**。
+   *
+   * 两条都来自同一类风险——「失败现场不存在」正是本 issue 的母题：
+   *   · 镜像先于结论 ⇒ 镜像里的 start_refusal_* 是上一次拒启的旧值（取证变成了误导）；
+   *   · 整段包一个 try ⇒ 标记写盘一抛就连一条 boot-fail 都没有，只剩 Log.w。
+   */
+  @Test
+  fun `diagnostics mirror follows the outcome and no step failure is swallowed`() {
+    val flow = code("EngineStartFlow.kt")
+    val fn = between(flow, "internal fun maybeRecoverFromIncompleteLiveRuntime(", "private fun clearRuntimeTreeDamageMarker(")
+    val knownAt = fn.indexOf("writeBootFail(")
+    val mirrorAt = fn.indexOf("mirrorDiagnosticsToShared(")
+    assertTrue("两处都必须在场", knownAt >= 0 && mirrorAt >= 0)
+    assertTrue("取证镜像必须在结论落盘之后（否则镜像里是上一次拒启的旧值）", knownAt < mirrorAt)
+    assertTrue("标记写入必须单独容错（runCatching），不得与后续步骤共用一个 try", fn.contains("runCatching {"))
+    assertTrue("标记写入失败必须被记下来", fn.contains("stepFailure"))
+    assertTrue("落盘文案必须如实带上标记写入失败", fn.contains("损坏标记写入失败"))
   }
 
   /** 删除指纹必须经 EngineManager 的具名 API，且**返回值**要影响落盘文案。 */
@@ -235,20 +306,71 @@ class Issue309StartRecoveryTest {
   /** 取证必须在**删指纹之前**产生，否则重抽取会抹掉现场（issue #309 建议 3 的取证要求）。 */
   @Test
   fun `evidence is captured before the fingerprint can be deleted`() {
+    // 独立评审指出旧写法是一条**空断言**：它拿 branch 里 writeBootFail 的下标去比
+    // maybeRecoverFromIncompleteLiveRuntime，而这两句本身一个在前一个在后（写死顺序），
+    // 且全程没碰 liveRuntimeEvidence 与 invalidateSnapshotFreshness ⇒ 守不住任何东西。
+    // 改成断言真正的性质，三段各对应一个可被改坏的实现细节：
     val manager = code("EngineManager.kt")
-    val gateA = between(manager, "if (!liveRuntimeComplete()) {", "lastStartRefusalCode = null")
-    val evidenceAt = gateA.indexOf("liveRuntimeEvidence(")
-    assertTrue("拒启时必须取证", evidenceAt >= 0)
+    val gateA = between(manager, "if (!liveRuntimeComplete()) {", "return false")
+    // ① 闸门 A 里必须**先探测一次**，且日志与判据共用这一次结果（不得各算一遍）。
+    assertTrue("拒启时必须取证", gateA.contains("RuntimeTree.missingEntries("))
     assertTrue(
-      "取证用的缺失项与决定恢复的缺失项必须来自同一次探测",
-      gateA.contains("RuntimeTree.confirmedDamage(missing)"),
+      "缺失项必须只探测一次（missing 变量），不得日志与判据各算一遍",
+      gateA.contains("val missing = RuntimeTree.missingEntries(") &&
+        gateA.contains("RuntimeTree.confirmedDamage(missing)") &&
+        gateA.contains("liveRuntimeEvidence(missing, confirmed)"),
     )
+    // ② 判据必须来自同一次探测的 confirmed，而不是重新算一遍。
+    assertTrue("判据必须复用 confirmed", gateA.contains("lastStartRefusalConfirmed = confirmed"))
+    // ③ 闸门 A 的整段（到 return false 为止）不得出现删指纹——删指纹只能发生在恢复函数里，
+    //    于是「取证先于删除」由**函数边界**保证，而不是靠注释声称。
+    assertFalse("闸门 A 内不得删指纹（取证必须发生在删除之前）", gateA.contains("invalidateSnapshotFreshness"))
     val flow = code("EngineStartFlow.kt")
-    val branch = between(flow, "if (!activity.engineManager.startEngine()) {", "activity.runOnUiThread {")
+    val fn = between(flow, "internal fun maybeRecoverFromIncompleteLiveRuntime(", "private fun clearRuntimeTreeDamageMarker(")
     assertTrue(
-      "删指纹在恢复函数里、取证在闸门 A 里 ⇒ 取证天然先于删除",
-      branch.indexOf("writeBootFail(") < branch.indexOf("maybeRecoverFromIncompleteLiveRuntime("),
+      "删指纹必须发生在恢复函数内（即闸门 A 的取证之后）",
+      fn.contains("invalidateSnapshotFreshness()"),
     )
+  }
+
+  /**
+   * 独立评审 6(a)：拒启结论必须**每次进入 startEngine 就重置**，否则会残留上一次的码。
+   *
+   * 缺陷形态：旧实现只在**通过**闸门 A 时清码，而闸门 A 之前还有两条 return false
+   * （打包指纹不可用 / termux-exec 预载库缺失）。于是那两条路径返回后，**上一次**的
+   * live-runtime 码与确诊项仍在 ⇒ 错误页主按钮会拿陈旧码去花掉那次一次性重抽取，
+   * 诊断包也会出现「有 confirmed/evidence 却没有 code」的自相矛盾字段。
+   */
+  @Test
+  fun `stale refusal facts are cleared on every startEngine entry`() {
+    val manager = code("EngineManager.kt")
+    val entry = between(manager, "fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {", "snapshotFingerprintProblem()")
+    assertTrue("入口必须先清原因码", entry.contains("lastStartRefusalCode = null"))
+    assertTrue("入口必须同时清确诊项", entry.contains("lastStartRefusalConfirmed = emptyList()"))
+    val beforeFirstReturn = manager.substringAfter("fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {").substringBefore("return false")
+    assertTrue(
+      "清码必须早于第一条 return false（否则残留码仍会被当成本次结论）",
+      beforeFirstReturn.contains("lastStartRefusalCode = null"),
+    )
+  }
+
+  /**
+   * 独立评审 6(b)：删指纹失败时必须**退回**预算。
+   *
+   * 为什么这条是硬要求：预算语义是「一次运行内最多重做一次」以防死循环；而 invalidation 失败
+   * 意味着没有安排任何重做（没有触发重抽取的载体）。若照样烧掉，自动与手动两条出口在本次运行内
+   * 双双失效，用户被钉死在错误页——比修之前更糟。
+   */
+  @Test
+  fun `failed invalidation releases the one-shot budget`() {
+    val flow = code("EngineStartFlow.kt")
+    val fn = between(flow, "internal fun maybeRecoverFromIncompleteLiveRuntime(", "private fun clearRuntimeTreeDamageMarker(")
+    assertTrue("必须消费 invalidation 的返回值", fn.contains("val invalidated ="))
+    assertTrue(
+      "删不掉指纹时必须把预算退回去（否则两条出口都被烧掉）",
+      fn.contains("if (!invalidated) runtimeTreeHealedThisRun.set(false)"),
+    )
+    assertTrue("预算必须是单次 CAS 操作", fn.contains("runtimeTreeHealedThisRun.compareAndSet(false, true)"))
   }
 
   /** 诊断包必须带上拒启原因/确诊项/现场，否则用户取包时没有可归因的事实。 */
