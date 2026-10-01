@@ -666,11 +666,36 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 属于前者：不再空等 90s 预算，直接以可归因的原因收口，用户看到的不再是
         // 「进程在 90s 预算内死亡」这种无指向的结论。
         val refusal = activity.engineManager.lastStartRefusal
+        val refusalCode = activity.engineManager.lastStartRefusalCode
         LogCollector.writeBootFail(
           activity, if (refusal != null) "engine-start-refused" else "engine-start-false",
           "EngineManager.startEngine() 返回 false（未能拉起引擎进程）"
+            + (refusalCode?.let { "；refusalCode=" + it } ?: "")
             + (refusal?.let { "；refusal=" + it } ?: ""),
         )
+        // issue #309：解开闸门 A / 闸门 B 的互锁。
+        //
+        // 互锁形态（源码级确证）：闸门 A（liveRuntimeComplete，spawn 之前）拒启 ⇒ 不 spawn
+        // ⇒ engine.log 永不产生 ⇒ 闸门 B（maybeSelfHealDamagedRuntimeTree 读 engine.log 尾部
+        // 找 CANNOT LINK）判据恒为假 ⇒ 自愈不可达。且 refreshSnapshot 全仓只有冷启动一个调用点，
+        // 拒启路径为零；UI 的「重试」只清账本不删指纹（指纹新鲜时是 no-op）——自动与手动路径都为零，
+        // 用户实测 36 次 / 47 分钟无任何恢复动作。
+        //
+        // 修法：拒启原因确为「live 树残缺」**且缺的是确诊项**时，删指纹 + 清账本，让下一次冷启动
+        // 的 `if (!snapshotFresh())` 走完整重抽取。三处克制：
+        //   ① 只在确诊项缺失时触发——REQUIRED_LIBS 成员可能是**传递依赖**误报（issue #309 明确
+        //      告诫「不要贸然补全该表」，否则互锁会从「可人工救」升级为「只能清应用数据」），
+        //      因此它们只记录、不触发；
+        //   ② 复用 runtimeTreeHealedThisRun（每次 app 运行一次），不新增预算变量，
+        //      因此不会引入「重抽取 → 再失败 → 再重抽取」死循环；
+        //   ③ 不改闸门 A 的判据本身——带病的树仍然不被 spawn，安全性不变。
+        // 预算用尽或缺的都是低置信度条目时如实停在错误页并留档，不假装已修复。
+        if (refusalCode == EngineManager.REFUSAL_LIVE_RUNTIME_INCOMPLETE) {
+          maybeRecoverFromIncompleteLiveRuntime(
+            activity,
+            confirmedMissing = activity.engineManager.lastStartRefusalConfirmed,
+          ) { isCurrentEngineFlow(generation) }
+        }
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
           activity.applyGuidePhase(GuidePhase.Error, "引擎启动失败")
@@ -1033,7 +1058,7 @@ internal fun startupRecoverThenProbe(recover: () -> Unit, probeRunning: () -> Bo
   return probeRunning()
 }
 
-// ── task-79（Bug A）：运行时树损坏 ⇒ 一次受控重抽取 ─────────────────────────────
+// ── task-79（Bug A）+ issue #309：运行时树损坏 ⇒ 一次受控重抽取 ────────────────
 
 /**
  * 本次 app 运行是否已经为「运行时树损坏」自愈过一次（进程内一次性，见 [RuntimeTree.maySelfHeal]）。
@@ -1124,6 +1149,93 @@ private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?
   // ③ 诊断包镜像（不切界面相位，理由见上方注释）。
   if (!current()) return
   activity.engineManager.mirrorDiagnosticsToShared(notice.code)
+}
+
+/**
+ * issue #309：live 运行时树残缺时**唯一**的自动恢复动作（与闸门 B 共用同一份预算）。
+ *
+ * 为什么需要它：闸门 A 在 spawn 之前就拒启，因此 engine.log 根本不会产生，闸门 B 的判据
+ * （读 engine.log 尾部的 CANNOT LINK / library not found）**结构性不可达**；而 refreshSnapshot
+ * 全仓只有冷启动一个调用点，拒启分支为零、UI 的「重试」在指纹新鲜时是 no-op。结果是「live 树
+ * 缺一条 soname 链」这种可自愈状态会把用户永久挡在错误页（issue 实测 36 次 / 47 分钟零恢复）。
+ *
+ * **两道闸门**（判定全在 RuntimeTree.allowStartRecovery，本函数只执行其结论，不自己发明条件）：
+ *   ① 预算——复用 runtimeTreeHealedThisRun（每次 app 运行一次），不新增预算变量，
+ *      因此不会引入「重抽取 → 再失败 → 再重抽取」死循环；
+ *   ② 证据分级——confirmedMissing 为空时**自动路径**不动作。低置信度条目（REQUIRED_LIBS 成员）
+ *      可能是传递依赖造成的假阴性，issue #309 明确告诫「不要贸然补全该表」；自动放宽等于把
+ *      「可人工救」升级成「每次启动白付一次 8-12 分钟全量抽取并抹掉现场」。
+ *      **唯一例外是用户显式动作**（userForced，错误页的错误态按钮）：自动路径的克制不能变成
+ *      「用户连点一下都不行」——issue 现场用户只能靠壳侧终端手工补库，本 issue 的核心诉求
+ *      正是「给闸门 A 加出口」。预算仍照旧约束他：一次之后仍失败就停手。
+ *
+ * 动作（与闸门 B 的自愈同形，避免两套口径）——顺序**不可换**：
+ *   ① 写壳侧损坏标记（不被引擎截断，供后续启动与诊断读取）；
+ *   ② 删 .snapshot-fingerprint（EngineManager.invalidateSnapshotFreshness）⇒
+ *      下一次冷启动的 `if (!snapshotFresh())` 走完整重抽取；
+ *   ③ 清刷新失败账本 ⇒ 避免降级闸门在新局面下用旧账打架；
+ *   ④ 写一份**快照前**诊断镜像 ⇒ 拒启取证已在 boot-fail.log，这里补一份可整包取走的现场。
+ *
+ * **不做什么**（写清以免被当成漏做）：不改闸门 A 的判据，带病的树仍然不被 spawn；不在本函数内
+ * 直接调 refreshSnapshot（那会把 2.5GB 解压塞进拒启分支的调用栈，且与冷启动路径争同一次刷新）；
+ * 不承诺一次修好——预算用尽或证据不足时如实停在错误页，由用户手动「重试」再走一轮。
+ * 与 #240 的降级闸门不冲突：下一次冷启动时 live 仍不完整 ⇒ shouldDegradeRefresh() 返回 false ⇒
+ * 不会绕过这次刷新（删除指纹正是为了让那条路径真正走到 refreshSnapshot）。
+ *
+ * @param activity 宿主（用其 filesDir 与 engineManager）。
+ * @param confirmedMissing 闸门 A 的**确诊缺失项**（EngineManager.lastStartRefusalConfirmed）。
+ * @param userForced 真 = 用户在错误页显式要求重做运行时（放行证据分级，不放行预算）。
+ * @param current 世代校验，恢复途中若已换代则立刻停手。
+ */
+internal fun maybeRecoverFromIncompleteLiveRuntime(
+  activity: MainActivity,
+  confirmedMissing: List<String>,
+  userForced: Boolean = false,
+  current: () -> Boolean,
+) {
+  if (!current()) return
+  if (!RuntimeTree.allowStartRecovery(confirmedMissing, runtimeTreeHealedThisRun, userForced)) {
+    val reason = if (confirmedMissing.isEmpty() && !userForced) {
+      "no confirmed missing entry (only low-confidence probes fired, so the automatic path stays put)"
+    } else {
+      "self-heal budget already spent this run"
+    }
+    LogCollector.log("dsh-engine-start", "live runtime incomplete (gate A): " + reason + "; staying at the readable error page")
+    return
+  }
+  runtimeTreeHealedThisRun = true
+  val evidence = confirmedMissing.joinToString(", ")
+  LogCollector.log(
+    "dsh-engine-start",
+    "live runtime incomplete (gate A): clearing fingerprint so the next start re-extracts the runtime; confirmed=" + evidence,
+  )
+  try {
+    if (!current()) return
+    java.io.File(activity.filesDir, RuntimeTree.DAMAGE_MARKER)
+      .writeText(System.currentTimeMillis().toString() + (0x0A).toChar())
+    if (!current()) return
+    val invalidated = activity.engineManager.invalidateSnapshotFreshness()
+    if (!current()) return
+    activity.engineManager.clearRefreshLedger()
+    if (!current()) return
+    // 取证镜像：重抽取会覆盖现场，所以先归档一份可整包取走的现场（best-effort，不抛）。
+    activity.engineManager.mirrorDiagnosticsToShared("live-runtime-incomplete")
+    if (!current()) return
+    // 落盘文案必须**如实**反映真做成了什么：删不掉指纹时不能写「下次启动将走完整重抽取」，
+    // 否则复现的是本 issue 第 5 条指出的同形缺陷（文案承诺一个并不存在的动作）。
+    LogCollector.writeBootFail(
+      activity,
+      if (invalidated) "live-runtime-incomplete-recovery" else "live-runtime-incomplete-recovery-blocked",
+      "闸门 A 拒启（live 运行时树残缺，确诊项：" + evidence + "）：" +
+        if (invalidated) {
+          "已删指纹并清刷新账本，下次启动将走完整重抽取；本次不 spawn"
+        } else {
+          "指纹删不掉（存储异常），无法安排重抽取；已留诊断包，本次不 spawn"
+        },
+    )
+  } catch (t: Throwable) {
+    Log.w("dsh-engine-start", "live-runtime recovery failed: " + t.javaClass.simpleName + ": " + (t.message ?: ""))
+  }
 }
 
 /**

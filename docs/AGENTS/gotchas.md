@@ -1325,3 +1325,9 @@
     **修法**：BrowserHostProfile在load/settings前验证per-session nonDefault并自有worker策略，不支持即拒不回Default；控制捕获Session/tab/modelTab与UI舞台分开，refs/identity/viewport/error均per-tab；官方MIT UI私有复用、真实tab-menu扩展。PTC A1 host/child双文件与pi streaming020六provider exact SHA/context及副本同步入runner；普通snapshot post-apply已统一runner --check复核全部companion/exact verifier，不再只搜主target marker。
     **证据**：源码/fixtures/patch登记在场，未构建/未执行；HTTP/loopback storage隔离、UA/UA-CH、模型跨会话、PTC授权不downgrade待外验。旧资产尺寸/hash不当新测量。
 
+237. **闸门A拒启与闸门B自愈互锁：只有能spawn才会写engine.log，而拒启恰恰不spawn（0.14.3，#309）**：
+    **真因**：`liveRuntimeComplete()`在spawn前拒启（且先于force/可用性判定⇒看门狗force也绕不过），而自愈判据`snapshotLinkFailure`读的是**当拍engine.log尾部**——不spawn就永不产生该文件⇒自愈条件恒为假。全仓`refreshSnapshot`调用点只有冷启动一处，拒启路径为零；UI「重试」只`clearRefreshLedger`不删指纹，指纹新鲜时是no-op。于是「live树缺一条条目」这种可自愈状态把用户永久挡在错误页（issue实测36次/47分钟零恢复）。
+    **修法**：拒启时先**取证**（缺失项+确诊分级+每项size/mtime，写进boot-fail与诊断包）再**删指纹**，借既有的`if (!snapshotFresh()) refreshSnapshot(...)`冷启动分支走完整重抽取——不新增调用点。触发条件是**双闸门**：预算复用`runtimeTreeHealedThisRun`（每次运行一次，避免重抽取→再失败→再重抽取），且缺失项里至少有一条是「快照自身条目」（`START_RECOVERY_CONFIRMED_ENTRIES`）。
+    **为什么`REQUIRED_LIBS`成员刻意不触发自动恢复**：issue原文明确告诫「不要贸然补全该表」——该表只列`usr/bin/node`的8条`DT_NEEDED`，**不含传递依赖**，因此它的命中可能是假阴性（真缺的可能是`libicudata.so.78`那类传递依赖）。自动放宽的代价是每次启动白付一次8-12分钟全量抽取并抹掉现场，比不修更坏；故低置信度条目只记录，用户可在错误页主按钮**显式**重做一次（放行分级、不放行预算）。
+    **证据**：`Issue309StartRecoveryTest`13例本轮exit 0（含反证：只有低置信度条目时必须拒绝；注入两处变异后实测2 failed已还原）。真机/模拟器删件冷启动与「只删一个库符号链接」两条外验未做。不改闸门A判据本身，带病的树仍不被spawn。
+

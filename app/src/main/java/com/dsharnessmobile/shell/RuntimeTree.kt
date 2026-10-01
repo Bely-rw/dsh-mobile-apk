@@ -194,4 +194,73 @@ internal object RuntimeTree {
 
   /** 损坏标记文件名（壳侧，**不被引擎的 redirectOutput 截断**——engine.log 每 spawn 截断，不能当账本）。 */
   internal const val DAMAGE_MARKER = ".runtime-tree-damaged"
+
+  // ── issue #309：拒启取证的**证据分级**（决定要不要花掉那次重抽取）────────────────
+
+  /**
+   * 「一旦缺失即可确诊 live 树被外部改坏」的**确认项**（issue #309）。
+   *
+   * 分级为什么是必须的（直接来自 issue 的反向告诫）：`REQUIRED_LIBS` 只列了 `usr/bin/node` 的
+   * 8 条 DT_NEEDED，**不含传递依赖** —— 作者实测缺的 `libicudata.so.78` 正是被 `libicuuc.so.78.3`
+   * 需要的传递依赖，却不在表里。因此「`REQUIRED_LIBS` 里有一项不在」**不能**证明真缺件：
+   * 它也可能是传递依赖造成的假阴性（即树其实是「不完整但近似原始」的可救态）。
+   *
+   * issue 原文据此明确要求「**不要贸然补全该表**」，否则闸门 A 更严、互锁会从「可人工救」升级为
+   * 「只能清应用数据」。同一句话反推出的纪律就是这里的分级：
+   *
+   *   · 确认项（本表）——抽取过程的产物，只可能是「树被改坏 / 搬了一半」，重抽取必能复原；
+   *   · `REQUIRED_LIBS` 成员——可能是传递依赖误报，**只记录不触发**。
+   *
+   * 代价是罕见的「只缺一个库、基础项俱全」的损伤不会自动恢复；但那正是 issue 里用户手动补链后
+   * **闸门 B 接手救回**的形态（enginelog 里有 CANNOT LINK）——这条路本轮已经打通，不是死路。
+   * 反过来若在这里放宽，误伤面是「每次启动白付一次 8-12 分钟全量抽取 + 抹掉现场」，明显更坏。
+   */
+  internal val START_RECOVERY_CONFIRMED_ENTRIES: List<String> = listOf(
+    "bin/node",
+    "lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "home/.dsh/profiles/web",
+  )
+
+  /**
+   * 从 [missingEntries] 的输出里挑出**确认项**（纯函数，JVM 可测）。
+   *
+   * 只做等值匹配、不做前缀匹配：`missingEntries` 对链接异常会追加 ` (dangling link -> x)`
+   * 一类后缀，而那条路径属于 `REQUIRED_LIBS` 面（低置信度），不应因后缀不同而被漏判为确认项。
+   */
+  internal fun confirmedDamage(missing: List<String>): List<String> =
+    missing.filter { entry -> START_RECOVERY_CONFIRMED_ENTRIES.any { it == entry } }
+
+  /**
+   * 拒启恢复的**唯一闸门**（纯函数）：预算 + 证据分级，两条同时满足才允许花掉那次全量重抽取。
+   *
+   * 抽成纯函数是为了让反证靠传参（本仓既有范式），而不是靠读源码字符串：
+   *   · `alreadyRecoveredThisRun = true` ⇒ 拒绝（预算，避免「重抽取 → 再失败 → 再重抽取」死循环）；
+   *   · `confirmedMissing` 为空 ⇒ 拒绝（证据不足，只有低置信度条目命中，见上表注释）；
+   *   · 两者都不满足 ⇒ 允许（本次运行第一次 + 有确诊缺失项）。
+   *
+   * 第三种输入是 issue #309 建议 3 的「手动入口」：`userForced = true` 放行**证据分级**这一关
+   * （预算那一关**不**放行）。理由：低置信度条目命中时（例如只缺一个 REQUIRED_LIBS 成员，见
+   * 上表注释）自动路径刻意不动作，但用户此刻看到的是「引擎起不来」——他点「安全模式启动」
+   * 就是显式要求「重做运行时」。若连这一下都不给，用户仍只能靠壳侧终端手工补库（issue 现场
+   * 正是如此），本 issue 的核心诉求「有出路」就没有兑现。反过来预算必须照旧：一次之后仍失败，
+   * 说明不是一次重抽取能修的损伤，继续循环只会把用户困在解压页。
+   *
+   * @param confirmedMissing [confirmedDamage] 的结果。
+   * @param alreadyRecoveredThisRun 本次 app 运行是否已经为「运行时树残缺」花过重抽取。
+   * @param userForced 是否来自用户的显式动作（错误页按钮）。
+   */
+  internal fun allowStartRecovery(
+    confirmedMissing: List<String>,
+    alreadyRecoveredThisRun: Boolean,
+    userForced: Boolean = false,
+  ): Boolean = maySelfHeal(alreadyRecoveredThisRun) && (userForced || confirmedMissing.isNotEmpty())
+
+  /**
+   * 一个条目的现场描述（诊断用，不是判据）：存在性 + 大小 + mtime。
+   *
+   * 为什么连大小/mtime 一起记：issue 报障者的触发源是「一次误删 usr/lib 下 soname 符号链接的操作」，
+   * 而重抽取会覆盖现场。事后要能回答「当时到底缺了什么、是什么时候被动的」，只能靠这条。
+   */
+  internal fun describeEntry(file: File): String =
+    if (!file.exists()) "absent" else "present size=" + file.length() + " mtime=" + file.lastModified()
 }

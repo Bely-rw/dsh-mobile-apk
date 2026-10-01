@@ -428,6 +428,24 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       if (copied) activity.getString(R.string.ds_safe_entered)
       else activity.getString(R.string.ds_safe_prompt_copy_failed),
     )
+    // issue #309：错误页的显式动作**同时**是闸门 A 的手动出口。
+    //
+    // 为什么必须是这个按钮：本仓的错误页只有它一个主按钮（Error 相位下它就是「安全模式启动」），
+    // 而 issue 现场用户能自救的唯一途径是壳侧终端手工补库——那等于没有出路。自动路径刻意克制
+    // （只有确诊项缺失才花掉那次重抽取），所以低置信度条目命中时必须留一个**用户显式**的出口。
+    //
+    // 为什么限定在「上一次拒启就是 live 树残缺」：`lastStartRefusalCode` 非空即表示本进程刚被
+    // 闸门 A 挡下（错误页正是在同一次启动尝试后出现的）；否则无差别地花掉一次 8-12 分钟全量
+    // 重抽取，对「插件装配失败」一类完全可以回滚的问题就是纯损失。
+    //
+    // 预算没有被这里放行：真要修不好（安装包本身缺件 / 存储坏块），一次之后仍会停在可读错误页。
+    if (engine.lastStartRefusalCode == EngineManager.REFUSAL_LIVE_RUNTIME_INCOMPLETE) {
+      maybeRecoverFromIncompleteLiveRuntime(
+        activity,
+        confirmedMissing = engine.lastStartRefusalConfirmed,
+        userForced = true,
+      ) { !activity.isDestroyed && !activity.isFinishing }
+    }
     // 回执看一小会儿，然后真的以 safe 状态重启（见方法注释：为什么留延时、为什么用 View 的 postDelayed）。
     chrome.root.postDelayed({
       if (activity.isDestroyed || activity.isFinishing || lastGuidePhase != GuidePhase.Error ||
