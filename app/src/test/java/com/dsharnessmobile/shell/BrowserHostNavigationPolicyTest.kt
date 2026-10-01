@@ -122,6 +122,133 @@ class BrowserHostNavigationPolicyTest {
     }
   }
 
+  @Test
+  fun isolatedProfileAllowsCanonicalOrdinaryLoopbackInBothPolicyLayers() {
+    val cases = linkedMapOf(
+      "http://127.0.0.1:9090/" to "http://127.0.0.1:9090/",
+      "https://127.0.0.1:8443/" to "https://127.0.0.1:8443/",
+      "http://127.2.3.4/" to "http://127.2.3.4/",
+      "http://2130706433:9090/" to "http://127.0.0.1:9090/",
+      "http://0x7f000001:9090/" to "http://127.0.0.1:9090/",
+      "http://017700000001:9090/" to "http://127.0.0.1:9090/",
+      "http://0177.0.0.1:9090/" to "http://127.0.0.1:9090/",
+      "http://127.1:9090/" to "http://127.0.0.1:9090/",
+      "http://127.0.1:9090/" to "http://127.0.0.1:9090/",
+      "http://LOCALHOST.:9090/" to "http://127.0.0.1:9090/",
+      "http://app.localhost:9090/" to "http://127.0.0.1:9090/",
+      "http://[::1]:9090/" to "http://[::1]:9090/",
+      "http://[0:0:0:0:0:0:0:1]:9090/" to "http://[::1]:9090/",
+      "http://[::ffff:7f00:1]:9090/" to "http://127.0.0.1:9090/",
+      "http://[::ffff:127.0.0.1]:9090/" to "http://127.0.0.1:9090/",
+      "http://[::127.0.0.1]:9090/" to "http://127.0.0.1:9090/",
+    )
+    for ((raw, canonical) in cases) {
+      assertEquals("isolated navigation: $raw", canonical,
+        BrowserHostNavigationPolicy.normalize(raw, isolatedProfile = true))
+      assertNull("isolated request: $raw",
+        BrowserHostNavigationPolicy.blockedRequestReason(raw, isolatedProfile = true))
+      assertNull("canonical request: $canonical",
+        BrowserHostNavigationPolicy.blockedRequestReason(canonical, isolatedProfile = true))
+      // Merely changing a port must NEVER grant an unprofiled/Default caller loopback access.
+      assertNull("unprofiled navigation: $raw", BrowserHostNavigationPolicy.normalize(raw))
+      assertEquals("unprofiled request: $raw", "loopback", BrowserHostNavigationPolicy.blockedRequestReason(raw))
+    }
+  }
+
+  @Test
+  fun protectedEngineIsStillDeniedInIsolatedProfilesAcrossCanonicalAliases() {
+    for (host in listOf("127.0.0.1", "127.1", "2130706433", "0x7f000001", "017700000001",
+      "0177.0.0.1", "localhost", "LOCALHOST.", "app.localhost", "[::1]", "[::ffff:7f00:1]")) {
+      for (scheme in listOf("http", "https")) {
+        val url = "$scheme://$host:3080/api/anonymous-check"
+        assertNull(url, BrowserHostNavigationPolicy.normalize(url, isolatedProfile = true))
+        assertEquals(url, "protected-engine-origin",
+          BrowserHostNavigationPolicy.blockedRequestReason(url, isolatedProfile = true))
+      }
+    }
+  }
+
+  @Test
+  fun anonymousEngineOptInIsExplicitAndCannotSubstituteForProfileIsolation() {
+    val url = "http://127.0.0.1:3080/"
+    assertNull(BrowserHostNavigationPolicy.normalize(url, allowAnonymousEngineAccess = true))
+    assertEquals("loopback", BrowserHostNavigationPolicy.blockedRequestReason(url, allowAnonymousEngineAccess = true))
+    assertEquals(url, BrowserHostNavigationPolicy.normalize(url,
+      isolatedProfile = true, allowAnonymousEngineAccess = true))
+    assertNull(BrowserHostNavigationPolicy.blockedRequestReason(url,
+      isolatedProfile = true, allowAnonymousEngineAccess = true))
+  }
+
+  @Test
+  fun isolatedNavigationAndRequestsBothRejectUnspecifiedAndMetadataLinkLocal() {
+    for ((url, reason) in listOf(
+      "http://0/" to "unspecified",
+      "http://0.0.0.0/" to "unspecified",
+      "http://[::]/" to "unspecified",
+      "http://[::ffff:0.0.0.0]/" to "unspecified",
+      "http://169.254.169.254/latest/meta-data/" to "link-local",
+      "http://0xa9fea9fe/latest/meta-data/" to "link-local",
+      "http://[::ffff:169.254.169.254]/" to "link-local",
+      "http://[fe80::1]/" to "link-local",
+      "http://[febf::1]/" to "link-local",
+    )) {
+      for (isolated in listOf(false, true)) {
+        assertNull(url, BrowserHostNavigationPolicy.normalize(url, isolatedProfile = isolated))
+        assertEquals(url, reason, BrowserHostNavigationPolicy.blockedRequestReason(url, isolatedProfile = isolated))
+      }
+    }
+  }
+
+  @Test
+  fun isolationDoesNotAdmitUserinfoUnsafeSchemesMalformedHostsOrPorts() {
+    for (url in listOf(
+      "http://user:password@127.0.0.1:9090/", "https://user@example.com/",
+      "javascript:alert(1)", "file:///sdcard/a.txt", "content://provider/a", "intent://example.com/",
+      "https:///missing-host", "http://127.0.0.1:0/", "http://127.0.0.1:65536/",
+      "http://127.0.0.1:-1/", "http://127.0.0.1:/", "http://%31%32%37.0.0.1:9090/",
+      "http://[fe80::1%25wlan0]/", "http://08.0.0.1/", "http://4294967296/",
+    )) {
+      assertNull(url, BrowserHostNavigationPolicy.normalize(url, isolatedProfile = true))
+      assertTrue("request must reject $url", BrowserHostNavigationPolicy.blockedRequestReason(url, isolatedProfile = true) != null)
+    }
+    // Ordinary inline resources remain usable, without granting top-level data/blob navigation.
+    for (url in listOf("data:image/png;base64,AAAA", "blob:https://example.com/abc")) {
+      assertNull(BrowserHostNavigationPolicy.normalize(url, isolatedProfile = true))
+      assertNull(BrowserHostNavigationPolicy.blockedRequestReason(url, isolatedProfile = true))
+    }
+  }
+
+  @Test
+  fun isolatedHttpStillSupportsLanPublicUrlsAndLosslessPathsQueriesAndFragments() {
+    val url = "http://127.0.0.1:9090/a%2Fb?q=%E4%B8%AD%E6%96%87#fragment"
+    assertEquals(url, BrowserHostNavigationPolicy.normalize(url, isolatedProfile = true))
+    for (ordinary in listOf("http://192.168.1.1/admin", "http://10.0.2.2:9090/", "http://neverssl.com/")) {
+      assertEquals(ordinary, BrowserHostNavigationPolicy.normalize(ordinary, isolatedProfile = true))
+      assertNull(BrowserHostNavigationPolicy.blockedRequestReason(ordinary, isolatedProfile = true))
+    }
+  }
+
+  @Test
+  fun webSocketPolicyUsesTheSameProfileAndProtectedPortRules() {
+    assertEquals("loopback", BrowserHostNavigationPolicy.blockedRequestReason("ws://127.0.0.1:9090/socket"))
+    assertNull(BrowserHostNavigationPolicy.blockedRequestReason("ws://127.0.0.1:9090/socket", isolatedProfile = true))
+    assertEquals("protected-engine-origin", BrowserHostNavigationPolicy.blockedRequestReason(
+      "wss://localhost:3080/socket", isolatedProfile = true))
+    assertNull(BrowserHostNavigationPolicy.normalize("ws://127.0.0.1:9090/socket", isolatedProfile = true))
+  }
+
+  @Test
+  fun browserSessionProfileNamesAreStableNonDefaultAndDoNotExposeSessionIds() {
+    val session = "session-test/unsafe?name:with-separators"
+    val first = BrowserHostProfile.nameForSession(session)
+    assertEquals(first, BrowserHostProfile.nameForSession(session))
+    assertNotEquals(first, BrowserHostProfile.nameForSession("another-session"))
+    assertNotEquals(first, BrowserHostProfile.nameForSession("__anonymous__"))
+    assertNotEquals("Default", first)
+    assertTrue(first.matches(Regex("dsh-browser-session-v1-[a-f0-9]{64}")))
+    assertFalse(first.contains(session))
+  }
+
   // ── 审查 §3.1-C3：jsString 必须转义 U+2028/U+2029（Chromium < 92 上是 SyntaxError） ──────
   //
   // 缺陷形态：`JSONObject.quote` 只处理引号/反斜杠与控制字符（< 0x20），**不转义行分隔符**；

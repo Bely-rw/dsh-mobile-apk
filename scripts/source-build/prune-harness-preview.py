@@ -9,8 +9,10 @@ import shutil
 import subprocess
 import sys
 
+HARNESS_COMMIT = "639ed015397290b3745d163aafe02ffee4aa3f84"
+
 PACKAGE_NAME = "@deepseek-ai/dsh-web-frontend"
-PACKAGE_VERSION = "0.1.7-rc.2"
+PACKAGE_VERSION = "0.2.0-rc.2"
 EXPECTED_FILES = ["dist", "!dist/**/*.map", "!dist/preview.html", "!dist/preview"]
 
 
@@ -83,6 +85,10 @@ def main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit("usage: prune-harness-preview.py <harness-source-root> <dsh-deploy-root> <provenance.json>")
     source_root, deploy_root, manifest_path = map(pathlib.Path, sys.argv[1:])
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()
+    root_manifest = json.loads((source_root / "package.json").read_text(encoding="utf-8"))
+    if commit != HARNESS_COMMIT or root_manifest.get("version") != PACKAGE_VERSION:
+        raise ValueError("preview pruning requires the official 0.2.0-rc.2 source")
     package_root = source_root / "apps" / "web"
     package_file = package_root / "package.json"
     package_bytes = package_file.read_bytes()
@@ -119,7 +125,6 @@ def main() -> None:
     if not seen:
         raise ValueError("deployed runtime is missing the pinned Harness web package")
 
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()
     manifest = {
         "source": "https://github.com/deepseek-ai/deepseek-harness",
         "sourceCommit": commit,

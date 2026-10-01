@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage the exact upstream vendor sources pinned by the Android engine overlay."""
+"""Audit overlay-pinned vendor sources at the official target; never rewind them."""
 from __future__ import annotations
 
 import hashlib
@@ -13,33 +13,20 @@ import subprocess
 import sys
 import tarfile
 
-HARNESS_COMMIT = "477b4f420553e8a52c2fbccc464d7561b239c443"
+HARNESS_COMMIT = "639ed015397290b3745d163aafe02ffee4aa3f84"
+HARNESS_VERSION = "0.2.0-rc.2"
 SOURCE_OVERRIDES = [
-    {
-        "package": "@deepseek-ai/cordis-plugin-group",
-        "path": "vendor/group",
-        "commit": "7bedce822f2c6b076df167dff46eecf81bbd5de4",
-    },
-    {
-        "package": "@deepseek-ai/cordis-plugin-hmr",
-        "path": "vendor/hmr",
-        "commit": "183f08e9c6dde7e36cd2318eaee70b0da08fb35e",
-    },
-    {
-        "package": "@deepseek-ai/cordis-plugin-include",
-        "path": "vendor/include",
-        "commit": "183f08e9c6dde7e36cd2318eaee70b0da08fb35e",
-    },
-    {
-        "package": "@deepseek-ai/cordis-plugin-loader",
-        "path": "vendor/loader",
-        "commit": "183f08e9c6dde7e36cd2318eaee70b0da08fb35e",
-    },
-    {
-        "package": "@deepseek-ai/cordis-plugin-timer",
-        "path": "vendor/timer",
-        "commit": "183f08e9c6dde7e36cd2318eaee70b0da08fb35e",
-    },
+    {"package": package, "path": path, "commit": HARNESS_COMMIT}
+    for package, path in [
+        ("@deepseek-ai/cordis", "vendor/cordis"),
+        ("@deepseek-ai/cordis-plugin-group", "vendor/group"),
+        ("@deepseek-ai/cordis-plugin-hmr", "vendor/hmr"),
+        ("@deepseek-ai/cordis-plugin-include", "vendor/include"),
+        ("@deepseek-ai/cordis-plugin-loader", "vendor/loader"),
+        ("@deepseek-ai/cordis-plugin-timer", "vendor/timer"),
+        ("@deepseek-ai/cosmokit", "vendor/cosmokit"),
+        ("@deepseek-ai/schemastery", "vendor/schemastery"),
+    ]
 ]
 
 
@@ -161,19 +148,22 @@ def main() -> None:
     if commit != HARNESS_COMMIT:
         raise ValueError(f"unexpected Harness source commit: {commit}")
     overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+    root_manifest = json.loads((repo / "package.json").read_text(encoding="utf-8"))
+    if root_manifest.get("version") != HARNESS_VERSION or overlay.get("engineVersion") != HARNESS_VERSION:
+        raise ValueError("vendor source audit requires the official 0.2.0-rc.2 source and overlay")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     stage_root = report_path.parent / "vendor-overrides-stage"
     shutil.rmtree(stage_root, ignore_errors=True)
     stage_root.mkdir(parents=True)
 
-    staged: list[tuple[pathlib.Path, pathlib.Path]] = []
     overrides: list[dict[str, object]] = []
     try:
         for item in SOURCE_OVERRIDES:
             package_name = str(item["package"])
             package_path = str(item["path"])
             source_commit = str(item["commit"])
-            expected_version = (overlay.get("packages") or {}).get(package_name)
+            expected_version = ((overlay.get("packages") or {}).get(package_name)
+                                or (overlay.get("vendorTop") or {}).get(package_name))
             source_manifest = manifest_at(repo, source_commit, package_path)
             current_manifest = manifest_at(repo, HARNESS_COMMIT, package_path)
             if source_manifest.get("name") != package_name:
@@ -188,7 +178,11 @@ def main() -> None:
 
             staged_root = stage_root / pathlib.Path(package_path).name
             files = stage_archive(repo, source_commit, package_path, stage_root)
-            staged.append((repo / package_path, staged_root))
+            # Compare tracked target bytes without replacing source or build outputs.
+            for entry in files:
+                working_file = repo / str(entry["path"])
+                if not working_file.is_file() or sha256(working_file.read_bytes()) != entry["sha256"]:
+                    raise ValueError(f"target vendor source differs from pinned commit: {entry['path']}")
             staged_manifest = json.loads((staged_root / "package.json").read_text(encoding="utf-8"))
             if staged_manifest.get("version") != expected_version:
                 raise ValueError(f"staged source manifest changed for {package_name}")
@@ -203,9 +197,10 @@ def main() -> None:
                 "sourceFiles": files,
             })
 
-        replace_staged_sources(staged, stage_root)
-
         report = {
+            "mode": "pinned-target-source-evidence",
+            "rewoundSourceCount": 0,
+            "reason": "All vendor manifests and tracked source bytes match the official Harness target. No older sources are staged into the build tree.",
             "repository": "https://github.com/deepseek-ai/deepseek-harness",
             "harnessSourceCommit": commit,
             "harnessSourceTree": git(repo, "rev-parse", "HEAD^{tree}"),
@@ -213,7 +208,7 @@ def main() -> None:
             "overrides": overrides,
         }
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(f"staged {len(overrides)} overlay-pinned Cordis packages from verified Harness commits")
+        print(f"audited {len(overrides)} overlay-pinned vendor packages at the official target; rewound zero sources")
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
 

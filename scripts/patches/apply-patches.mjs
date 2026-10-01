@@ -20,6 +20,9 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { ENV_MARKER as PTC_ENV_MARKER, LAUNCH_MARKER as PTC_LAUNCH_MARKER, assertChildClearing, patchEnvironment, patchRuntimeIndex, planPatch } from './ptc-android-native-A1.mjs'
+import { PI_STREAMING_FILES, planPiStreaming } from './pi-upstream-streaming-020.mjs'
+import { resolveEnginePatchFile } from './resolve-engine-patch-target.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const registry = JSON.parse(readFileSync(join(HERE, 'registry.json'), 'utf8'))
@@ -114,6 +117,51 @@ function assembledManifestFromStage(vendorRoot) {
 const F7_LEGACY_INLINE = 'const claim = await open(currentPath, "wx");'
 
 const IMPLS = {
+
+
+  // Raw npm pins do not include pnpm patchedDependencies; retain the official six-provider patch.
+  'pi-upstream-streaming-020': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js',
+    additionalFiles: PI_STREAMING_FILES.filter(file => file !== 'dist/api/openai-completions.js')
+      .map(file => 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/' + file),
+    scope: 'engine',
+    check: (s) => {
+      const runtime = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai'
+      const plan = planPiStreaming(join(CURRENT_STAGE_ROOT, runtime), file => file === 'dist/api/openai-completions.js'
+        ? s : loadImpl(runtime + '/' + file, CURRENT_STAGE_ROOT))
+      return plan.every(file => file.before === file.after)
+    },
+    apply: (s) => {
+      const runtime = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai'
+      const plan = planPiStreaming(join(CURRENT_STAGE_ROOT, runtime), file => file === 'dist/api/openai-completions.js'
+        ? s : loadImpl(runtime + '/' + file, CURRENT_STAGE_ROOT))
+      for (const file of plan) if (file.file !== 'dist/api/openai-completions.js') IMPL_state[runtime + '/' + file.file] = file.after
+      return plan.find(file => file.file === 'dist/api/openai-completions.js').after
+    },
+  },
+
+  // Host and child must share the same Android native startup allowlist. A1 never changes policy.
+  'ptc-android-native-A1': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/index.js',
+    additionalFiles: ['usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'],
+    scope: 'engine',
+    check: (s) => {
+      if (!s.includes(PTC_ENV_MARKER) || !s.includes(PTC_LAUNCH_MARKER)) return false
+      const child = loadImpl('usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js', CURRENT_STAGE_ROOT)
+      if (!child.includes(PTC_ENV_MARKER)) return false
+      assertChildClearing(child)
+      return patchRuntimeIndex(patchEnvironment(s)) === s && patchEnvironment(child) === child
+    },
+    apply: (s) => {
+      const runtime = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node'
+      const plan = planPatch(join(CURRENT_STAGE_ROOT, runtime), false, name => loadImpl(runtime + '/' + name, CURRENT_STAGE_ROOT))
+      const host = plan.find(file => file.name === 'lib/index.js')
+      if (host.before !== s) throw new Error('PTC runtime host/cache differs; discard this stage')
+      // Plan verifies version, both original files and unchanged policy before caching any output.
+      for (const file of plan) if (file.name !== 'lib/index.js') IMPL_state[runtime + '/' + file.name] = file.after
+      return host.after
+    },
+  },
 
   // ── marketplace B：安装 runner execPath 安全化（apk#83/#89 bad ELF magic）──
   'market-B': {
@@ -2020,9 +2068,12 @@ CURRENT_STAGE_ROOT = vendorRoot
 for (const id of order) {
   const impl = IMPLS[id]
   const meta = registry.patches.find((p) => p.id === id)
+  if (meta.targetDiscovery) impl.file = resolveEnginePatchFile(vendorRoot, meta)
   let src
+  const secondaryBefore = new Map()
   try {
     src = loadImpl(impl.file, vendorRoot)
+    for (const file of impl.additionalFiles ?? []) secondaryBefore.set(file, loadImpl(file, vendorRoot))
   } catch (e) {
     console.error(`[fail] ${id}: 目标文件缺失 ${impl.file}（${e.message}）`)
     failed++
@@ -2051,7 +2102,8 @@ for (const id of order) {
     const next = impl.apply(src)
     // FX-E19：check() 为假却「施加后零改动」= 锚点未命中（典型：前提补丁未打）。
     // 旧实现照打 `[ok] applied` 并报 `ALL OK`，制造假绿 apply——零改动必须失败。
-    if (next === src) {
+    const secondaryChanged = [...secondaryBefore].some(([file, before]) => IMPL_state[file] !== before)
+    if (next === src && !secondaryChanged) {
       console.error(`[fail] ${id}: apply 零改动（锚点未命中或前提补丁未打）——拒绝报 ALL OK；请人工核对 ${impl.file}`)
       failed++
       continue
@@ -2064,6 +2116,7 @@ for (const id of order) {
     IMPL_state[impl.file] = next
     touched.add(impl.file)
     saveImpl(impl.file, vendorRoot)
+    for (const file of impl.additionalFiles ?? []) { touched.add(file); saveImpl(file, vendorRoot) }
     applied++
     console.log(`[ok]   ${id} applied（${impl.file}）`)
   } catch (e) {

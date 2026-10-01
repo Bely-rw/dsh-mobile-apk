@@ -36,7 +36,7 @@ android {
     //    临时工作区 R1-R3；
     // ③ B2 门禁与发布链：新增门禁接进唯一接线面（本地构建链 / 两仓 CI / 发布组装链三处），
     //    快照指纹对账、工具返回值 schema 自检、控制 op 六处登记链、SKIP 计数。
-    versionCode = 44
+    versionCode = 45
     // Snapshot builds append a suffix (e.g. -SN-1-RC13) via -PversionNameSuffix; release builds pass none.
     val snapshotSuffix = providers.gradleProperty("versionNameSuffix").getOrElse("")
     // 版本号单一来源：UI（GuidePageRenderer）、桥（androidBridge.version）、诊断日志、引擎环境变量
@@ -47,7 +47,7 @@ android {
     //  ③ 仅受管精确 origin 的主框架 401 进入有界自动恢复，403/子资源/外部监听只作诊断；
     //  ④ 移除误导性的手动「重新认证」入口；#288 无实时覆盖层证据则安全停步，不伪造 CSS 修复。
     // 演进：… → 0.14.2(41) → 0.14.2-fx-1(42) → 0.14.2-fx-2(43) → 0.14.2-fx-3(44)。
-    versionName = "0.14.2-fx-3" + snapshotSuffix
+    versionName = "0.14.3" + snapshotSuffix
     buildConfigField("String", "TERMUX_VERSION", "\"0.118.3\"")
     // 0.14.0-preview：虚拟屏 P0 建屏矩阵走仪器测试入口（app UID 下运行 = P0-6 要测的调用者身份），
     // 不新增任何产品面（Activity/Bridge/Manifest 均不动）。见 .deploy-tmp/iter-0140/vdisplay-p0.md §8.8。

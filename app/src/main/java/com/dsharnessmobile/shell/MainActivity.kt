@@ -1106,6 +1106,7 @@ class MainActivity : ComponentActivity() {
         onSetScreenScope = { raw -> ScreenScopePrefs.set(this, raw).wire },
         onIncomingWorkspacePath = { FileIncoming.tmpWorkspace(this).absolutePath },
         onBrowserHostStatus = { browserHost.statusJson() },
+        onBrowserHostCommand = { payload -> browserHost.command(payload) },
         onBrowserHostShow = { target -> browserHost.show(target) },
         onBrowserHostHide = { browserHost.hide() },
         onBrowserHostReload = { browserHost.reload() },

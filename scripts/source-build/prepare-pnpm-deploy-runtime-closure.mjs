@@ -14,6 +14,12 @@ if (!sourceArg || !overlayArg || !backupArg || !reportArg) {
 }
 
 const sourceRoot = resolve(sourceArg)
+const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot, encoding: 'utf8' }).trim()
+const sourceManifest = JSON.parse(readFileSync(join(sourceRoot, 'package.json'), 'utf8'))
+if (sourceCommit !== '639ed015397290b3745d163aafe02ffee4aa3f84' || sourceManifest.version !== '0.2.0-rc.2'
+  || sourceManifest.packageManager !== 'pnpm@11.7.0') {
+  throw new Error('production deployment requires official 0.2.0-rc.2 source and pnpm 11.7.0')
+}
 const cliDir = join(sourceRoot, 'apps', 'cli')
 const packageFile = join(cliDir, 'package.json')
 const lockFile = join(sourceRoot, 'pnpm-lock.yaml')
@@ -26,6 +32,10 @@ const originalLock = readFileSync(lockFile)
 const originalWorkspace = readFileSync(workspaceFile)
 const manifest = JSON.parse(originalPackage.toString('utf8'))
 const overlay = JSON.parse(readFileSync(resolve(overlayArg), 'utf8'))
+if (manifest.name !== '@deepseek-ai/dsh' || manifest.version !== '0.2.0-rc.2'
+  || overlay.engineVersion !== '0.2.0-rc.2' || overlay.rootPackage?.version !== '0.2.0-rc.2') {
+  throw new Error('production deployment manifest/overlay must target 0.2.0-rc.2')
+}
 const packages = Object.entries(overlay.packages ?? {})
   .filter(([name]) => name.startsWith('@deepseek-ai/'))
   .sort(([a], [b]) => a.localeCompare(b))
@@ -120,7 +130,7 @@ writeFileSync(lockFile, temporaryLock)
 const temporaryWorkspace = Buffer.from(yaml.dump(workspaceConfig, { lineWidth: -1, noRefs: true, quotingType: "'" }))
 writeFileSync(workspaceFile, temporaryWorkspace)
 writeFileSync(reportFile, JSON.stringify({
-  sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: sourceRoot, encoding: 'utf8' }).trim(),
+  sourceCommit,
   deployTarget: 'apps/cli (@deepseek-ai/dsh)',
   originalPackageJsonSha256: sha256(originalPackage),
   temporaryPackageJsonSha256: sha256(temporaryPackage),

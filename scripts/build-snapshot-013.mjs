@@ -137,11 +137,26 @@ for (const leaf of STRIP.secretLeaves) {
   const p = join(DH, leaf)
   if (existsSync(p)) { rmSync(p, { force: true }); log(`strip secret: ${leaf}`) }
 }
-// seed 非机密 settings.yaml 模板（Q14；零机密：deepseek 官方段骨架，key 由壳私有文件注入）
-// 模板内容外置 snapshot-config/seed-settings.yaml（verbatim 写入）
+// Factory archives always replace device-derived YAML, even if that device already imported it.
+// Runtime upgrades suppress this seed from the stage when the LIVE installation has an import marker.
+const seedSettingsBody = SEED_SETTINGS.split(/\r?\n/).map((line) => line.replace(/#.*$/, '').trimEnd())
+  .filter((line) => line.trim()).join('\n')
+if (seedSettingsBody !== 'llm-deepseek: {}\nllm-pi-ai:\n  providers: {}') {
+  throw new Error('Factory settings seed must contain only the reviewed empty provider skeleton')
+}
 const seedSettingsPath = join(DH, 'settings.yaml')
-writeFileSync(seedSettingsPath, SEED_SETTINGS)
-log(`settings.yaml seed template written (zero-secret): ${seedSettingsPath}`)
+try {
+  if (!lstatSync(DH).isDirectory()) throw new Error('Factory DSH home must be a real directory')
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error
+}
+// Remove the extracted entry itself before writing: never follow a base-device settings symlink.
+for (const leaf of ['settings.yaml', 'settings.yaml.imported']) {
+  rmSync(join(DH, leaf), { recursive: true, force: true })
+}
+mkdirSync(DH, { recursive: true })
+writeFileSync(seedSettingsPath, seedSettingsBody + '\n', { flag: 'wx', mode: 0o600 })
+log(`settings.yaml factory seed written (empty providers): ${seedSettingsPath}`)
 // 出厂 profile 清单体检（0.14.2 起）：剥掉上游已不读的死键并断言 bundles 非空。历史上的
 // 性能 A1 seed（dsh.profile.patchReload=startup，实测冷启动 24.9s -> 16.6s）随 0.1.7-rc.1 失效：
 // 上游删掉了整个 patchReload 机制，reload 链改为常驻但空转的 dsh-client-hmr 一行 ⇒ 启动收益由
@@ -296,23 +311,17 @@ for (const entry of OVERLAY.keepUnpublished ?? []) {
   const registry = JSON.parse(readFileSync(join(ROOT, 'scripts', 'patches', 'registry.json'), 'utf8'))
   const enginePatches = registry.patches.filter((p) => p.scope === 'engine')
   log(`施加引擎树补丁（${enginePatches.map((p) => p.id).join(', ')}，apply-patches --scope engine）…`)
+  // Capture unmodified cache bytes for external regression inputs; this does not execute tests.
+  const captureScript = join(ROOT, 'scripts', 'probe-engine-anchors.mjs')
+  const captured = execSync(`node "${captureScript}" --fixtures --capture-only`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  process.stdout.write(captured)
   const script = join(ROOT, 'scripts', 'patches', 'apply-patches.mjs')
   const out = execSync(`node "${script}" "${stageRoot}" --apply --scope engine`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   process.stdout.write(out)
-  // 施加后复查（防 exit 0 但补丁缺席的半成品）
-  for (const patch of enginePatches) {
-    const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
-    const target = join(stageRoot, patch.target)
-    if (marker.length === 0) {
-      console.error(`[引擎树补丁断言失败] ${patch.id} 登记表缺 marker——无法验证`)
-      process.exit(1)
-    }
-    if (!existsSync(target) || !readFileSync(target, 'utf8').includes(marker)) {
-      console.error(`[引擎树补丁断言失败] ${patch.id} marker「${marker}」不在场（${patch.target}）——快照不可发布`)
-      process.exit(1)
-    }
-  }
-  log(`引擎树补丁就位（${enginePatches.length} 项 marker 在场）`)
+  // 施加后复查（防 exit 0 但补丁缺席的半成品；包含精确多文件 verifier）
+  const checked = execSync(`node "${script}" "${stageRoot}" --check --scope engine`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  process.stdout.write(checked)
+  log(`引擎树补丁就位（${enginePatches.length} 项，包含全部 companion 文件与精确上游 verifier）`)
   // 行为回归（0.13.7）：G1/G2 这类补丁光有 marker 不足以证明「改完还能跑」——marker 只证文本被替换。
   // 两个测试直接驱动刚打过补丁的产物（不联网、不花额度），缺目标文件时自行 skip（裸 clone 正常）。
   for (const [label, script, flag, target] of [

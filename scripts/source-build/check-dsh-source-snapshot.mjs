@@ -22,7 +22,7 @@ import { XZ_THREADS } from '../lib/shell.mjs'
 import { checkDshRuntimeDependencies } from './check-dsh-runtime-dependencies.mjs'
 import { checkAndroidNativeRuntimePackages } from './check-android-native-runtime-packages.mjs'
 import { checkPresetCarriers } from './preset-carriers.mjs'
-import { collectPhysicalFiles, matchesPatchTarget } from './reconcile-engine-patch-copies.mjs'
+import { collectPhysicalFiles, matchesPatchTarget, enginePatchTargets, verifyCanonicalEnginePatch } from './reconcile-engine-patch-copies.mjs'
 
 const snapshotArg = process.argv[2]
 if (!snapshotArg) {
@@ -35,7 +35,7 @@ const sourceBuildRoot = resolve('.deploy-tmp/source-build')
 const sourceManifestPath = resolve('.deploy-tmp/engine-overlay/source-build-manifest.json')
 const reportPath = join(sourceBuildRoot, 'source-engine-snapshot-check.json')
 const packageCache = resolve('.deploy-tmp/engine-overlay')
-const expectedCommit = '477b4f420553e8a52c2fbccc464d7561b239c443'
+const expectedCommit = '639ed015397290b3745d163aafe02ffee4aa3f84'
 const packagePrefix = 'usr/lib/node_modules/@deepseek-ai/dsh'
 const overlayPath = join(sourceBuildRoot, 'engine-overlay.original.json')
 const overridePath = join(sourceBuildRoot, 'harness-vendor-overrides.json')
@@ -52,13 +52,21 @@ const within = (root, candidate) => {
 const sourceManifest = JSON.parse(readFileSync(sourceManifestPath, 'utf8'))
 if (sourceManifest.commit !== expectedCommit) throw new Error(`unexpected Harness source commit: ${sourceManifest.commit}`)
 const sourceOverlay = JSON.parse(readFileSync(overlayPath, 'utf8'))
+if (sourceOverlay.engineVersion !== '0.2.0-rc.2' || sourceOverlay.rootPackage?.version !== '0.2.0-rc.2') {
+  throw new Error('source snapshot overlay must target official 0.2.0-rc.2')
+}
 const expectedPackages = new Map(Object.entries(sourceOverlay.packages ?? {}).filter(([name]) => name.startsWith('@deepseek-ai/')))
 expectedPackages.set(sourceOverlay.rootPackage.name, sourceOverlay.rootPackage.version)
 if (sourceManifest.packageCount !== sourceManifest.packages?.length || sourceManifest.packageCount !== expectedPackages.size) {
   throw new Error(`source package manifest is incomplete: ${sourceManifest.packageCount}, expected ${expectedPackages.size}`)
 }
 const overrideReport = JSON.parse(readFileSync(overridePath, 'utf8'))
-if (overrideReport.harnessSourceCommit !== expectedCommit) throw new Error('Harness vendor source overrides target the wrong source commit')
+if (overrideReport.harnessSourceCommit !== expectedCommit
+  || overrideReport.mode !== 'pinned-target-source-evidence' || overrideReport.rewoundSourceCount !== 0
+  || !Array.isArray(overrideReport.overrides) || overrideReport.overrides.length === 0
+  || overrideReport.overrides.some((item) => item.sourceCommit !== expectedCommit)) {
+  throw new Error('Harness vendor evidence must audit the official target without source rewinds')
+}
 const overrideByPackage = new Map((overrideReport.overrides ?? []).map((item) => [item.package, item]))
 const sourcePackageNames = new Set()
 for (const item of sourceManifest.packages) {
@@ -158,7 +166,8 @@ try {
     throw new Error(`engine patches without a usable marker would be skipped silently: ${markerless.join(', ')}`
       + '（marker 为空 ⇒ 该补丁在来源链上完全没有判据；请补 marker 或在 registry 显式登记 overlayCheck:false）')
   }
-  for (const patch of enginePatches) {
+  for (const patch of enginePatches) verifyCanonicalEnginePatch(engineRoot, patch)
+  for (const patch of enginePatches.flatMap(patch => enginePatchTargets(patch, engineRoot))) {
     const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
     if (!marker) continue
     if (!patch.target.startsWith(runtimePrefix)) throw new Error(`engine patch target escaped the source runtime: ${patch.target}`)
@@ -168,13 +177,14 @@ try {
     const physicalTarget = realpathSync(target)
     if (!within(physicalEngineRoot, physicalTarget)) throw new Error(`source snapshot patch target link escaped: ${patch.id}`)
     const content = readFileSync(target, 'utf8')
-    if (!content.includes(marker)) throw new Error(`source snapshot patch marker missing: ${patch.id} (${marker})`)
+    if (!patch.verifier && !content.includes(marker)) throw new Error(`source snapshot patch marker missing: ${patch.id} (${marker})`)
     // 副本面（设备实锤，0.14.2 追版后）：pnpm 布局下同一包在上层与 `.pnpm/**` store 各有一份物理文件，
     // 引擎补丁只按顶层 target 写入 ⇒ store 副本保持原样；而运行时按依赖查找可能解析到 store 那份
     // （`node-addon-require-builtin` 就是这样 ⇒ 未打补丁 ⇒ 引擎 boot 硬崩；同批 `pi-toolcall-G2` 亦然）。
     // 故判据不只看 target 本身：**同一目标的任何物理副本都必须带 marker**。
     const copies = engineFiles.filter((file) => matchesPatchTarget(relative(engineRoot, file).split(sep).join('/'), targetRel))
-    const unpatched = copies.filter((file) => !readFileSync(file, 'utf8').includes(marker))
+    const canonicalBytes = readFileSync(target)
+    const unpatched = copies.filter((file) => !readFileSync(file).equals(canonicalBytes))
     if (unpatched.length > 0) {
       const paths = unpatched.map((file) => relative(engineRoot, file).split(sep).join('/')).sort()
       throw new Error(`source snapshot has unpatched copies of ${patch.id}: ${paths.join(', ')}`

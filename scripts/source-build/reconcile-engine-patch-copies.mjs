@@ -16,6 +16,9 @@
 //   engineRoot 例：.deploy-tmp/snapshot-013/arm64/stage/root（其下 usr/lib/node_modules/...）
 import { copyFileSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, posix, relative, resolve, sep } from 'node:path'
+import { planPiStreaming } from '../patches/pi-upstream-streaming-020.mjs'
+import { planPatch as planPtcAndroid } from '../patches/ptc-android-native-A1.mjs'
+import { resolveEnginePatchTarget } from '../patches/resolve-engine-patch-target.mjs'
 
 // 登记表里的 target 是**归档内路径**；本模块与调用方一律用「相对引擎根」的路径对话，
 // 引擎根 = `usr/lib/node_modules/@deepseek-ai/dsh` 目录本身（与 check-dsh-source-snapshot.mjs 同约定）。
@@ -53,24 +56,55 @@ export function matchesPatchTarget(engineRelPath, targetRel) {
   return engineRelPath === targetRel || engineRelPath.endsWith(`/${targetRel}`)
 }
 
-/** 对一个补丁目标：找出全部副本、判定打没打上、必要时把已打补丁的字节写给其余副本。 */
+/** Expand every physical target; secondary files cannot silently leave the source audit. */
+export function enginePatchTargets(patch, engineRoot = undefined) {
+  let target = patch.target
+  if (patch.targetDiscovery) {
+    if (!engineRoot) throw new Error('discovery requires actual engine root: ' + patch.id)
+    const directory = patch.targetDiscovery.directory.slice(TARGET_PREFIX.length)
+    const entries = readdirSync(join(engineRoot, directory), { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.endsWith('.js'))
+      .map(entry => { const path = patch.targetDiscovery.directory + '/' + entry.name;
+        return [path, readFileSync(join(engineRoot, directory, entry.name), 'utf8')] })
+    target = resolveEnginePatchTarget(patch, entries)
+  }
+  const paths = [target, ...(patch.additionalTargets ?? [])]
+  if (paths.some(path => typeof path !== 'string' || !path.startsWith(TARGET_PREFIX)) || new Set(paths).size !== paths.length) {
+    throw new Error('invalid/duplicate engine patch targets: ' + patch.id)
+  }
+  return paths.map((target, i) => ({ ...patch, target,
+    marker: i === 0 ? patch.marker : patch.targetMarkers?.[target] ?? patch.marker }))
+}
+
+/** Exact reviewed verifiers supplement markers for unchanged upstream bytes and two-file PTC state. */
+export function verifyCanonicalEnginePatch(engineRoot, patch) {
+  if (patch.verifier === undefined) return
+  let plan
+  if (patch.id === 'pi-upstream-streaming-020' && patch.verifier === 'pi-upstream-streaming-020') {
+    plan = planPiStreaming(join(engineRoot, 'node_modules/@earendil-works/pi-ai'))
+  } else if (patch.id === 'ptc-android-native-A1' && patch.verifier === 'ptc-android-native-A1') {
+    plan = planPtcAndroid(join(engineRoot, 'node_modules/@deepseek-ai/dsh-ptc-runtime-node'))
+  } else throw new Error('unknown engine patch verifier: ' + patch.id)
+  if (plan.some(file => file.before !== file.after)) throw new Error('incomplete canonical engine patch: ' + patch.id)
+}
+
+/** 对一个补丁目标：找出全部副本、必要时将已验证逻辑目标的完整字节写给其余副本。 */
 function reconcileTarget(engineRoot, files, patch) {
   if (!patch.target.startsWith(TARGET_PREFIX)) throw new Error(`补丁目标不在引擎根内：${patch.id}（${patch.target}）`)
   const targetRel = patch.target.slice(TARGET_PREFIX.length)
   const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
   const copies = files.filter((file) => matchesPatchTarget(relative(engineRoot, file).split(sep).join(posix.sep), targetRel))
   if (copies.length === 0) throw new Error(`补丁目标在引擎树里找不到：${patch.id}（${targetRel}）`)
-  const rows = copies.map((file) => ({
-    file,
-    path: relative(engineRoot, file).split(sep).join(posix.sep),
-    size: statSync(file).size,
-    patched: marker ? readFileSync(file, 'utf8').includes(marker) : true,
-  }))
-  const patched = rows.filter((row) => row.patched)
-  if (patched.length === 0) {
-    throw new Error(`补丁完全没打上（所有副本都缺 marker）：${patch.id}（${marker}）`)
+  const canonicalFile = join(engineRoot, targetRel)
+  const canonicalBytes = readFileSync(canonicalFile)
+  if (!patch.verifier && (!marker || !canonicalBytes.toString('utf8').includes(marker))) {
+    throw new Error(`规范补丁目标缺 marker：${patch.id}（${marker}）`)
   }
-  const canonical = patched[0]
+  const rows = copies.map((file) => ({
+    file, path: relative(engineRoot, file).split(sep).join(posix.sep), size: statSync(file).size,
+    patched: readFileSync(file).equals(canonicalBytes),
+  }))
+  const canonical = { file: canonicalFile, path: targetRel }
   const reconciled = []
   for (const row of rows) {
     if (row.patched) continue
@@ -88,9 +122,10 @@ function reconcileTarget(engineRoot, files, patch) {
 
 /** 全量对账。返回报告；有副本被改写时也会体现在报告里。 */
 export function reconcileEnginePatchCopies(engineRoot, registry, { files = null } = {}) {
-  const patches = registry.patches.filter((patch) => patch.scope === 'engine' && patch.overlayCheck !== false && String(patch.marker ?? '').trim())
+  const patches = registry.patches.filter((patch) => patch.scope === 'engine' && patch.overlayCheck !== false)
+  for (const patch of patches) verifyCanonicalEnginePatch(engineRoot, patch)
   const allFiles = files ?? collectPhysicalFiles(engineRoot)
-  const targets = patches.map((patch) => reconcileTarget(engineRoot, allFiles, patch))
+  const targets = patches.flatMap(patch => enginePatchTargets(patch, engineRoot)).map((patch) => reconcileTarget(engineRoot, allFiles, patch))
   return {
     engineRoot: engineRoot.split(sep).join(posix.sep),
     patchCount: targets.length,

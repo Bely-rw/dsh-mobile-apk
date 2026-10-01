@@ -12,7 +12,7 @@
 // 判据：我们自己的 CSS/样式字符串里引用的 `--dsw-*` 令牌，必须在上游**现存令牌集合**里；
 // 引用不存在的令牌即 exit 1 并逐条列出 `文件:行`。
 //
-// 上游令牌真源 = dsh/packages/client/ui-theme/src/styles/*.css（该目录是设计 token 的唯一定义面：
+// 上游令牌真源 = contract.upstreamRepo/packages/client/ui-theme/src/styles/*.css（该目录是设计 token 的唯一定义面：
 // design-platform.css 定义别名层，gradient-shadow-text.css 定义字体层，均需计入）。上游树不在场时
 // **跳过**（与 check-contract.mjs / check-engine-overlay.mjs 同风格），并打印 SKIP 计数；
 // `--require` 时 SKIP 判红（发布链不得以 SKIP 结案）——**不恒绿**。
@@ -20,10 +20,11 @@
 // 允许清单 [ALLOW]：本仓自己**定义**的同名局部变量（在 `:root` / 注入的 style 里给出值）不算死引用；
 // 每条都必须写在下面的清单里并写明原因（默认拒绝）。
 //
-// 用法：node scripts/check-dead-tokens.mjs [--require] [--self-test] [--root <dshRoot>]
+// 用法：node scripts/check-dead-tokens.mjs [--require] [--self-test] [--root <upstream-styles-dir>]
 // 退出码：0 = 通过（或显式 SKIP）；1 = 有死 token / --require 下有 SKIP；2 = 用法错误。
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -48,7 +49,11 @@ const SCAN_DIRS = [
  * gradient-shadow-text.css 定义字体层）。**刻意不扫**别处 `*.module.css` 里的 `--dsw-x:`——
  * 那些是组件作用域内的局部自定义属性，对全局引用不构成「已定义」，把它们算进来会把真死引用洗绿。
  */
-const UPSTREAM_TOKEN_DIR = 'dsh/packages/client/ui-theme/src/styles'
+const contract = JSON.parse(readFileSync(join(HERE, 'contract.json'), 'utf8'))
+if (typeof contract.upstreamRepo !== 'string' || !contract.upstreamRepo.trim()) {
+  throw new Error('contract.upstreamRepo 缺席：不得回落到旧 dsh/ 树')
+}
+const UPSTREAM_TOKEN_DIR = join(contract.upstreamRepo, 'packages/client/ui-theme/src/styles')
 
 /**
  * 允许清单：引用但不来自上游的令牌 —— 必须是**我们自己定义**的局部变量。
@@ -57,6 +62,55 @@ const UPSTREAM_TOKEN_DIR = 'dsh/packages/client/ui-theme/src/styles'
 const ALLOW = new Map([
   // 例：['--dsw-local-example', 'dsh-client-ui-responsive/src/client/x.css.ts 的 :root 注入定义'],
 ])
+
+/**
+ * 上游自带缺陷豁免（**不是** ALLOW，语义完全不同）。
+ *
+ * 上游 0.2.0-rc.2 自身把 `ui-sidebar-browser` 的 Browser.module.css 逐字节搬到本仓（见
+ * dsh-client-ui-responsive/src/client/mobile/upstream-browser/SOURCE.json 的 sha256 锁定），
+ * 而该文件引用的 `--dsw-alias-label-quaternary` 已被上游自己的 ui-theme 删除 ——
+ * 即上游自身就是「引用不存在的令牌」。我方既要跟上游逐字节一致（SOURCE.json 哈希锁，
+ * 改一个字节 SOURCE 校验就红），又不能把这条真缺陷悄悄洗绿。
+ *
+ * 故此处**不是**「容忍配额」：每条豁免都必须同时满足
+ *   ① 引用的文件在 VERBATIM_VENDORS 里（上游逐字节 vendored 面），
+ *   ② 该文件的 sha256 与 SOURCE.json 声明一致（文件一旦偏离上游，豁免立即失效并判红）。
+ * 任何一条不满足都不豁免 —— 新增条目需要同样两条证据，默认拒绝。
+ */
+const VERBATIM_VENDORS = new Map([
+  [
+    'dsh-client-ui-responsive/src/client/mobile/upstream-browser/view/Browser.module.css',
+    '787ffc87ef674562ef1758e3d7452809ebb19cd4d5853a6dc4207c7b3c6c4039',
+  ],
+])
+const UPSTREAM_NATIVE_DEFECTS = new Map([
+  [
+    '--dsw-alias-label-quaternary',
+    '上游 0.2.0-rc.2 的 ui-sidebar-browser/Browser.module.css 自身引用，而上游 ui-theme 已删除该令牌；'
+      + '我方按 SOURCE.json 逐字节 vendor 该文件，改字节会让 SOURCE 哈希校验失败。上游修复后随之消失。',
+  ],
+])
+
+/**
+ * 判定一条死引用是否属于「上游逐字节 vendored 文件自带缺陷」。
+ *
+ * @param ref - @BQ@{ token, file, line }@BQ@ 引用。
+ * @returns 命中且哈希一致时为豁免理由字符串，否则 null。
+ */
+function upstreamNativeDefect(ref) {
+  if (!UPSTREAM_NATIVE_DEFECTS.has(ref.token)) return null
+  const expected = VERBATIM_VENDORS.get(ref.file)
+  if (expected === undefined) return null
+  const abs = resolveRepoPath(ref.file)
+  if (abs === null) return null
+  const actual = createHash('sha256').update(readFileSync(abs)).digest('hex')
+  if (actual !== expected) {
+    console.error('VERBATIM 哈希失配：' + ref.file + ' 声明 ' + expected + ' 实测 ' + actual
+      + ' —— 该文件已偏离上游，上游缺陷豁免不再适用，按死引用判红')
+    return null
+  }
+  return UPSTREAM_NATIVE_DEFECTS.get(ref.token)
+}
 
 /** 布局无关定位：协调仓根写 `dsh-mobile-apk/...`；壳侧自包含仓落到同名相对路径。 */
 function resolveRepoPath(rel) {
@@ -177,7 +231,10 @@ if (argv.includes('--self-test')) {
 }
 
 const rootArg = argv.indexOf('--root')
-const upstreamRel = rootArg >= 0 ? argv[rootArg + 1] : resolveRepoPath(UPSTREAM_TOKEN_DIR)
+if (rootArg >= 0 && (!argv[rootArg + 1] || argv[rootArg + 1].startsWith('--'))) {
+  console.error('--root 需要上游样式定义目录'); process.exit(2)
+}
+const upstreamRel = rootArg >= 0 ? resolve(ROOT, argv[rootArg + 1]) : resolveRepoPath(UPSTREAM_TOKEN_DIR)
 if (upstreamRel === null || !existsSync(upstreamRel)) {
   skip('上游令牌定义面不在场（' + UPSTREAM_TOKEN_DIR + '）：无判据，跳过死 token 对账（不计入绿）')
   console.log('SKIP=' + skipped)
@@ -210,7 +267,20 @@ for (const file of scanned) {
   const rel = relative(ROOT, file).replace(/\\/g, '/')
   for (const hit of referencedTokens(text)) references.push({ token: hit.token, file: rel, line: hit.line })
 }
-const { dead, usedAllow } = audit(references, defined, ALLOW)
+// 上游逐字节 vendored 文件自带的缺陷：单独剥离并记账，绝不并入 ALLOW（语义不同，且这里必须哈希一致才认）。
+const exemptRefs = []
+const gatedReferences = []
+for (const ref of references) {
+  const reason = upstreamNativeDefect(ref)
+  if (reason === null) gatedReferences.push(ref)
+  else exemptRefs.push({ ...ref, reason })
+}
+const { dead, usedAllow } = audit(gatedReferences, defined, ALLOW)
+for (const token of UPSTREAM_NATIVE_DEFECTS.keys()) {
+  if (!exemptRefs.some((r) => r.token === token)) {
+    console.log('WARN  上游缺陷豁免条目未被用到（上游可能已修复，可清理）: ' + token)
+  }
+}
 // 允许清单腐化检测：声明了却没人用的条目意味着「问题已消失」或「写错了名字」，两种都该清掉——
 // 否则清单会越滚越长，最终成为「什么都豁免」的摆设。
 for (const token of ALLOW.keys()) {
@@ -218,8 +288,13 @@ for (const token of ALLOW.keys()) {
 }
 
 console.log('上游令牌 ' + defined.size + ' 个（' + UPSTREAM_TOKEN_DIR + '）；扫描 ' + scanned.length + ' 个文件、' + references.length + ' 处引用')
+if (exemptRefs.length > 0) {
+  console.log('上游自带缺陷豁免 ' + exemptRefs.length + ' 处（逐字节 vendored + 哈希一致，非 ALLOW）：')
+  for (const ref of exemptRefs) console.log('  ' + ref.token + ' @ ' + ref.file + ':' + ref.line + ' —— ' + ref.reason)
+}
 if (dead.size === 0) {
-  console.log('CHECK-DEAD-TOKENS PASSED（引用 ' + references.length + ' 处全部命中上游现存令牌）')
+  console.log('CHECK-DEAD-TOKENS PASSED（引用 ' + references.length + ' 处全部命中上游现存令牌'
+    + (exemptRefs.length > 0 ? '；另 ' + exemptRefs.length + ' 处为上游自带缺陷豁免' : '') + '）')
   process.exit(0)
 }
 // 死引用一律判红，不设「容忍配额」：配额的存在只会让下一处死 token 悄悄挤进允许范围，

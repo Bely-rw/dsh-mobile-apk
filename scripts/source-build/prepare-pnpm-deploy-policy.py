@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 
-SOURCE_COMMIT = "477b4f420553e8a52c2fbccc464d7561b239c443"
+SOURCE_COMMIT = "639ed015397290b3745d163aafe02ffee4aa3f84"
 PACKAGE_NAME = "@deepseek-ai/dsh-subprocess-local"
-PACKAGE_VERSION = "0.1.7-rc.2"
+PACKAGE_VERSION = "0.2.0-rc.2"
 PACKAGE_PATH = "packages/subprocess/subprocess-local"
 BUILD_SCRIPT_PATH = f"{PACKAGE_PATH}/scripts/ensure-spawn-helper.mjs"
 ORIGINAL_SELECTOR = (
@@ -26,6 +27,10 @@ def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit("usage: prepare-pnpm-deploy-policy.py <pnpm-workspace.yaml> <manifest.json>")
     workspace_path, manifest_path = map(pathlib.Path, sys.argv[1:])
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace_path.parent, text=True).strip()
+    root_manifest = json.loads((workspace_path.parent / "package.json").read_text(encoding="utf-8"))
+    if commit != SOURCE_COMMIT or root_manifest.get("version") != PACKAGE_VERSION:
+        raise ValueError("pnpm deploy policy requires the official 0.2.0-rc.2 source")
     original = workspace_path.read_bytes()
     needle = ORIGINAL_SELECTOR.encode("ascii")
     if original.count(needle) != 1:
