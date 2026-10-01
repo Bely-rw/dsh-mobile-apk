@@ -2461,6 +2461,10 @@ flowchart TD
   L --> P
 ```
 
+## 0.14.3 root/shared-startup 修订
+
+有效当前版本同意、派发前回退白名单、v4配置确认、固定签名APK描述符维护和跨进程不明结果租约由RootGrant/RootAccess/ShizukuTransport/RootMaintenanceLease共同实现。RootOwnershipJobs共享单飞，Activity/Service在事务恢复前等待，busy/unknown不进入恢复；caller取消不取消共享rootworker。ProcIo/capture返回不可变、有界、明确排水/清理结果；各chunk重新检查同意。启动世代与wake资源只有原owner可以释放。新增行为夹具已编译但开发agent未运行；正常PR CI与外部设备验收分别留证，不宣称设备验收通过。
+
 ## 7. 覆盖账本与校验
 
 ```bash
@@ -2531,6 +2535,14 @@ app/src/main/java/com/dsharnessmobile/shell/ShizukuProbe.kt
 app/src/main/java/com/dsharnessmobile/shell/ShizukuSupport.kt
 app/src/main/java/com/dsharnessmobile/shell/RootGrant.kt
 app/src/main/java/com/dsharnessmobile/shell/RootAccess.kt
+app/src/main/java/com/dsharnessmobile/shell/ForegroundPageRecoveryPolicy.kt
+app/src/main/java/com/dsharnessmobile/shell/OwnershipRepair.kt
+app/src/main/java/com/dsharnessmobile/shell/OwnershipRepairCore.kt
+app/src/main/java/com/dsharnessmobile/shell/RootExecutionFence.kt
+app/src/main/java/com/dsharnessmobile/shell/RootMaintenanceLease.kt
+app/src/main/java/com/dsharnessmobile/shell/RootOwnershipJobs.kt
+app/src/main/java/com/dsharnessmobile/shell/RootRepairMain.kt
+app/src/main/java/com/dsharnessmobile/shell/SnapshotFingerprintPolicy.kt
 app/src/main/java/com/dsharnessmobile/shell/LocalDocs.kt
 app/src/main/java/com/dsharnessmobile/shell/ProcIo.kt
 app/src/main/java/com/dsharnessmobile/shell/FileIncoming.kt

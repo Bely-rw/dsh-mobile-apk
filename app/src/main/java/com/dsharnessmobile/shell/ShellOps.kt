@@ -125,7 +125,7 @@ internal object ShellOps {
 
   internal fun canFallbackBeforeDispatch(code: String): Boolean = code in setOf(
     "shizuku-absent", "shizuku-not-running", "shizuku-denied", "shizuku-prev11",
-    "shizuku-user-service-not-bound", "shizuku-user-service-too-old", "shizuku-identity-failed",
+    "shizuku-user-service-not-bound", "shizuku-user-service-too-old",
   )
 
   private fun pull(context: Context, args: JSONObject): JSONObject {

@@ -39,10 +39,24 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
 
     private val spoolCounter = AtomicInteger(0)
 
-    private fun spoolFile(): File {
-      val dir = File(SPOOL_DIR)
-      if (!dir.exists()) dir.mkdirs()
-      return File(dir, "exec-" + SystemClock.elapsedRealtime() + "-" + spoolCounter.incrementAndGet() + ".out")
+    private fun spoolFile(appDataDir: String): File {
+      val uid = Process.myUid()
+      val dir = if (uid == 0) {
+        require(appDataDir.isNotBlank()) { "root capture requires acknowledged application data" }
+        val cache = File(appDataDir, "cache")
+        val stat = android.system.Os.lstat(cache.path)
+        require(android.system.OsConstants.S_ISDIR(stat.st_mode)) { "capture cache is not an ordinary directory" }
+        File(cache, "dsh-root-spool")
+      } else File(SPOOL_DIR + "-" + uid)
+      try { android.system.Os.mkdir(dir.path, 448) }
+      catch (failure: android.system.ErrnoException) {
+        if (failure.errno != android.system.OsConstants.EEXIST) throw failure
+      }
+      val stat = android.system.Os.lstat(dir.path)
+      require(android.system.OsConstants.S_ISDIR(stat.st_mode) && stat.st_uid == uid && (stat.st_mode and 511) == 448) {
+        "capture spool must be private and owned by the execution identity"
+      }
+      return File(dir, "exec-" + java.util.UUID.randomUUID() + "-" + spoolCounter.incrementAndGet() + ".out")
     }
   }
 
@@ -182,7 +196,7 @@ class ShizukuUserServiceBridge() : ShizukuUserService.Stub() {
     }
     var launched = false
     return try {
-      val file = spoolFile()
+      val file = spoolFile(appDataDir)
       val process = ProcessBuilder(argv.toList()).redirectErrorStream(true).start()
       launched = true
       val result = ShizukuCaptureIo.capture(process, file,
@@ -352,7 +366,8 @@ internal object ShizukuCaptureIo {
     val cap = maxBytes.coerceIn(1, 256L * 1024 * 1024)
     val reader = Thread({
       try {
-        FileOutputStream(staging).use { sink ->
+        java.nio.file.Files.newOutputStream(staging.toPath(), java.nio.file.StandardOpenOption.CREATE_NEW,
+          java.nio.file.StandardOpenOption.WRITE, java.nio.file.LinkOption.NOFOLLOW_LINKS).use { sink ->
           val input = process.inputStream
           val buf = ByteArray(64 * 1024)
           var size = 0L
@@ -379,7 +394,7 @@ internal object ShizukuCaptureIo {
       !wait.cleanupIncomplete && !snap.truncated && error == null && exit >= 0
     if (ready) {
       // Rename only after writer death. Incomplete .part paths are NEVER returned as file results.
-      ready = try { staging.renameTo(file) }
+      ready = try { java.nio.file.Files.move(staging.toPath(), file.toPath()); true }
       catch (failure: Throwable) { error = ProcIo.errorText(failure); false }
       if (!ready && error == null) error = "spool-publish-failed"
     }

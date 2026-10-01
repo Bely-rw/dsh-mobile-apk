@@ -177,8 +177,8 @@ class RootGrantTest {
     assertBefore(controller, "rootGateRefusal(context)", "ensureBound(context)")
     assertBefore(controller, "remote.protocolVersion()", "configureIfNeeded(context)")
     assertTrue(controller.contains("< ShizukuUserServiceBridge.PROTOCOL_VERSION"))
-    assertBefore(controller, "configureIfNeeded(context)", "actualIdentityRefusal(context, remote)")
-    assertBefore(controller, "actualIdentityRefusal(context, remote)", "remote.exec(argv,")
+    assertBefore(controller, "configureIfNeeded(context)", "lease.beforeRpc(remote)")
+    assertBefore(controller, "lease.beforeRpc(remote)", "remote.exec(argv,")
   }
 
   @Test
@@ -216,8 +216,10 @@ class RootGrantTest {
     assertTrue(state.contains(""".put("granted", isGranted(context))"""))
     assertTrue(body("ShizukuTransport.kt", "internal fun rootGateRefusal(").contains("RootGrant.isGranted(context)"))
     val actual = body("ShizukuTransport.kt", "private fun actualIdentityRefusal(")
-    assertTrue(actual.contains("remote.uid()") && actual.contains("!RootGrant.isGranted(context)"))
-    assertTrue(actual.contains("uid != 0 && uid != 2000"))
+    assertTrue(actual.contains("dispatchIdentity(context, remote).second"))
+    val identity = body("ShizukuTransport.kt", "private fun dispatchIdentity(")
+    assertTrue(identity.contains("remote.uid()") && identity.contains("!RootGrant.isGranted(context)"))
+    assertTrue(identity.contains("uid != 0 && uid != 2000"))
   }
 
   @Test

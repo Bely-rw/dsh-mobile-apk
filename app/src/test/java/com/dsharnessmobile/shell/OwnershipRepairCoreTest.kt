@@ -235,16 +235,17 @@ class OwnershipRepairCoreTest {
     assertClosed(fake)
   }
 
-  @Test fun alreadyAppOwnedHardlinkNeedsNoMutationAndRootGroupIsRepaired() {
+  @Test fun alreadyAppOwnedHardlinkAndRootGroupDoNotTriggerMutation() {
     val owned = Node(2, owner = uid, group = uid, links = 2)
     val rootGroup = Node(3, owner = uid, group = 0)
     val fake = Fake(directory(1).also { it.children["owned"] = owned; it.children["root-group"] = rootGroup })
     val result = repair(fake)
     assertTrue(result.ok)
     assertEquals(0, result.hardlinksRejected)
-    assertEquals(1, result.healed)
-    assertEquals(uid, rootGroup.group)
-    assertEquals(listOf(3L), fake.mutations)
+    // An app-owned inode is not evidence of root origin merely because its gid is zero.
+    assertEquals(0, result.healed)
+    assertEquals(0, rootGroup.group)
+    assertTrue(fake.mutations.isEmpty())
     assertClosed(fake)
   }
 

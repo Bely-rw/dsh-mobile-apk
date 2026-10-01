@@ -544,7 +544,8 @@ class BootDiagnosticsContractTest {
   fun renderProcessGoneCallbackIsPresentAndConsumed() {
     val body = memberBody(codeOnly(source("MainActivity.kt")), "override fun onRenderProcessGone(")
     assertTrue("§2.3：必须落 render-gone 诊断", body.contains("\"render-gone\""))
-    assertTrue("§2.3：必须置失败态并回引导页", body.contains("enginePageFailed = true") && body.contains("showGuide()"))
+    assertTrue("§2.3：必须置失败态并按前台恢复策略延后/有界重建", body.contains("enginePageFailed = true") &&
+      body.contains("pageRecovery.rendererLost()") && body.contains("recoverPageIfPending()"))
     assertTrue("§2.3：必须消费（返回 true），否则留在一个永不响应的 WebView 上", body.contains("return true"))
   }
 
