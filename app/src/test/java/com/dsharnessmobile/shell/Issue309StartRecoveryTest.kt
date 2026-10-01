@@ -373,6 +373,43 @@ class Issue309StartRecoveryTest {
     assertTrue("预算必须是单次 CAS 操作", fn.contains("runtimeTreeHealedThisRun.compareAndSet(false, true)"))
   }
 
+  /**
+   * 独立评审 C6：手动入口**不得**在 UI 线程上做恢复。
+   *
+   * 缺陷形态：`enterSafeMode` 跑在 `runOnUiThread` 上，而恢复动作含诊断镜像（拷贝六代
+   * engine.log）与一次有界 logcat 抽取，可阻塞到 10s 级 ⇒ 真实 ANR 路径。自动路径本来就在
+   * 启动流的 worker 线程上，手动路径必须对齐同一执行上下文。
+   */
+  @Test
+  fun `manual recovery leaves the UI thread before doing heavy work`() {
+    val guide = code("GuidePageRenderer.kt")
+    val safe = between(guide, "private fun enterSafeMode()", "private companion object {")
+    val callAt = safe.indexOf("maybeRecoverFromIncompleteLiveRuntime(")
+    assertTrue("错误页必须仍能触发恢复", callAt >= 0)
+    // 调用必须被包在 Thread { ... }.start() 里，而不是直接写在 runOnUiThread 的 lambda 体内。
+    val threadAt = safe.lastIndexOf("Thread {", callAt)
+    assertTrue("恢复调用之前必须有 Thread { 包裹（否则在 UI 线程上跑重活）", threadAt >= 0 && threadAt < callAt)
+    assertTrue("必须有 .start()", safe.substringAfter("Thread {").contains(".start()"))
+  }
+
+  /**
+   * 独立评审：删指纹必须让开正在进行的刷新，否则会被刷新在提交点重新写回。
+   *
+   * 缺陷形态：`refreshSnapshotInternal` 在提交点 `writeFingerprint`；若在它进行中删指纹，
+   * 结果是「删了又被写回」而预算已花 ⇒ 恢复动作静默失效。与 startEngine 的刷新旁路同源。
+   */
+  @Test
+  fun `fingerprint invalidation defers while a snapshot refresh is in flight`() {
+    val manager = code("EngineManager.kt")
+    val api = between(manager, "fun invalidateSnapshotFreshness(): Boolean {", "var pendingRecoveryFailure")
+    val guardAt = api.indexOf("snapshotRefreshing.get()")
+    val deleteAt = api.indexOf("fp.delete()")
+    assertTrue("必须检查刷新闸门", guardAt >= 0)
+    assertTrue("闸门必须早于删除", guardAt < deleteAt)
+    val guardBlock = api.substring(guardAt, deleteAt)
+    assertTrue("刷新进行中必须返回假（让调用方走 blocked 文案并退回预算）", guardBlock.contains("return false"))
+  }
+
   /** 诊断包必须带上拒启原因/确诊项/现场，否则用户取包时没有可归因的事实。 */
   @Test
   fun `diagnostics package carries the refusal facts`() {

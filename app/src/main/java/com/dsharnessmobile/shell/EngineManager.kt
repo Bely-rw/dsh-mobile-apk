@@ -352,6 +352,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
    *   **不得**声称「已安排重抽取」，因为下次冷启动仍会在 [snapshotFresh] 处早退。
    */
   fun invalidateSnapshotFreshness(): Boolean {
+    // 独立评审：删除必须让开正在进行的刷新。`refreshSnapshotInternal` 会在提交点重写指纹
+    // （`writeFingerprint`），若在它进行中把指纹删掉，会出现「删了又被写回」而预算已花——
+    // 恢复动作静默失效。与 `startEngine` 的旁路闸门同源：刷新期间不碰运行时面。
+    // 返回 false 让调用方走「如实写 blocked 文案 + 退回预算」那条路，而不是假装成功。
+    if (EngineManager.snapshotRefreshing.get()) {
+      Log.w(TAG, "snapshot fingerprint invalidation deferred: a snapshot refresh is in progress")
+      return false
+    }
     val fp = File(context.filesDir, ".snapshot-fingerprint")
     if (!fp.exists()) return true
     val deleted = try {
