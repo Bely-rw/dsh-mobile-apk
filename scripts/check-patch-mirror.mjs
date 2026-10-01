@@ -119,13 +119,17 @@ if (peer) {
     }
   }
   // tests/ 递归清单 + 共有文件逐字节
-  const walk = (dir, prefix = '') => {
-    const out = new Map()
+  // **递归**列清单：0.14.3 实锤——旧实现只列 tests/ 的一层，于是 `fixtures` 被当成一个dir 条目，
+  // 里面的 31 个夹具目录从未参与比对。协调仓已把夹具换到 0.2.0-rc.2，APK 侧仍留着 0.1.7-rc.2 的旧夹具，
+  // 本地镜像门禁却全绿，直到 APK CI 的 check-patch-fixtures 判红 93 项才暴露。
+  const walk = (dir, prefix = '', out = new Map()) => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name)
       const rel = prefix ? `${prefix}/${name}` : name
-      if (statSync(full).isDirectory()) out.set(rel, 'dir')
-      else out.set(rel, 'file')
+      if (statSync(full).isDirectory()) {
+        out.set(rel, 'dir')
+        walk(full, rel, out)
+      } else out.set(rel, 'file')
     }
     return out
   }
