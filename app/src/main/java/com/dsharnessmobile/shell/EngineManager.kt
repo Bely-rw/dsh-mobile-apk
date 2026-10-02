@@ -2036,7 +2036,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
       // ships libtermux-exec-*-ld-preload.so. The hook only rewrites for
       // untrusted_app_25/27 SELinux domains, so force mode is required.
       "LD_PRELOAD" to preload.absolutePath,
-      "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE" to "force",
+      "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE" to "enable",
       "TERMUX_EXEC__EXECVE_CALL__INTERCEPT" to "1",
       "TERMUX__ROOTFS" to usrDir.parentFile.absolutePath,
       "TERMUX__PREFIX" to usrDir.absolutePath,

@@ -13,7 +13,7 @@ android {
     // targetSdk 34: Android 15+ forbids exec of app-data ELF for targetSdk 35+
     // (the embedded engine, bash, and every child command would need linker64
     // wrappers); 34 keeps native exec working on Android 15/16 devices.
-    targetSdk = 34
+    targetSdk = 28
     // 0.14.2-fx-1：versionCode 42（覆盖安装 0.14.2(41)）。
     // fx-1 是 0.14.2 的修订版，**必须**抬 vc：同 code 装不上（无法覆盖安装），
     // 且 vc41 与已发布的 0.14.2 相同会让系统/用户无法区分两者。
@@ -36,7 +36,7 @@ android {
     //    临时工作区 R1-R3；
     // ③ B2 门禁与发布链：新增门禁接进唯一接线面（本地构建链 / 两仓 CI / 发布组装链三处），
     //    快照指纹对账、工具返回值 schema 自检、控制 op 六处登记链、SKIP 计数。
-    versionCode = 45
+    versionCode = 46
     // Snapshot builds append a suffix (e.g. -SN-1-RC13) via -PversionNameSuffix; release builds pass none.
     val snapshotSuffix = providers.gradleProperty("versionNameSuffix").getOrElse("")
     // 版本号单一来源：UI（GuidePageRenderer）、桥（androidBridge.version）、诊断日志、引擎环境变量
